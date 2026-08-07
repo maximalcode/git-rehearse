@@ -62,6 +62,12 @@ impl Fixture {
         // carry it across for a rehearsed commit to be authored correctly.
         fixture.git(&["config", "user.name", "Fixture"]);
         fixture.git(&["config", "user.email", "fixture@example.invalid"]);
+        // Windows CI checks out with core.autocrlf on, so a worktree file
+        // comes back as "x\r\n" where the test wrote "x\n". That is git doing
+        // what the user's config says — principle 1 — and the code under test
+        // reads this repository's config, so pinning it here is what makes an
+        // assertion about worktree bytes mean the same thing on every machine.
+        fixture.git(&["config", "core.autocrlf", "false"]);
         fixture.commit("one", "one\n");
         fixture.commit("two", "two\n");
         fixture.git(&["tag", "v1"]);
@@ -127,6 +133,7 @@ impl Fixture {
         self.git_in(&path, &["init", "-b", "main"]);
         self.git_in(&path, &["config", "user.name", "Fixture"]);
         self.git_in(&path, &["config", "user.email", "fixture@example.invalid"]);
+        self.git_in(&path, &["config", "core.autocrlf", "false"]);
         std::fs::write(path.join("file.txt"), "sibling\n").expect("write sibling file");
         self.git_in(&path, &["add", "file.txt"]);
         self.git_in(&path, &["commit", "-m", "sibling"]);
