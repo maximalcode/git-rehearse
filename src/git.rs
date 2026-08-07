@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 
 use crate::{Error, Result};
 
@@ -92,6 +92,40 @@ where
         code: output.status.code(),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     })
+}
+
+/// Runs git in `dir` with the parent's stdin, stdout and stderr, and returns
+/// its exit status.
+///
+/// The one place a rehearsed command meets the user's terminal. `rebase -i`
+/// has to be able to open the user's editor and draw on the user's screen —
+/// principle 1 says the sandbox runs *their* git with *their* environment, and
+/// capturing the output would break that on purpose.
+///
+/// `env` is layered on top of the inherited environment, not a replacement
+/// for it.
+///
+/// # Errors
+///
+/// [`Error::Spawn`] if git cannot be started or waited on. A non-zero exit is
+/// *not* an error here: for a rehearsal it is a result, and classifying it is
+/// the caller's job.
+pub fn spawn<I, S>(dir: &Path, args: I, env: &[(&str, OsString)]) -> Result<ExitStatus>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(Error::Spawn)
 }
 
 /// The refs under `pattern` as `name -> sha`, with `strip` leading components

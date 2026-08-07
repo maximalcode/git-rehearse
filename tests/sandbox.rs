@@ -59,6 +59,35 @@ fn a_fresh_sandbox_is_inert_and_checked_out() {
 }
 
 #[test]
+fn the_sandbox_carries_the_repositorys_own_commit_identity() {
+    let fixture = Fixture::new();
+    // A per-repository identity: a work checkout, a second account, or this
+    // project's own CLAUDE.md rule. `git clone` does not copy .git/config, so
+    // without carrying it the rehearsal would commit as somebody else — or,
+    // where there is no global identity at all, refuse to commit.
+    fixture.git(&["config", "user.name", "Repo Local"]);
+    fixture.git(&["config", "user.email", "repo-local@example.invalid"]);
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
+
+    assert_eq!(
+        fixture.git_in(
+            &sandbox.worktree(),
+            &["config", "--local", "--get", "user.name"]
+        ),
+        "Repo Local"
+    );
+    assert_eq!(
+        fixture.git_in(
+            &sandbox.worktree(),
+            &["config", "--local", "--get", "user.email"]
+        ),
+        "repo-local@example.invalid"
+    );
+}
+
+#[test]
 fn the_meta_file_records_what_apply_will_need() {
     let fixture = Fixture::new();
     let pre_state = fixture.refs();
