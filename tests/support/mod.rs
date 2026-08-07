@@ -187,6 +187,10 @@ fn run_git(dir: &Path, empty: &Path, args: &[&str]) -> String {
         // fixtures have to opt back in to build a submodule locally.
         .arg("-c")
         .arg("protocol.file.allow=always")
+        // `true` as the editor accepts whatever message git proposes, so a
+        // fixture can finish a `rebase --continue` without a terminal.
+        .arg("-c")
+        .arg("core.editor=true")
         .args(args)
         // Pointing config at files that do not exist is git's supported way of
         // saying "no config here".
