@@ -51,9 +51,13 @@ pub struct Analysis {
 
 impl Analysis {
     /// Whether this rehearsal changed content it was not supposed to change.
+    ///
+    /// Not merely "the trees differ": a rebase onto a base that has moved on
+    /// differs by the base's own commits, every time, and warning about that
+    /// would train people to ignore the warning. See [`Replay`].
     #[must_use]
     pub fn has_unexpected_drift(&self) -> bool {
-        self.drift_expected_empty && !self.drift.is_empty()
+        self.drift_expected_empty && self.drift.iter().any(|drift| drift.replay.is_suspicious())
     }
 }
 
@@ -100,11 +104,41 @@ pub struct Drift {
     /// Commits between the common ancestor and the old tip.
     pub commits_before: usize,
     /// Commits between the common ancestor and the new tip.
-    ///
-    /// More than `commits_before` usually means the rewrite picked up commits
-    /// from a base that had moved on, which explains a content difference that
-    /// would otherwise look alarming.
     pub commits_after: usize,
+    /// What happened to the individual commits when they were replayed.
+    pub replay: Replay,
+}
+
+/// How the replayed commits compare with the ones they replaced.
+///
+/// Comparing trees alone cannot answer the question the warning wants to ask.
+/// Rebasing onto a base that has moved on legitimately changes the tip's tree
+/// — by exactly the base's own commits — and a warning that fires on the most
+/// ordinary rebase there is would be ignored within a week. What matters is
+/// whether the *commits being replayed* still do what they did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Replay {
+    /// Subjects of commits whose patch is not what it was. The real signal:
+    /// something — a conflict resolution, a merge driver — changed what these
+    /// commits do.
+    pub changed: Vec<String>,
+    /// Subjects of commits that are simply gone.
+    pub dropped: Vec<String>,
+    /// Subjects of commits that exist only on the new side. Ordinary: these
+    /// are the base's own commits, picked up by rebasing onto it.
+    pub added: Vec<String>,
+    /// Whether git could compare the two ranges at all. An unrelated history
+    /// or a rewrite too large to pair up leaves this false, and an
+    /// uncomparable rewrite is treated as suspicious rather than as fine.
+    pub compared: bool,
+}
+
+impl Replay {
+    /// Whether this replay changed something it should not have.
+    #[must_use]
+    pub fn is_suspicious(&self) -> bool {
+        !self.compared || !self.changed.is_empty() || !self.dropped.is_empty()
+    }
 }
 
 /// One file in a diff.
@@ -270,6 +304,7 @@ fn drift(worktree: &Path, moves: &[RefMove]) -> Result<Vec<Drift>> {
             changes,
             commits_before,
             commits_after,
+            replay: replay(worktree, before, after),
         });
     }
     Ok(drifted)
@@ -297,6 +332,91 @@ fn name_status(worktree: &Path, before: &str, after: &str) -> Result<Vec<FileCha
         });
     }
     Ok(changes)
+}
+
+/// Compares the commits behind the two tips, commit by commit.
+///
+/// `git range-diff <old>...<new>` pairs the commits either side of the common
+/// ancestor by content and says, per pair, whether the patch is unchanged
+/// (`=`), different (`!`), gone (`<`) or new (`>`). That is exactly the
+/// question the drift warning wants answered, and git has done the hard part
+/// — matching commits across a rewrite — since 2.19.
+///
+/// Delegating rather than reimplementing, for the same reason the graph
+/// delegates to `git log --graph`: matching rewritten commits by content is
+/// subtle, and a home-grown version would be subtly wrong exactly where it
+/// matters.
+fn replay(worktree: &Path, before: &str, after: &str) -> Replay {
+    // Three dots: compare what each side has since their common ancestor.
+    let Ok(listing) = git::run(
+        worktree,
+        [
+            "range-diff",
+            "--no-color",
+            "--no-patch",
+            &format!("{before}...{after}"),
+        ],
+    ) else {
+        // Unrelated histories, or a rewrite git will not pair up. Unknown, and
+        // unknown is treated as suspicious by Replay::is_suspicious.
+        return Replay::default();
+    };
+    parse_range_diff(&listing)
+}
+
+/// Reads `git range-diff --no-patch` output.
+///
+/// Each line is `<n>:  <sha> <op> <n>:  <sha> <subject>`, where a missing side
+/// is written as `-:  -------`. The operator is the third whitespace-separated
+/// token, and the subject is everything after the second `<n>:  <sha>` pair.
+fn parse_range_diff(listing: &str) -> Replay {
+    let mut replay = Replay {
+        compared: true,
+        ..Replay::default()
+    };
+    for line in listing.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // "1:", "<sha>", "<op>", "2:", "<sha>", subject...
+        let (Some(op), true) = (fields.get(2), fields.len() > 5) else {
+            continue;
+        };
+        let subject = fields[5..].join(" ");
+        match *op {
+            "!" => replay.changed.push(subject),
+            "<" => replay.dropped.push(subject),
+            ">" => replay.added.push(subject),
+            // "=" is the good case, and anything else is not a pairing line.
+            _ => {}
+        }
+    }
+    reconcile_by_subject(&mut replay);
+    replay
+}
+
+/// Re-pairs commits git would not pair, by subject.
+///
+/// When a conflict is resolved differently enough, range-diff's cost matrix
+/// gives up on matching the old commit to the new one and reports a deletion
+/// plus an addition. That reads as "your commit vanished", which is both
+/// alarming and wrong — the commit is there, it just no longer does what it
+/// did, which is precisely the case the warning is *for*.
+///
+/// Raising `--creation-factor` is git's documented remedy for this symptom,
+/// but on the shapes this tool sees it makes range-diff pair a rewritten
+/// commit against an unrelated one from the new base, which is worse than not
+/// pairing at all. Matching the subject is narrower and cannot mispair: a
+/// subject on both sides is the same commit, rewritten.
+fn reconcile_by_subject(replay: &mut Replay) {
+    let mut still_gone = Vec::new();
+    for subject in std::mem::take(&mut replay.dropped) {
+        if let Some(position) = replay.added.iter().position(|added| *added == subject) {
+            replay.added.remove(position);
+            replay.changed.push(subject);
+        } else {
+            still_gone.push(subject);
+        }
+    }
+    replay.dropped = still_gone;
 }
 
 /// How many commits each tip carries since their common ancestor.
@@ -395,6 +515,77 @@ mod tests {
         conflicted.push(0xff);
         conflicted.push(b'\n');
         assert_eq!(count_hunks(&conflicted), 1);
+    }
+
+    #[test]
+    fn a_range_diff_of_unchanged_commits_says_nothing_happened() {
+        let replay = super::parse_range_diff(
+            "1:  a1b2c3d = 1:  d4e5f6a teach the parser about tabs\n\
+             2:  b2c3d4e = 2:  e5f6a7b fix the off-by-one\n",
+        );
+        assert!(replay.compared);
+        assert!(!replay.is_suspicious(), "{replay:?}");
+    }
+
+    #[test]
+    fn commits_picked_up_from_a_new_base_are_counted_not_flagged() {
+        let replay = super::parse_range_diff(
+            "-:  ------- > 1:  d4e5f6a main moves on\n\
+             1:  a1b2c3d = 2:  e5f6a7b teach the parser about tabs\n",
+        );
+        assert_eq!(replay.added, vec!["main moves on".to_owned()]);
+        assert!(
+            !replay.is_suspicious(),
+            "the most ordinary rebase there is: {replay:?}"
+        );
+    }
+
+    #[test]
+    fn a_commit_git_reports_as_changed_is_changed() {
+        let replay =
+            super::parse_range_diff("1:  a1b2c3d ! 1:  d4e5f6a teach the parser about tabs\n");
+        assert_eq!(
+            replay.changed,
+            vec!["teach the parser about tabs".to_owned()]
+        );
+        assert!(replay.is_suspicious());
+    }
+
+    #[test]
+    fn a_commit_rewritten_beyond_recognition_is_changed_not_gone() {
+        // What range-diff actually prints when a conflict was resolved
+        // differently enough: it gives up pairing and reports a deletion and
+        // an addition. The commit is not gone; it stopped doing what it did.
+        let replay = super::parse_range_diff(
+            "1:  a1b2c3d < -:  ------- teach the parser about tabs\n\
+             -:  ------- > 1:  d4e5f6a main moves on\n\
+             -:  ------- > 2:  e5f6a7b teach the parser about tabs\n",
+        );
+        assert_eq!(
+            replay.changed,
+            vec!["teach the parser about tabs".to_owned()]
+        );
+        assert!(replay.dropped.is_empty(), "{replay:?}");
+        assert_eq!(replay.added, vec!["main moves on".to_owned()]);
+    }
+
+    #[test]
+    fn a_commit_that_really_is_gone_stays_gone() {
+        let replay = super::parse_range_diff(
+            "1:  a1b2c3d = 1:  d4e5f6a teach the parser about tabs\n\
+             2:  b2c3d4e < -:  ------- fix the off-by-one\n",
+        );
+        assert_eq!(replay.dropped, vec!["fix the off-by-one".to_owned()]);
+        assert!(replay.changed.is_empty(), "{replay:?}");
+        assert!(replay.is_suspicious());
+    }
+
+    #[test]
+    fn a_comparison_git_could_not_make_is_suspicious_by_default() {
+        assert!(
+            super::Replay::default().is_suspicious(),
+            "an unknown rewrite must not pass for a safe one"
+        );
     }
 
     #[test]
