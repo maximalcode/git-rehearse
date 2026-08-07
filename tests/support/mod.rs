@@ -10,6 +10,11 @@
 //! runs the user's real git with the user's real config, which is design
 //! principle 1.
 
+// Every integration-test binary compiles this module separately and uses the
+// part of it that its subject needs; the unused remainder is not dead code,
+// it is another test file's scaffolding.
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,6 +27,7 @@ pub struct Fixture {
     // Kept alive for its Drop: the whole tree goes when the test ends, panic
     // or not.
     _dir: TempDir,
+    base: PathBuf,
     repo: PathBuf,
     cache: PathBuf,
     /// An empty directory, used as git's template and hooks path so nothing
@@ -46,6 +52,7 @@ impl Fixture {
             repo: base.join("repo"),
             cache: base.join("cache"),
             empty: base.join("empty"),
+            base,
         };
         std::fs::create_dir_all(&fixture.repo).expect("repo directory");
         std::fs::create_dir_all(&fixture.empty).expect("empty directory");
@@ -80,11 +87,51 @@ impl Fixture {
         run_git(dir, &self.empty, args)
     }
 
+    /// The temporary directory the repository and cache live in — where sibling
+    /// repositories, clones and linked worktrees get created.
+    pub fn base(&self) -> &Path {
+        &self.base
+    }
+
     /// Commits `content` as `file.txt` with the given message.
     pub fn commit(&self, message: &str, content: &str) {
-        std::fs::write(self.repo.join("file.txt"), content).expect("write file.txt");
-        self.git(&["add", "file.txt"]);
+        self.commit_file("file.txt", content, message);
+    }
+
+    /// Commits `content` as `name` with the given message.
+    pub fn commit_file(&self, name: &str, content: &str, message: &str) {
+        self.write(name, content);
+        self.git(&["add", "--", name]);
         self.git(&["commit", "-m", message]);
+    }
+
+    /// Writes a file in the worktree without committing it, creating parent
+    /// directories so `"sub/file.txt"` works.
+    pub fn write(&self, name: &str, content: &str) {
+        let path = self.repo.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent directory");
+        }
+        std::fs::write(path, content).expect("write into the worktree");
+    }
+
+    /// A second repository beside the first, with one commit. Used as a
+    /// submodule source and as somewhere to clone from.
+    pub fn sibling(&self, name: &str) -> PathBuf {
+        let path = self.base.join(name);
+        std::fs::create_dir_all(&path).expect("sibling directory");
+        self.git_in(&path, &["init", "-b", "main"]);
+        std::fs::write(path.join("file.txt"), "sibling\n").expect("write sibling file");
+        self.git_in(&path, &["add", "file.txt"]);
+        self.git_in(&path, &["commit", "-m", "sibling"]);
+        path
+    }
+
+    /// An empty directory beside the repository, created for the caller.
+    pub fn scratch(&self, name: &str) -> PathBuf {
+        let path = self.base.join(name);
+        std::fs::create_dir_all(&path).expect("scratch directory");
+        path
     }
 
     /// Every ref in the repository, `refname -> sha`. This is the shape
@@ -129,6 +176,10 @@ fn run_git(dir: &Path, empty: &Path, args: &[&str]) -> String {
         .arg("commit.gpgsign=false")
         .arg("-c")
         .arg(format!("core.hooksPath={}", empty.display()))
+        // git 2.38 blocked file:// submodules by default (CVE-2022-39253);
+        // fixtures have to opt back in to build a submodule locally.
+        .arg("-c")
+        .arg("protocol.file.allow=always")
         .args(args)
         // Pointing config at files that do not exist is git's supported way of
         // saying "no config here".

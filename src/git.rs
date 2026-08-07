@@ -10,6 +10,7 @@
 //! rehearsed command against the user's editor and terminal) is a separate
 //! concern and does not belong here.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::Path;
@@ -91,6 +92,32 @@ where
         code: output.status.code(),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     })
+}
+
+/// The refs under `pattern` as `name -> sha`, with `strip` leading components
+/// removed from each name.
+///
+/// `refs(dir, "refs/heads/", 0)` gives full ref names, which is what a
+/// pre-state snapshot records; `strip = 2` gives bare branch names.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn refs(dir: &Path, pattern: &str, strip: u8) -> Result<BTreeMap<String, String>> {
+    let listing = run(
+        dir,
+        [
+            "for-each-ref".to_owned(),
+            format!("--format=%(objectname) %(refname:lstrip={strip})"),
+            pattern.to_owned(),
+        ],
+    )?;
+    Ok(listing
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(_, name)| !name.is_empty())
+        .map(|(sha, name)| (name.to_owned(), sha.to_owned()))
+        .collect())
 }
 
 /// Renders an argument list for an error message.

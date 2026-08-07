@@ -14,6 +14,7 @@
 pub mod cache;
 pub mod error;
 pub mod git;
+pub mod preflight;
 pub mod sandbox;
 
 pub use error::{Error, Result};

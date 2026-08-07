@@ -312,8 +312,8 @@ fn clone(root: &Path, repo: &Path, hooks: &Path) -> Result<()> {
 /// transaction that refuses if the clone is not the shape we believe it is,
 /// rather than overwriting something we did not predict.
 fn promote_branches(worktree: &Path) -> Result<()> {
-    let existing = refs_under(worktree, "refs/heads/", 2)?;
-    let remote = refs_under(worktree, "refs/remotes/origin/", 3)?;
+    let existing = git::refs(worktree, "refs/heads/", 2)?;
+    let remote = git::refs(worktree, "refs/remotes/origin/", 3)?;
 
     let mut updates = String::new();
     for (name, sha) in &remote {
@@ -332,25 +332,6 @@ fn promote_branches(worktree: &Path) -> Result<()> {
     }
     git::run_with_stdin(worktree, ["update-ref", "--stdin", "-z"], Some(&updates))?;
     Ok(())
-}
-
-/// The refs under `pattern` as `name -> sha`, with `strip` leading components
-/// removed from each name.
-fn refs_under(worktree: &Path, pattern: &str, strip: u8) -> Result<BTreeMap<String, String>> {
-    let listing = git::run(
-        worktree,
-        [
-            "for-each-ref".to_owned(),
-            format!("--format=%(objectname) %(refname:lstrip={strip})"),
-            pattern.to_owned(),
-        ],
-    )?;
-    Ok(listing
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .filter(|(_, name)| !name.is_empty())
-        .map(|(sha, name)| (name.to_owned(), sha.to_owned()))
-        .collect())
 }
 
 /// Removes every remote, then proves there are none left.
