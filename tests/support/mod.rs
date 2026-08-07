@@ -40,13 +40,12 @@ impl Fixture {
     /// more commit), checked out on `main`.
     pub fn new() -> Self {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        // Canonicalised because macOS hands out /var/... paths that are really
-        // /private/var/..., and the cache directory name is derived from the
-        // canonical path.
-        let base = dir
-            .path()
-            .canonicalize()
-            .expect("the temporary directory resolves");
+        // Through the library's own canonicaliser rather than std's: macOS
+        // hands out /var/... paths that are really /private/var/..., and on
+        // Windows std returns a \\?\ path that git reads as a hostname. A
+        // fixture path has to be the same shape a real repository path is.
+        let base =
+            git_rehearse::git::canonicalize(dir.path()).expect("the temporary directory resolves");
         let fixture = Self {
             _dir: dir,
             repo: base.join("repo"),
