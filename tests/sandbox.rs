@@ -88,6 +88,27 @@ fn the_sandbox_carries_the_repositorys_own_commit_identity() {
 }
 
 #[test]
+fn the_sandbox_carries_the_repositorys_line_ending_policy() {
+    let fixture = Fixture::new();
+    // Same class as the identity: set locally, invisible to a clone, and it
+    // decides the bytes the rehearsed command sees in the worktree. Without
+    // it a conflict can present differently in the sandbox than it would at
+    // home, which is the one thing the rehearsal must not do.
+    fixture.git(&["config", "core.autocrlf", "input"]);
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
+
+    assert_eq!(
+        fixture.git_in(
+            &sandbox.worktree(),
+            &["config", "--local", "--get", "core.autocrlf"]
+        ),
+        "input"
+    );
+}
+
+#[test]
 fn the_meta_file_records_what_apply_will_need() {
     let fixture = Fixture::new();
     let pre_state = fixture.refs();
