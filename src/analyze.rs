@@ -162,7 +162,16 @@ fn current_state(worktree: &Path) -> Result<BTreeMap<String, String>> {
 }
 
 /// Every ref whose commit differs between the two states.
-fn ref_moves(before: &BTreeMap<String, String>, after: &BTreeMap<String, String>) -> Vec<RefMove> {
+///
+/// Public because apply recomputes this for itself rather than trusting an
+/// [`Analysis`] handed to it: `git rehearse apply <id>` runs in a later
+/// process against a rehearsal nobody has looked at since, and the refs it
+/// moves must be derived from what is on disk right then.
+#[must_use]
+pub fn ref_moves(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<RefMove> {
     let names: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
     names
         .into_iter()
