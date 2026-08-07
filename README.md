@@ -1,5 +1,9 @@
 # git-rehearse
 
+[![quality](https://github.com/maximalcode/git-rehearse/actions/workflows/quality.yml/badge.svg?branch=develop)](https://github.com/maximalcode/git-rehearse/actions/workflows/quality.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/maximalcode/git-rehearse/badge)](https://scorecard.dev/viewer/?uri=github.com/maximalcode/git-rehearse)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Rehearse dangerous git commands in a shadow clone of your real repo. See
 exactly what would happen — then apply it or throw it away.**
 

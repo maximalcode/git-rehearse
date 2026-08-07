@@ -31,7 +31,7 @@ jobs:
         env:
           RUSTFLAGS: -Dwarnings
         run: cargo clippy --all-targets --locked
-      # advisories covers what cargo-audit would (RustSec); add 'licenses' to
-      # the list once deny.toml's allowlist holds your policy.
-      - run: cargo deny check advisories bans
+      # advisories covers what cargo-audit would (RustSec); 'licenses' gates
+      # against the allowlist set in deny.toml (policy decided in #1).
+      - run: cargo deny check advisories bans licenses
       - run: cargo test --locked
