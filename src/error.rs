@@ -30,6 +30,13 @@ pub enum Error {
     },
     /// A `meta.json` could not be written or parsed.
     Meta(PathBuf, serde_json::Error),
+    /// We will not rehearse this, and here is why.
+    ///
+    /// Design principle 5: refuse loudly rather than guess. The message is
+    /// product surface — it is written for a human in the middle of a rebase,
+    /// says what is in the way and what to do about it, and it is what the
+    /// CLI prints before exiting 4.
+    Refused(String),
     /// No usable cache directory could be determined from the environment.
     NoCacheDir,
     /// The sandbox could not be built for a structural reason of our own.
@@ -63,10 +70,12 @@ impl fmt::Display for Error {
                 Ok(())
             }
             Self::Meta(path, source) => write!(f, "{}: {source}", path.display()),
+            // Both verbatim: a refusal is already written for the person
+            // reading it, and a sandbox failure names its own cause.
+            Self::Refused(message) | Self::Sandbox(message) => f.write_str(message),
             Self::NoCacheDir => f.write_str(
                 "no cache directory: set GIT_REHEARSE_CACHE_DIR, XDG_CACHE_HOME, or HOME",
             ),
-            Self::Sandbox(message) => f.write_str(message),
         }
     }
 }
@@ -76,7 +85,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(_, source) | Self::Spawn(source) => Some(source),
             Self::Meta(_, source) => Some(source),
-            Self::Git { .. } | Self::NoCacheDir | Self::Sandbox(_) => None,
+            Self::Git { .. } | Self::Refused(_) | Self::NoCacheDir | Self::Sandbox(_) => None,
         }
     }
 }
