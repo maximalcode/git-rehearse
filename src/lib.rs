@@ -17,6 +17,7 @@ pub mod error;
 pub mod execute;
 pub mod git;
 pub mod preflight;
+pub mod report;
 pub mod sandbox;
 
 pub use error::{Error, Result};
