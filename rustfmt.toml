@@ -1,0 +1,33 @@
+# maxi-quality — Rust formatting baseline (rustfmt), issue #58.
+#
+# Copied into the consumer by scripts/adopt.sh; rustfmt has no include/extend
+# mechanism, so like mypy.ini this is a genuine copy — never hand-edit it,
+# re-run the script.
+#
+# DELIBERATELY MINIMAL. rustfmt's defaults are the community's defaults, and a
+# baseline that fights them buys churn with no bug caught. Only stable options
+# appear here — the unstable ones (imports_granularity and friends) require a
+# nightly toolchain, and this baseline pins stable. Two values below are stated
+# defaults, written out for the reason prettier.config.mjs states at length: an
+# unstated default changes under you in a major bump and arrives as unexplained
+# churn in somebody's diff. One value is not a default, and it is the one with
+# an ablation fixture.
+
+# A rustfmt run with NO config assumes edition 2015 and cannot even parse
+# `async fn`. Stating the edition is what makes the formatter able to read the
+# code at all; keep it in sync with the consumer's Cargo.toml edition.
+edition = "2024"
+
+# rustfmt's own default, stated. Matches configs/editorconfig
+# (max_line_length = 100), Prettier's printWidth and ruff's line-length — the
+# one number the whole baseline agrees on, for once by coincidence.
+max_width = 100
+
+# NOT the default (that is "Auto": whatever the file already uses). "Auto"
+# means a file that is consistently CRLF passes, so the same tree formats
+# "clean" on two machines and differs on every line. LF is what
+# configs/editorconfig already mandates for every language; the formatter
+# should enforce the policy, not defer to the incumbent line endings.
+# samples/format/crlf_line_endings.rs is the ablation fixture: clean under
+# rustfmt's defaults, rejected under this file.
+newline_style = "Unix"

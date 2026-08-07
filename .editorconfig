@@ -1,0 +1,50 @@
+# maxi-quality — shared .editorconfig baseline (all languages)
+#
+# Consume by copying this file to your repo root as `.editorconfig`:
+#   cp ~/dev/mine/maxi-quality/configs/editorconfig <repo>/.editorconfig
+#
+# C# projects additionally append configs/dotnet/dotnet.editorconfig — see
+# configs/dotnet/dotnet.editorconfig for the exact instructions.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+max_line_length = 100
+
+# 4-space languages
+[*.{cs,csx,vb}]
+indent_size = 4
+
+[*.{java,kt,kts,gradle}]
+indent_size = 4
+
+[*.py]
+indent_size = 4
+
+[*.go]
+indent_style = tab
+
+# Makefiles require real tabs
+[{Makefile,makefile,*.mk}]
+indent_style = tab
+
+# Generated / vendored lockfiles: leave exactly as the tool wrote them
+[{package-lock.json,pnpm-lock.yaml,yarn.lock,*.lock}]
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+
+# Markdown uses trailing double-space for hard line breaks
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[*.{csproj,props,targets,xml,xaml}]
+indent_size = 2

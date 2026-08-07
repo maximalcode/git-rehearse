@@ -1,0 +1,119 @@
+[package]
+name = "git-rehearse"
+version = "0.1.0-dev"
+edition = "2024"
+rust-version = "1.97"
+description = "Rehearse dangerous git commands in a shadow clone of your real repo — see exactly what would happen, then apply or discard."
+repository = "https://github.com/maximalcode/git-rehearse"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+
+# maxi-quality — Rust lint baseline (clippy + rustc lints), issue #58.
+#
+# USAGE — this block goes INTO the consumer's own Cargo.toml. Cargo cannot
+# consume lint configuration from a remote package: `[lints]` /
+# `[workspace.lints]` must live in the manifest itself. So Rust follows the C#
+# pattern (an adopt-time copy, like Directory.Build.props), not the TypeScript
+# remote-consumption pattern. `scripts/adopt.sh` appends it for you — as
+# written below into a workspace root, or with `workspace.` stripped from the
+# section names for a single-crate repo. Workspace MEMBERS opt in with:
+#
+#   [lints]
+#   workspace = true
+#
+# Regenerate with adopt.sh rather than hand-editing the copy; this file is the
+# source the drift check in CI compares against.
+#
+# THE STRICTNESS BAR IS THE HOUSE BAR: typescript-eslint strict-type-checked
+# for TS, `mypy --strict` for Python, TreatWarningsAsErrors for C#. For Rust
+# that means `clippy::all` + `clippy::pedantic` in full, a curated slice of
+# nursery/cargo, and `unsafe_code` forbidden outright.
+#
+# EVERYTHING IS `warn` HERE, AND CI RUNS WITH RUSTFLAGS="-Dwarnings". That
+# split is deliberate: the gate is CI's job, and a contributor's local
+# `cargo check` should tell them what is wrong, not wall them mid-refactor
+# with an error for a line they are about to delete. `unsafe_code` is the one
+# exception — see below.
+#
+# The `priority = -1` on the group entries is LOAD-BEARING: without it, cargo
+# refuses the manifest when an individual lint below overrides a group member
+# (the group and the lint get equal priority, and cargo makes the conflict a
+# hard error rather than guessing).
+
+[lints.rust]
+# `forbid`, not `deny`, and in the manifest rather than CI: unsafe is a design
+# decision, not a warning to fix later, and `forbid` is what stops a stray
+# `#[allow(unsafe_code)]` from waiving it file-by-file. Today's consumers are
+# CLIs and applications with no FFI; a crate that genuinely needs unsafe
+# (FFI, memory-mapped I/O) lowers this to "deny" in its OWN manifest and
+# documents why — that is a per-repo policy call, the same class of decision
+# as the C# packages.lock.json one.
+unsafe_code = "forbid"
+
+[lints.clippy]
+# The two groups, whole. `all` is correctness + suspicious + style +
+# complexity + perf; `pedantic` is the strict tier that matches the house bar.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# --- curated nursery picks ---------------------------------------------------
+# The nursery GROUP is not enabled — it is clippy's staging area and carries
+# known false positives. Each pick below is a real bug class with a low
+# false-positive rate, listed with the bug it catches:
+#
+# `unwrap_or(expensive())` evaluates the argument even on the Some/Ok path —
+# side effects run and allocations happen for nothing; `unwrap_or_else` is lazy.
+or_fun_call = "warn"
+# A mutating call inside debug_assert! vanishes in release builds — the same
+# argument as banning `assert` in production Python (S101): the check
+# evaporates in exactly the deployment that needs it.
+debug_assert_with_mut_call = "warn"
+# `PathBuf::push` with an absolute path silently REPLACES the whole path
+# instead of appending — a path-traversal-shaped bug, not a style point.
+path_buf_push_overwrite = "warn"
+# A collection that is filled but never read is dead logic wearing live
+# syntax — the mirror image of the SonarJS bug class (a collection read but
+# never filled) that got eslint-plugin-sonarjs adopted for TypeScript (#11).
+collection_is_never_read = "warn"
+# `Vec::new()` handed to `Read::read` reads zero bytes and reports success —
+# an I/O loop that terminates instantly and looks correct.
+read_zero_byte_vec = "warn"
+# `a.x == b.x && a.y == b.x` — the copy-paste typo class in operator chains.
+suspicious_operation_groupings = "warn"
+
+# --- curated cargo picks -----------------------------------------------------
+# The cargo group is 5 lints; three make the cut.
+#
+# A `*` requirement means "whatever the registry serves today" — the opposite
+# of the pinning posture everything else here enforces.
+wildcard_dependencies = "warn"
+# Feature names like `no-std` / `use-std` read as double negatives at every
+# call site; both lints are cheap and fire only on genuine mistakes.
+negative_feature_names = "warn"
+redundant_feature_names = "warn"
+#
+# NOT picked, and why:
+#   cargo_common_metadata — fires on every unpublished binary (a fresh
+#     `cargo new` has no description/license fields); publish metadata is a
+#     library concern and today's consumers are binaries.
+#   multiple_crate_versions — duplicate-version detection is cargo-deny's job
+#     (`[bans] multiple-versions` in deny.toml); two tools reporting the same
+#     graph disagree on the edges and someone has to arbitrate. One tool, one
+#     job. It also fires on transitive graphs a consumer cannot fix locally.
+
+# --- pedantic, individually disabled -----------------------------------------
+# Per CLAUDE.md's rule for the ESLint config: every disable carries its one-line
+# justification. Overrides for a single site belong in the code as
+# `#[allow(...)]` with a reason — scoped and greppable beats invisible.
+#
+# Mandates a "# Errors" doc section on every fn returning Result — a
+# documentation rule, not a bug class, and binaries have no API consumers.
+missing_errors_doc = "allow"
+# Same shape: mandates "# Panics" sections; the panic itself is what review
+# catches, not the missing doc heading.
+missing_panics_doc = "allow"
+# Flags `req`/`res`-class name pairs that idiomatic code uses constantly;
+# naming taste, not a defect, and the false-positive rate swamps the signal.
+similar_names = "allow"

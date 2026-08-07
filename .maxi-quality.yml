@@ -1,0 +1,26 @@
+# maxi-quality policy for this repo. Everything below is commented out, so as
+# written this file changes nothing — uncomment what you need.
+#
+# Unknown keys, unknown rule ids and unknown group names are HARD ERRORS, not
+# warnings. That is deliberate: a typo that silently does nothing is the failure
+# mode this file exists to prevent.
+#
+# rules:
+#   groups: [general, security, conventions]   # omit one to stop running it
+#   disable:                                   # the rule does not apply here
+#     - no-float-for-money
+#   warn:                                      # reported, never fails the build
+#     - todo-without-issue
+#
+# paths:
+#   exclude:
+#     - legacy                                 # NOT 'legacy/**' — semgrep's
+#                                              # --exclude matches path
+#                                              # components and would silently
+#                                              # ignore the glob form.
+#
+# extends: .maxi-quality/rules                 # your own semgrep rules, run
+#                                              # alongside the baseline's
+#
+# Gitleaks and OSV-Scanner are deliberately not configurable here: a leaked
+# credential and a known CVE are not matters of local policy.

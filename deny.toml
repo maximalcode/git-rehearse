@@ -1,0 +1,58 @@
+# maxi-quality — Rust supply-chain baseline (cargo-deny), issue #58.
+#
+# Copied into the consumer by scripts/adopt.sh — cargo-deny reads deny.toml
+# from the workspace root, and like rustfmt.toml it has no extend mechanism.
+#
+# One tool, four checks, one supply chain to trust: `advisories` covers what
+# cargo-audit would (RustSec), `bans` covers duplicate versions, `licenses`
+# and `sources` are opt-in policy — the same argument as the SBOM note in
+# actions/layer2: no second tool doing the same walk over the same graph.
+#
+# Layer 2's OSV-Scanner ALSO reads Cargo.lock, so a consumer on the reusable
+# workflow gets two advisory feeds (OSV aggregates RustSec). That overlap is
+# deliberate: cargo-deny runs locally and in the consumer's own CI without any
+# baseline machinery, which is what a first-commit adoption needs.
+
+[graph]
+# Empty = every target. Deliberate: a dependency compiled only on a platform
+# CI never builds is still shipped to whoever runs there, and an advisory
+# does not care which cfg() gate the dependency sits behind.
+targets = []
+
+[advisories]
+# The version-2 defaults are already the right posture: a RustSec advisory is
+# an ERROR, unmaintained transitive crates warn. `yanked` defaults to warn and
+# is raised — a yanked crate was pulled by its own author, usually for a
+# soundness or security reason that never got an advisory id; a warning nobody
+# reads is not a posture.
+yanked = "deny"
+# Waivers go here, each with a written reason — same rule as an ESLint
+# disable. Scoped and greppable beats invisible:
+#   { id = "RUSTSEC-0000-0000", reason = "not reachable: we never deserialize
+#     untrusted input with this crate" },
+ignore = []
+
+[bans]
+# Duplicate semver-incompatible versions of one crate: binary bloat and two
+# copies of one bug, but usually introduced transitively and not always
+# fixable at the leaf — so it warns rather than gates. Raise it locally once
+# the tree is clean if you want the ratchet.
+multiple-versions = "warn"
+wildcards = "allow" # clippy::wildcard_dependencies already owns this (lints.toml)
+
+[licenses]
+# EMPTY ON PURPOSE, and cargo-deny treats an empty allowlist as "flag
+# everything" — so the licenses check is NOT part of the CI gate until you
+# fill this in. Same reasoning as the Layer 2 `licenses` input having no
+# default: an allowlist is a per-repo policy call, and a default would gate
+# wrongly somewhere on day one. When you have a policy, list it and add
+# `licenses` to the `cargo deny check` invocation in your workflow:
+#   allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+allow = []
+
+[sources]
+# crates.io only, by default. A git dependency is a supply chain with no
+# registry, no yank mechanism and no advisory feed; adding one should be a
+# visible decision, which a warning makes it.
+unknown-registry = "warn"
+unknown-git = "warn"
