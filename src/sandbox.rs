@@ -247,6 +247,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
     promote_branches(&worktree)?;
     strip_remotes(&worktree)?;
     disable_hooks(&worktree, &hooks)?;
+    carry_identity(&plan.repo, &worktree)?;
     checkout(&worktree, &plan.checkout)?;
 
     let meta = Meta {
@@ -370,6 +371,32 @@ fn disable_hooks(worktree: &Path, hooks: &Path) -> Result<()> {
             hooks.as_os_str().to_os_string(),
         ],
     )?;
+    Ok(())
+}
+
+/// Copies the real repository's effective commit identity into the sandbox.
+///
+/// `git clone` does not copy `.git/config`, so a repository whose identity is
+/// set *locally* — a work checkout, a second GitHub account, anything with a
+/// per-repo `user.email` — would have its rehearsal committed under whatever
+/// the global identity happens to be. Principle 1 says the sandbox runs the
+/// user's git with the user's config; an author line that differs from the
+/// real repository's would break that in the one place it is most visible,
+/// since a rebase rewrites committer identity on every replayed commit.
+///
+/// Read with `--get`, which resolves local over global over system, so what
+/// lands in the sandbox is exactly what the real repository would have used.
+/// An identity that is not configured anywhere is left unset rather than
+/// invented: git behaves in the sandbox exactly as it would have at home,
+/// including refusing to commit without one.
+fn carry_identity(repo: &Path, worktree: &Path) -> Result<()> {
+    for key in ["user.name", "user.email"] {
+        if let Ok(value) = git::run(repo, ["config", "--get", key])
+            && !value.is_empty()
+        {
+            git::run(worktree, ["config", key, &value])?;
+        }
+    }
     Ok(())
 }
 

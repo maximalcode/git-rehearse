@@ -58,6 +58,11 @@ impl Fixture {
         std::fs::create_dir_all(&fixture.empty).expect("empty directory");
 
         fixture.git(&["init", "-b", "main"]);
+        // In the repository's own config, not only in the environment: a real
+        // repository has an identity git can read, and the sandbox has to
+        // carry it across for a rehearsed commit to be authored correctly.
+        fixture.git(&["config", "user.name", "Fixture"]);
+        fixture.git(&["config", "user.email", "fixture@example.invalid"]);
         fixture.commit("one", "one\n");
         fixture.commit("two", "two\n");
         fixture.git(&["tag", "v1"]);
@@ -121,6 +126,8 @@ impl Fixture {
         let path = self.base.join(name);
         std::fs::create_dir_all(&path).expect("sibling directory");
         self.git_in(&path, &["init", "-b", "main"]);
+        self.git_in(&path, &["config", "user.name", "Fixture"]);
+        self.git_in(&path, &["config", "user.email", "fixture@example.invalid"]);
         std::fs::write(path.join("file.txt"), "sibling\n").expect("write sibling file");
         self.git_in(&path, &["add", "file.txt"]);
         self.git_in(&path, &["commit", "-m", "sibling"]);
