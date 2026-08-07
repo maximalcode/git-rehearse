@@ -1,0 +1,96 @@
+# Builds the three platforms for a v* tag and attaches them to the release.
+#
+# SCOPE.md's checklist names cargo-dist for this. Hand-written instead, and
+# the reason is worth stating: what v0.1 needs is three binaries on a release
+# page, and this is that in sixty reviewable lines with every action pinned to
+# a commit. cargo-dist earns its keep when there are shell/PowerShell
+# installers, checksum manifests and a Homebrew tap to generate — none of
+# which v0.1 has. Swapping this file for `dist init` output when those are
+# wanted is a small change; carrying a generated multi-hundred-line workflow
+# before then is not.
+#
+# Uploading via the `gh` CLI rather than a release action keeps the
+# third-party surface at the two artifact actions GitHub itself publishes.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --target ${{ matrix.target }}
+          rustup default 1.97.1
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          staging="git-rehearse-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp target/${{ matrix.target }}/release/git-rehearse README.md LICENSE "$staging/"
+          tar czf "$staging.tar.gz" "$staging"
+          shasum -a 256 "$staging.tar.gz" > "$staging.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: |
+          $staging = "git-rehearse-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/git-rehearse.exe", README.md, LICENSE $staging
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
+          (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash | Out-File "$staging.zip.sha256"
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+            *.zip
+            *.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and attach the binaries to it
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: artifacts
+          merge-multiple: true
+      # --verify-tag: a release is only ever cut from a tag that exists here,
+      # never from a name somebody typed.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --verify-tag \
+            --generate-notes \
+            artifacts/*
