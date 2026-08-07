@@ -240,34 +240,51 @@ fn indent_into(out: &mut String, block: &str) {
 
 fn render_drift(out: &mut String, analysis: &Analysis) {
     for drift in &analysis.drift {
-        if analysis.drift_expected_empty {
-            // The loud one. This is the report line the tool exists to print.
+        let replay = &drift.replay;
+        if analysis.drift_expected_empty && replay.is_suspicious() {
+            // The loud one. This is the line the tool exists to print.
             let _ = writeln!(out, "warning: content drift on {}", drift.reference);
+            if replay.compared {
+                let _ = writeln!(
+                    out,
+                    "  replaying a commit should not change what it does. These did change:"
+                );
+                for subject in &replay.changed {
+                    let _ = writeln!(out, "    changed  {subject}");
+                }
+                for subject in &replay.dropped {
+                    let _ = writeln!(out, "    gone     {subject}");
+                }
+                let _ = writeln!(
+                    out,
+                    "  A conflict resolution, a merge driver or a dropped commit did this."
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  the content differs and the old and new commits could not be compared,"
+                );
+                let _ = writeln!(
+                    out,
+                    "  so what changed cannot be narrowed down. Read the diff."
+                );
+            }
+        } else if analysis.drift_expected_empty {
+            // Content differs, and every replayed commit still does what it
+            // did — so the difference came from the base, which is what
+            // rebasing onto a moved base is *for*. Said once, calmly.
             let _ = writeln!(
                 out,
-                "  replaying commits should land on the same content. These files differ,"
+                "content  {} — every replayed commit is unchanged; the difference is the {} \
+                 commit(s) picked up from the new base",
+                drift.reference,
+                replay.added.len()
             );
-            let _ = writeln!(
-                out,
-                "  which means something changed them along the way — a conflict resolution,"
-            );
-            let _ = writeln!(out, "  a merge driver, or a dropped commit.");
         } else {
             let _ = writeln!(out, "content  {}", drift.reference);
         }
         for change in &drift.changes {
             let _ = writeln!(out, "    {} {}", change.status, change.path);
-        }
-        // Only alongside the warning: the counts are there to explain a
-        // surprise, and on a merge — where changed content is the point —
-        // they are a statistic nobody asked for.
-        if analysis.drift_expected_empty && drift.commits_after != drift.commits_before {
-            let _ = writeln!(
-                out,
-                "  ({} commits before, {} after — part of the difference may come from the \
-                 base moving on)",
-                drift.commits_before, drift.commits_after
-            );
         }
         let _ = writeln!(out);
     }
@@ -357,7 +374,7 @@ fn parse(answer: &str, can_apply: bool) -> Option<Choice> {
 #[cfg(test)]
 mod tests {
     use super::{Choice, Graph, ask, can_apply, non_interactive, parse, render, short};
-    use crate::analyze::{Analysis, Commit, Conflict, Drift, FileChange, RefMove};
+    use crate::analyze::{Analysis, Commit, Conflict, Drift, FileChange, RefMove, Replay};
     use crate::execute::Outcome;
     use crate::sandbox::{Checkout, META_SCHEMA, Meta, Status};
     use std::collections::BTreeMap;
@@ -447,10 +464,9 @@ mod tests {
         assert!(report.contains("nothing moved"), "{report}");
     }
 
-    #[test]
-    fn drift_on_a_replay_is_a_warning_that_explains_itself() {
-        let mut analysis = analysis();
-        analysis.drift = vec![Drift {
+    /// A drift entry whose replay says what `replay` says.
+    fn drift(replay: Replay) -> Drift {
+        Drift {
             reference: "refs/heads/feature".to_owned(),
             changes: vec![FileChange {
                 status: "M".to_owned(),
@@ -458,15 +474,87 @@ mod tests {
             }],
             commits_before: 1,
             commits_after: 2,
-        }];
+            replay,
+        }
+    }
+
+    #[test]
+    fn a_commit_that_changed_when_replayed_is_a_warning_that_explains_itself() {
+        let mut analysis = analysis();
+        analysis.drift = vec![drift(Replay {
+            changed: vec!["teach the parser about tabs".to_owned()],
+            compared: true,
+            added: vec!["main moves on".to_owned()],
+            ..Replay::default()
+        })];
         let report = render(&meta(&["rebase", "main"]), &analysis, &Outcome::Clean, &[]);
 
         assert!(report.contains("warning: content drift"), "{report}");
+        assert!(
+            report.contains("changed  teach the parser about tabs"),
+            "{report}"
+        );
         assert!(report.contains("M src/main.rs"), "{report}");
         // The explanation matters as much as the warning: a warning nobody
         // understands gets ignored the second time.
         assert!(report.contains("conflict resolution"), "{report}");
-        assert!(report.contains("1 commits before, 2 after"), "{report}");
+    }
+
+    #[test]
+    fn a_dropped_commit_is_named_rather_than_left_to_be_noticed() {
+        let mut analysis = analysis();
+        analysis.drift = vec![drift(Replay {
+            dropped: vec!["fix the off-by-one".to_owned()],
+            compared: true,
+            ..Replay::default()
+        })];
+        let report = render(
+            &meta(&["rebase", "-i", "main"]),
+            &analysis,
+            &Outcome::Clean,
+            &[],
+        );
+
+        assert!(report.contains("warning: content drift"), "{report}");
+        assert!(report.contains("gone     fix the off-by-one"), "{report}");
+    }
+
+    #[test]
+    fn content_that_came_from_the_new_base_is_not_a_warning() {
+        // The most ordinary rebase there is: `rebase main` where main has
+        // moved on. The tip's tree differs by exactly the base's own commits,
+        // and warning about that would train people to ignore the warning.
+        let mut analysis = analysis();
+        analysis.drift = vec![drift(Replay {
+            added: vec!["a".to_owned(), "b".to_owned()],
+            compared: true,
+            ..Replay::default()
+        })];
+        let report = render(&meta(&["rebase", "main"]), &analysis, &Outcome::Clean, &[]);
+
+        assert!(!report.contains("warning"), "{report}");
+        assert!(
+            report.contains("every replayed commit is unchanged"),
+            "{report}"
+        );
+        assert!(
+            report.contains("2 commit(s) picked up from the new base"),
+            "{report}"
+        );
+        assert!(
+            report.contains("M src/main.rs"),
+            "still says what differs: {report}"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_git_could_not_compare_is_treated_as_suspicious() {
+        let mut analysis = analysis();
+        analysis.drift = vec![drift(Replay::default())];
+        let report = render(&meta(&["rebase", "main"]), &analysis, &Outcome::Clean, &[]);
+
+        assert!(report.contains("warning: content drift"), "{report}");
+        assert!(report.contains("could not be compared"), "{report}");
     }
 
     #[test]
@@ -481,6 +569,10 @@ mod tests {
             }],
             commits_before: 1,
             commits_after: 1,
+            replay: Replay {
+                compared: true,
+                ..Replay::default()
+            },
         }];
         let report = render(
             &meta(&["merge", "feature"]),

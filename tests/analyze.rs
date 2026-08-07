@@ -200,10 +200,71 @@ fn content_that_changes_during_a_replay_is_reported_as_drift() {
     assert_eq!(drift.changes.len(), 1);
     assert_eq!(drift.changes[0].path, "file.txt");
     assert_eq!(drift.changes[0].status, "M");
-    // And the counts explain part of it: the new tip carries a commit the old
-    // one did not, because the base moved on.
-    assert_eq!(drift.commits_before, 1);
-    assert_eq!(drift.commits_after, 2);
+    // And it names the commit that stopped doing what it did, which is the
+    // part a person can act on.
+    assert!(drift.replay.compared, "{:?}", drift.replay);
+    assert_eq!(drift.replay.changed, vec!["three".to_owned()]);
+    assert!(drift.replay.dropped.is_empty(), "{:?}", drift.replay);
+}
+
+#[test]
+fn a_rebase_onto_a_base_that_moved_on_is_not_called_drift() {
+    let fixture = Fixture::new();
+    // The most ordinary rebase there is: main gained a commit, in a file the
+    // feature branch never touched, and `feature` is replayed on top of it.
+    // The tip's tree now differs by exactly that commit — and calling that
+    // drift would train people to ignore the warning.
+    fixture.commit_file("other.txt", "other\n", "four");
+    fixture.git(&["checkout", "feature"]);
+
+    let (_sandbox, analysis) = rehearse(&fixture, &["rebase", "main"]);
+
+    assert!(
+        !analysis.drift.is_empty(),
+        "the trees do differ, and the report still says so"
+    );
+    assert!(
+        !analysis.has_unexpected_drift(),
+        "but nothing the replay did is worth warning about: {:?}",
+        analysis.drift
+    );
+    let replay = &analysis.drift[0].replay;
+    assert!(replay.compared);
+    assert!(replay.changed.is_empty(), "{replay:?}");
+    assert!(replay.dropped.is_empty(), "{replay:?}");
+    assert_eq!(
+        replay.added,
+        vec!["four".to_owned()],
+        "the commit picked up from the new base"
+    );
+}
+
+#[test]
+fn a_commit_dropped_by_a_rebase_is_reported() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "feature"]);
+    fixture.commit_file("a.txt", "a\n", "add a");
+    let (sandbox, plan) = sandbox_of(&fixture, &["rebase", "-i", "HEAD~2"]);
+    let worktree = sandbox.worktree();
+    let commits: Vec<String> = fixture
+        .git_in(&worktree, &["log", "--format=%H", "--reverse", "-2"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    // A todo that keeps the first commit and silently loses the second.
+    let todo_file = fixture.base().join("todo");
+    std::fs::write(&todo_file, format!("pick {}\n", commits[0])).expect("write the todo");
+    let todo = Todo {
+        file: todo_file,
+        editor: PathBuf::from(env!("CARGO_BIN_EXE_git-rehearse")),
+    };
+
+    let outcome = execute::run(&worktree, &plan.command, Some(&todo)).expect("the rebase runs");
+    let analysis = analyze::run(&worktree, &plan.pre_state, &plan.command, &outcome)
+        .expect("the sandbox can be read");
+
+    assert!(analysis.has_unexpected_drift(), "{analysis:?}");
+    assert_eq!(analysis.drift[0].replay.dropped, vec!["add a".to_owned()]);
 }
 
 #[test]
