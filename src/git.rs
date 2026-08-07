@@ -1,0 +1,166 @@
+//! The thin layer over the user's real `git`.
+//!
+//! Design principle 1 — *real git executes, always* — means this crate never
+//! reimplements git behaviour, so this module stays deliberately small: run a
+//! command, capture what it said, fail loudly with git's own words. Anything
+//! that reasons about the output belongs in a module with unit tests, not
+//! here.
+//!
+//! Everything in this module captures stdio. The interactive path (running the
+//! rehearsed command against the user's editor and terminal) is a separate
+//! concern and does not belong here.
+
+use std::ffi::{OsStr, OsString};
+use std::io::Write as _;
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use crate::{Error, Result};
+
+/// Runs `git -C <dir> <args...>` and returns its stdout, trailing newline
+/// trimmed.
+///
+/// Stdin is `/dev/null`: a git subprocess that decides to ask a question here
+/// would hang forever instead, and every caller in this module is
+/// non-interactive by construction.
+///
+/// # Errors
+///
+/// [`Error::Spawn`] if git is not runnable at all, [`Error::Git`] with git's
+/// stderr if it ran and exited non-zero.
+pub fn run<I, S>(dir: &Path, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_with_stdin(dir, args, None)
+}
+
+/// [`run`], with `input` fed to git's stdin.
+///
+/// Used for `update-ref --stdin`, where the alternative is one process per
+/// ref. The input is written and the pipe closed before the output is read;
+/// git's stdin-driven commands consume their whole input before writing
+/// anything substantial, so this cannot deadlock on the volumes we send.
+///
+/// # Errors
+///
+/// As [`run`], plus [`Error::Spawn`] if the pipe to git breaks mid-write.
+pub fn run_with_stdin<I, S>(dir: &Path, args: I, input: Option<&str>) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(&args)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(Error::Spawn)?;
+
+    if let Some(input) = input {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Sandbox("git stdin was not available".to_owned()))?;
+        stdin.write_all(input.as_bytes()).map_err(Error::Spawn)?;
+        // Dropped here on purpose: git waits for EOF, not for us.
+        drop(stdin);
+    }
+
+    let output = child.wait_with_output().map_err(Error::Spawn)?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_owned());
+    }
+    Err(Error::Git {
+        args: describe(&args),
+        code: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
+}
+
+/// Renders an argument list for an error message.
+///
+/// Lossy on purpose: this string is for a human reading a failure, never for
+/// re-execution, so a path that is not valid UTF-8 should still be legible
+/// rather than turn the error into a different error.
+fn describe(args: &[OsString]) -> String {
+    args.iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Appends a path to a `--flag=` prefix without going through `String`.
+///
+/// `format!("--template={}", path.display())` would corrupt a path that is not
+/// valid UTF-8; git takes bytes, so we hand it bytes.
+#[must_use]
+pub fn flag_with_path(prefix: &str, path: &Path) -> OsString {
+    let mut arg = OsString::from(prefix);
+    arg.push(path);
+    arg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{describe, flag_with_path, run};
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    #[test]
+    fn a_failing_git_command_reports_gits_own_words() {
+        // Chosen because it fails identically whether or not the working
+        // directory happens to be a git repository — a unit test should not
+        // depend on where the test runner was launched from.
+        let dir = std::env::current_dir().expect("a working directory");
+        let err = run(
+            &dir,
+            ["config", "--file", "/nonexistent/gitconfig", "--get", "a.b"],
+        )
+        .expect_err("git must reject an unreadable config file");
+        let message = err.to_string();
+        assert!(message.contains("config"), "{message}");
+        assert!(
+            message.contains("/nonexistent/gitconfig"),
+            "git's stderr must survive into the error: {message}"
+        );
+    }
+
+    #[test]
+    fn stdout_comes_back_without_its_trailing_newline() {
+        let dir = std::env::current_dir().expect("a working directory");
+        let version = run(&dir, ["--version"]).expect("git --version");
+        assert!(version.starts_with("git version"), "{version}");
+        assert!(!version.ends_with('\n'));
+    }
+
+    #[test]
+    fn arguments_render_readably_for_error_messages() {
+        let args: Vec<OsString> = ["checkout", "--detach", "deadbeef"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(describe(&args), "checkout --detach deadbeef");
+    }
+
+    #[test]
+    fn path_flags_keep_the_path_intact() {
+        let arg = flag_with_path("--template=", Path::new("/tmp/no hooks"));
+        assert_eq!(arg, OsString::from("--template=/tmp/no hooks"));
+    }
+}
