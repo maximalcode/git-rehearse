@@ -132,6 +132,17 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
+    /// An absolute path in the form *this* platform recognises.
+    ///
+    /// `Path::is_absolute` is false for a unix-style path on Windows — a
+    /// drive letter or a UNC prefix is what makes a path absolute there — and
+    /// the XDG rule below turns on exactly that question. Hard-coding a unix
+    /// path would test nothing on Windows except the hard-coding.
+    #[cfg(windows)]
+    const ABSOLUTE: &str = r"C:\Users\u\AppData\Local";
+    #[cfg(not(windows))]
+    const ABSOLUTE: &str = "/home/u/.cache";
+
     #[test]
     fn the_override_wins_and_is_used_verbatim() {
         let root = root_from(
@@ -145,9 +156,9 @@ mod tests {
 
     #[test]
     fn xdg_cache_home_gets_our_own_subdirectory() {
-        let root = root_from(None, Some(OsStr::new("/home/u/.cache")), None)
-            .expect("XDG_CACHE_HOME is usable");
-        assert_eq!(root, PathBuf::from("/home/u/.cache/git-rehearse"));
+        let root =
+            root_from(None, Some(OsStr::new(ABSOLUTE)), None).expect("XDG_CACHE_HOME is usable");
+        assert_eq!(root, PathBuf::from(ABSOLUTE).join("git-rehearse"));
     }
 
     #[test]
@@ -163,9 +174,9 @@ mod tests {
 
     #[test]
     fn an_empty_override_is_not_a_directory_name() {
-        let root = root_from(Some(OsStr::new("")), Some(OsStr::new("/c")), None)
+        let root = root_from(Some(OsStr::new("")), Some(OsStr::new(ABSOLUTE)), None)
             .expect("empty override falls through");
-        assert_eq!(root, PathBuf::from("/c/git-rehearse"));
+        assert_eq!(root, PathBuf::from(ABSOLUTE).join("git-rehearse"));
     }
 
     #[test]
