@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod analyze;
+pub mod apply;
 pub mod cache;
 pub mod error;
 pub mod execute;

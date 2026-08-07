@@ -307,11 +307,14 @@ fn clone(root: &Path, repo: &Path, hooks: &Path) -> Result<()> {
 /// name may legally contain a double quote, which the line-based format would
 /// parse as the start of a quoted string.
 ///
-/// Every update states the value it expects to replace — the SHA for the one
-/// branch `clone` already created locally, and empty (git's "this ref must not
-/// exist yet") for all the others. The whole promotion is then a single
-/// transaction that refuses if the clone is not the shape we believe it is,
-/// rather than overwriting something we did not predict.
+/// Every command states what it expects to find: `update` with the SHA it
+/// replaces for the one branch `clone` already created locally, and `create`
+/// — which fails if the ref exists — for all the others. The promotion is then
+/// a single transaction that refuses if the clone is not the shape we believe
+/// it is, rather than overwriting something we did not predict.
+///
+/// Not `update` with an empty old value: in NUL-delimited mode git reads that
+/// as "do not check", not as "must not exist".
 fn promote_branches(worktree: &Path) -> Result<()> {
     let existing = git::refs(worktree, "refs/heads/", 2)?;
     let remote = git::refs(worktree, "refs/remotes/origin/", 3)?;
@@ -323,10 +326,12 @@ fn promote_branches(worktree: &Path) -> Result<()> {
         if name == "HEAD" {
             continue;
         }
-        let old = existing.get(name).map_or("", String::as_str);
         // `write!` into the buffer rather than push_str(&format!(..)): no
         // intermediate String per branch, and writing to a String cannot fail.
-        let _ = write!(updates, "update refs/heads/{name}\0{sha}\0{old}\0");
+        let _ = match existing.get(name) {
+            Some(old) => write!(updates, "update refs/heads/{name}\0{sha}\0{old}\0"),
+            None => write!(updates, "create refs/heads/{name}\0{sha}\0"),
+        };
     }
     if updates.is_empty() {
         return Ok(());
