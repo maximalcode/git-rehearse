@@ -20,6 +20,7 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 
+use crate::execute::Outcome;
 use crate::{Error, Result, cache, git};
 
 /// Version of the `meta.json` document. Bump on any incompatible change; a
@@ -101,6 +102,13 @@ pub struct Meta {
     pub created_unix: u64,
     /// Fresh or kept.
     pub status: Status,
+    /// How the rehearsed command ended, once it has run.
+    ///
+    /// Recorded so a rehearsal stays self-describing across processes: `git
+    /// rehearse show <id>` tomorrow has to say "stopped on a conflict" without
+    /// re-running anything, and re-deriving that from the sandbox's state
+    /// would be guessing at what git did rather than remembering it.
+    pub result: Option<Outcome>,
 }
 
 impl Meta {
@@ -167,6 +175,27 @@ impl Sandbox {
     #[must_use]
     pub fn meta(&self) -> &Meta {
         &self.meta
+    }
+
+    /// Records how the rehearsed command ended.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] or [`Error::Meta`] if `meta.json` cannot be rewritten.
+    pub fn record(&mut self, outcome: &Outcome) -> Result<()> {
+        self.meta.result = Some(outcome.clone());
+        self.meta.write(&self.root)
+    }
+
+    /// Marks the rehearsal as one to keep, so `list` shows it and the prune
+    /// clock is the only thing that removes it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] or [`Error::Meta`] if `meta.json` cannot be rewritten.
+    pub fn keep(&mut self) -> Result<()> {
+        self.meta.status = Status::Kept;
+        self.meta.write(&self.root)
     }
 
     /// Deletes the rehearsal, immediately and entirely.
@@ -260,6 +289,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
         pre_state: plan.pre_state.clone(),
         created_unix: now_unix,
         status: Status::Fresh,
+        result: None,
     };
     meta.write(root)?;
     Ok(meta)
@@ -454,6 +484,47 @@ pub fn list(cache_root: &Path, repo_id: Option<&str>) -> Result<Vec<Sandbox>> {
     Ok(found)
 }
 
+/// Finds one rehearsal of a repository.
+///
+/// `id` may be a full rehearsal id or a unique prefix of one — nobody wants to
+/// type `1786248000-00` from a listing. Without an id, the most recent
+/// rehearsal of that repository is the one meant, because "apply it" said
+/// straight after a rehearsal can only mean that one.
+///
+/// # Errors
+///
+/// [`Error::Refused`] if there is no such rehearsal, or if a prefix matches
+/// more than one — an ambiguous id must not be resolved by guessing.
+pub fn find(cache_root: &Path, repo_id: &str, id: Option<&str>) -> Result<Sandbox> {
+    let mut candidates = list(cache_root, Some(repo_id))?;
+    let Some(id) = id else {
+        return candidates.pop().ok_or_else(|| {
+            Error::Refused(
+                "no rehearsals for this repository.\n\
+                 Rehearse something first: `git rehearse merge <branch>`."
+                    .to_owned(),
+            )
+        });
+    };
+
+    let mut matches: Vec<Sandbox> = candidates
+        .into_iter()
+        .filter(|sandbox| sandbox.id() == id || sandbox.id().starts_with(id))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(Error::Refused(format!(
+            "no rehearsal {id} for this repository.\n\
+             `git rehearse list` shows the ones there are."
+        ))),
+        _ => Err(Error::Refused(format!(
+            "{id} matches {} rehearsals.\n\
+             Use more of the id — `git rehearse list` shows them in full.",
+            matches.len()
+        ))),
+    }
+}
+
 /// Deletes rehearsals older than `max_age_secs`, returning the ids removed.
 ///
 /// Age comes from `meta.json` where there is one and from the directory's
@@ -542,6 +613,7 @@ mod tests {
             pre_state: BTreeMap::from([("refs/heads/main".to_owned(), "abc123".to_owned())]),
             created_unix: 1_786_248_000,
             status: Status::Fresh,
+            result: None,
         }
     }
 

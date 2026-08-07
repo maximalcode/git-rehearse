@@ -17,6 +17,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Error, Result, git};
 
 /// The argument that makes this binary act as git's sequence editor.
@@ -31,7 +33,8 @@ pub const SEQUENCE_EDITOR_ARG: &str = "__sequence-editor";
 /// `2` stopped, `3` failed), which v2's agent mode depends on — so the
 /// distinction between "stopped, and you can look at it" and "git refused" is
 /// load-bearing, not cosmetic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Outcome {
     /// The command finished and left no operation in progress.
     Clean,

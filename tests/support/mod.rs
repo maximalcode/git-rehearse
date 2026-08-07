@@ -141,6 +141,26 @@ impl Fixture {
         path
     }
 
+    /// Runs the real `git-rehearse` binary in the fixture repository.
+    ///
+    /// Returns the exit code and what it wrote. Exit codes are API from v0.1
+    /// on, and the only honest way to test an exit code is to let the process
+    /// exit. Stdin is `/dev/null`, which is also how a script would run it.
+    pub fn rehearse(&self, args: &[&str]) -> (i32, String, String) {
+        let output = Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+            .current_dir(&self.repo)
+            .args(args)
+            .env("GIT_REHEARSE_CACHE_DIR", &self.cache)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("git-rehearse runs");
+        (
+            output.status.code().expect("exited rather than signalled"),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
     /// Every ref in the repository, `refname -> sha`. This is the shape
     /// preflight will hand to [`Plan::pre_state`], and what an apply compares
     /// against to prove nothing moved.

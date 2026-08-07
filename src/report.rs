@@ -78,8 +78,14 @@ pub fn graphs(worktree: &Path, analysis: &Analysis) -> Result<Vec<Graph>> {
 }
 
 /// `git log --graph` for `tip`, stopping where it rejoins `other`.
+///
+/// The bounded range is empty whenever one tip is an ancestor of the other —
+/// a fast-forward, or a merge whose old tip the new one contains — and an
+/// empty "before" block tells the reader nothing about where they were. So an
+/// empty range, or one git will not compute because the two sides share no
+/// history, falls back to the last few commits from the tip.
 fn log_graph(worktree: &Path, tip: &str, other: &str) -> Result<String> {
-    git::run(
+    let bounded = git::run(
         worktree,
         [
             "log",
@@ -87,21 +93,19 @@ fn log_graph(worktree: &Path, tip: &str, other: &str) -> Result<String> {
             "--oneline",
             "--decorate",
             "--boundary",
-            // Everything reachable from this tip but not from where the other
-            // side forked — the affected subgraph, and nothing else.
+            // Everything reachable from this tip but not from the other side:
+            // the affected subgraph, and nothing else.
             tip,
             &format!("^{other}"),
         ],
-    )
-    .or_else(|_| {
-        // A tip whose history is entirely unrelated to the other side has no
-        // subgraph to bound; falling back to a short log beats an error in the
-        // middle of an otherwise good report.
-        git::run(
+    );
+    match bounded {
+        Ok(graph) if !graph.trim().is_empty() => Ok(graph),
+        _ => git::run(
             worktree,
-            ["log", "--graph", "--oneline", "--decorate", "-5", tip],
-        )
-    })
+            ["log", "--graph", "--oneline", "--decorate", "-3", tip],
+        ),
+    }
 }
 
 /// The pre-state key for `HEAD`, repeated here to keep the module's imports
@@ -254,7 +258,10 @@ fn render_drift(out: &mut String, analysis: &Analysis) {
         for change in &drift.changes {
             let _ = writeln!(out, "    {} {}", change.status, change.path);
         }
-        if drift.commits_after != drift.commits_before {
+        // Only alongside the warning: the counts are there to explain a
+        // surprise, and on a merge — where changed content is the point —
+        // they are a statistic nobody asked for.
+        if analysis.drift_expected_empty && drift.commits_after != drift.commits_before {
             let _ = writeln!(
                 out,
                 "  ({} commits before, {} after — part of the difference may come from the \
@@ -368,6 +375,7 @@ mod tests {
             pre_state: BTreeMap::new(),
             created_unix: 1_786_248_000,
             status: Status::Fresh,
+            result: None,
         }
     }
 
