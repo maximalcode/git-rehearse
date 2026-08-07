@@ -263,8 +263,10 @@ conventions layer for Rust.
       (`CLAUDE.md` §3; branch protection set at repo creation)
 - [x] `CLAUDE.md`: build/test commands, the five design principles verbatim, and the
       rule that principle 2 (apply = ref transplant) is inviolable
-- [ ] Releases: tag `v*` on main, cargo-dist builds the three platforms (first needed
-      at v0.1)
+- [x] Releases: tag `v*` on main → `.github/workflows/release.yml` builds
+      linux/macos/windows and attaches them with checksums. Hand-written rather than
+      cargo-dist (#10): v0.1 needs three binaries on a release page, not installers,
+      a checksum manifest and a Homebrew tap. Revisit when it does.
 - [x] Name collision check: crates.io verified free for `git-rehearse` and
       `git_rehearse` (2026-08-07); claimed with the first real `cargo publish`, not a
       placeholder

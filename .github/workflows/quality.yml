@@ -35,3 +35,25 @@ jobs:
       # against the allowlist set in deny.toml (policy decided in #1).
       - run: cargo deny check advisories bans licenses
       - run: cargo test --locked
+
+  # The tests, on the platforms the release ships to. Only the tests: fmt,
+  # clippy and cargo-deny read the same source and the same lockfile
+  # everywhere, so running them three times would buy nothing. What differs
+  # per platform is what `git` and the filesystem do — hardlinked clones,
+  # path handling, the shell git runs the sequence editor through — and that
+  # is exactly what the integration tests exercise.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide what the others would have said.
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+      - run: cargo test --locked

@@ -477,9 +477,7 @@ fn repo_id(cwd: &Path) -> Result<String> {
             cwd.display()
         ))
     })?;
-    let repo = PathBuf::from(top);
-    let repo = repo.canonicalize().map_err(Error::io(&repo))?;
-    Ok(cache::repo_id(&repo))
+    Ok(cache::repo_id(&git::canonicalize(&PathBuf::from(top))?))
 }
 
 #[cfg(test)]

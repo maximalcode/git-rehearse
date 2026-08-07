@@ -40,13 +40,12 @@ impl Fixture {
     /// more commit), checked out on `main`.
     pub fn new() -> Self {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        // Canonicalised because macOS hands out /var/... paths that are really
-        // /private/var/..., and the cache directory name is derived from the
-        // canonical path.
-        let base = dir
-            .path()
-            .canonicalize()
-            .expect("the temporary directory resolves");
+        // Through the library's own canonicaliser rather than std's: macOS
+        // hands out /var/... paths that are really /private/var/..., and on
+        // Windows std returns a \\?\ path that git reads as a hostname. A
+        // fixture path has to be the same shape a real repository path is.
+        let base =
+            git_rehearse::git::canonicalize(dir.path()).expect("the temporary directory resolves");
         let fixture = Self {
             _dir: dir,
             repo: base.join("repo"),
@@ -63,6 +62,12 @@ impl Fixture {
         // carry it across for a rehearsed commit to be authored correctly.
         fixture.git(&["config", "user.name", "Fixture"]);
         fixture.git(&["config", "user.email", "fixture@example.invalid"]);
+        // Windows CI checks out with core.autocrlf on, so a worktree file
+        // comes back as "x\r\n" where the test wrote "x\n". That is git doing
+        // what the user's config says — principle 1 — and the code under test
+        // reads this repository's config, so pinning it here is what makes an
+        // assertion about worktree bytes mean the same thing on every machine.
+        fixture.git(&["config", "core.autocrlf", "false"]);
         fixture.commit("one", "one\n");
         fixture.commit("two", "two\n");
         fixture.git(&["tag", "v1"]);
@@ -128,6 +133,7 @@ impl Fixture {
         self.git_in(&path, &["init", "-b", "main"]);
         self.git_in(&path, &["config", "user.name", "Fixture"]);
         self.git_in(&path, &["config", "user.email", "fixture@example.invalid"]);
+        self.git_in(&path, &["config", "core.autocrlf", "false"]);
         std::fs::write(path.join("file.txt"), "sibling\n").expect("write sibling file");
         self.git_in(&path, &["add", "file.txt"]);
         self.git_in(&path, &["commit", "-m", "sibling"]);

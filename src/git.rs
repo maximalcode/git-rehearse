@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 use crate::{Error, Result};
@@ -164,6 +164,49 @@ fn describe(args: &[OsString]) -> String {
         .map(|a| a.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Resolves a path to its canonical form, in a spelling git accepts.
+///
+/// Canonical because the cache directory name is derived from the repository
+/// path, and `~/dev/app` and `~/dev/../dev/app` must not become two rehearsal
+/// histories — on macOS that also resolves `/var` to `/private/var`.
+///
+/// The second half matters only on Windows, where [`Path::canonicalize`]
+/// returns an extended-length path (`\\?\C:\...`). Git reads a leading `\\`
+/// as a host and answers `hostname contains invalid characters`, so a path in
+/// that form cannot be handed to `git clone`. The prefix is stripped for
+/// ordinary drive paths; a genuine UNC path keeps its `\\` because there the
+/// leading slashes mean what git thinks they mean.
+///
+/// # Errors
+///
+/// [`Error::Io`] if the path cannot be resolved.
+pub fn canonicalize(path: &Path) -> Result<PathBuf> {
+    let resolved = path.canonicalize().map_err(Error::io(path))?;
+    Ok(git_readable(resolved))
+}
+
+#[cfg(windows)]
+fn git_readable(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return path;
+    };
+    let Prefix::VerbatimDisk(letter) = prefix.kind() else {
+        // VerbatimUNC and the rest keep their leading slashes: those really
+        // are host-shaped paths, and git treats them as such correctly.
+        return path;
+    };
+    let text = path.to_string_lossy();
+    // r"\\?\C:\dir" -> r"C:\dir"; the first six bytes are ASCII, always.
+    PathBuf::from(format!("{}:{}", letter as char, &text[6..]))
+}
+
+#[cfg(not(windows))]
+fn git_readable(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// Appends a path to a `--flag=` prefix without going through `String`.

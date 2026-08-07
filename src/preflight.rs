@@ -122,11 +122,10 @@ fn locate(cwd: &Path) -> Result<PathBuf> {
     }
 
     let top = git::run(cwd, ["rev-parse", "--show-toplevel"])?;
-    let repo = PathBuf::from(top);
     // git prints an absolute path but not necessarily a resolved one, and the
     // cache directory name is derived from this — /var/... and /private/var/...
     // must not become two rehearsal histories for one repository.
-    repo.canonicalize().map_err(Error::io(&repo))
+    git::canonicalize(&PathBuf::from(top))
 }
 
 fn refuse_if_shallow(repo: &Path) -> Result<()> {

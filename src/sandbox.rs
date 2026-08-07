@@ -276,7 +276,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
     promote_branches(&worktree)?;
     strip_remotes(&worktree)?;
     disable_hooks(&worktree, &hooks)?;
-    carry_identity(&plan.repo, &worktree)?;
+    carry_config(&plan.repo, &worktree)?;
     checkout(&worktree, &plan.checkout)?;
 
     let meta = Meta {
@@ -409,23 +409,40 @@ fn disable_hooks(worktree: &Path, hooks: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copies the real repository's effective commit identity into the sandbox.
+/// Settings whose absence would make the rehearsal differ from the real
+/// thing.
 ///
-/// `git clone` does not copy `.git/config`, so a repository whose identity is
-/// set *locally* — a work checkout, a second GitHub account, anything with a
-/// per-repo `user.email` — would have its rehearsal committed under whatever
-/// the global identity happens to be. Principle 1 says the sandbox runs the
-/// user's git with the user's config; an author line that differs from the
-/// real repository's would break that in the one place it is most visible,
-/// since a rebase rewrites committer identity on every replayed commit.
+/// Deliberately a short list rather than "everything local". Copying the whole
+/// config would carry `remote.*` and `core.hooksPath` straight back into a
+/// sandbox that exists to have neither, and would keep doing so for every
+/// setting git invents later. Each entry here earns its place by changing what
+/// the rehearsed command *produces* or *shows*:
+///
+/// - `user.name` / `user.email`: a rebase rewrites the committer line on every
+///   replayed commit, and those commits are what apply transplants.
+/// - `core.autocrlf` / `core.eol`: they decide the bytes in the worktree the
+///   command runs against, so a conflict can present differently without them.
+///
+/// (`.gitattributes` needs no carrying — it is tracked content, so the clone
+/// already has it. Signing is the same class as identity and is still open:
+/// see issue #16.)
+const CARRIED_CONFIG: [&str; 4] = ["user.name", "user.email", "core.autocrlf", "core.eol"];
+
+/// Copies the settings above from the real repository into the sandbox.
+///
+/// `git clone` does not copy `.git/config`, so anything set *locally* — a work
+/// checkout's identity, a per-repo line-ending policy — is simply absent from
+/// the sandbox. Principle 1 says the sandbox runs the user's git with the
+/// user's config, and an author line or a worktree that differs from the real
+/// repository's breaks that where it shows most.
 ///
 /// Read with `--get`, which resolves local over global over system, so what
 /// lands in the sandbox is exactly what the real repository would have used.
-/// An identity that is not configured anywhere is left unset rather than
-/// invented: git behaves in the sandbox exactly as it would have at home,
-/// including refusing to commit without one.
-fn carry_identity(repo: &Path, worktree: &Path) -> Result<()> {
-    for key in ["user.name", "user.email"] {
+/// A setting configured nowhere is left unset rather than invented: git then
+/// behaves in the sandbox exactly as it would have at home, including refusing
+/// to commit without an identity.
+fn carry_config(repo: &Path, worktree: &Path) -> Result<()> {
+    for key in CARRIED_CONFIG {
         if let Ok(value) = git::run(repo, ["config", "--get", key])
             && !value.is_empty()
         {
