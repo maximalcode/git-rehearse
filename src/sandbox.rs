@@ -422,11 +422,39 @@ fn disable_hooks(worktree: &Path, hooks: &Path) -> Result<()> {
 ///   replayed commit, and those commits are what apply transplants.
 /// - `core.autocrlf` / `core.eol`: they decide the bytes in the worktree the
 ///   command runs against, so a conflict can present differently without them.
+/// - the signing group: whether to sign (`commit.gpgsign`, `tag.gpgsign`),
+///   what to sign with (`user.signingkey`, `gpg.format`) and what does the
+///   signing (`gpg.*.program`). Because apply is a **ref transplant**, the
+///   commits made in the sandbox *become* the commits in the real repository
+///   — so without these, rehearsing a rebase in a repository that signs
+///   locally would replace signed history with unsigned history, silently.
+///   That is exactly the class of surprise this tool exists to prevent.
+///
+/// Verification settings (`gpg.ssh.allowedSignersFile`, `gpg.minTrustLevel`)
+/// are deliberately absent: they change whether git *believes* a signature,
+/// never whether it produces one, and nothing in a rehearsal verifies.
+///
+/// A repository that signs but whose key the sandbox cannot reach now fails
+/// the rehearsal outright rather than producing unsigned commits. That is the
+/// right way round: a loud exit 3 is recoverable, a quiet signature downgrade
+/// is not.
 ///
 /// (`.gitattributes` needs no carrying — it is tracked content, so the clone
-/// already has it. Signing is the same class as identity and is still open:
-/// see issue #16.)
-const CARRIED_CONFIG: [&str; 4] = ["user.name", "user.email", "core.autocrlf", "core.eol"];
+/// already has it.)
+const CARRIED_CONFIG: &[&str] = &[
+    "user.name",
+    "user.email",
+    "core.autocrlf",
+    "core.eol",
+    "commit.gpgsign",
+    "tag.gpgsign",
+    "user.signingkey",
+    "gpg.format",
+    "gpg.program",
+    "gpg.openpgp.program",
+    "gpg.ssh.program",
+    "gpg.x509.program",
+];
 
 /// Copies the settings above from the real repository into the sandbox.
 ///
