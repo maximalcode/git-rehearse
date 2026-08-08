@@ -366,31 +366,106 @@ fn replay(worktree: &Path, before: &str, after: &str) -> Replay {
 
 /// Reads `git range-diff --no-patch` output.
 ///
-/// Each line is `<n>:  <sha> <op> <n>:  <sha> <subject>`, where a missing side
-/// is written as `-:  -------`. The operator is the third whitespace-separated
-/// token, and the subject is everything after the second `<n>:  <sha>` pair.
+/// Every line pairs one commit with its counterpart:
+///
+/// ```text
+/// -:  ------- > 1:  b1a6479 main moves on
+/// 1:  cbd2376 = 2:  0bb1e77 teach the parser about tabs
+/// 2:  768e487 < -:  -------
+/// ```
+///
+/// Five fixed fields — index, object name, operator, index, object name —
+/// and then the subject, which the third line shows may be absent entirely.
+///
+/// **Validated against a grammar, not read by field number.** git publishes no
+/// machine-readable form of this listing: there is no `--porcelain`, no `-z`,
+/// and the columns are laid out for a person to read. Trusting a field index
+/// is therefore a bet on a shape git never promised — and the bet was already
+/// lost. A commit with an empty message produces a five-field line, the old
+/// "at least six fields" check read that as *not a pairing line* and skipped
+/// it, and so a **dropped** commit with an empty message was invisible: the
+/// drift warning stayed silent about precisely the thing it exists to shout
+/// about. See `a_dropped_commit_with_no_message_is_still_dropped` below.
+///
+/// So a line that does not match the grammar is not skipped. It abandons the
+/// whole comparison — [`Replay::compared`] false, which
+/// [`Replay::is_suspicious`] reports as a warning. This is the noisy direction
+/// on purpose: if a future git reformats the listing, every rehearsal saying
+/// "could not compare" is a bug report, whereas every rehearsal quietly saying
+/// "no drift" is the silent failure this tool exists to prevent.
 fn parse_range_diff(listing: &str) -> Replay {
     let mut replay = Replay {
         compared: true,
         ..Replay::default()
     };
-    for line in listing.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        // "1:", "<sha>", "<op>", "2:", "<sha>", subject...
-        let (Some(op), true) = (fields.get(2), fields.len() > 5) else {
-            continue;
+    for line in listing.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((operator, subject)) = pairing(line) else {
+            // Unreadable, therefore unknown, and unknown is not "fine".
+            return Replay::default();
         };
-        let subject = fields[5..].join(" ");
-        match *op {
-            "!" => replay.changed.push(subject),
-            "<" => replay.dropped.push(subject),
-            ">" => replay.added.push(subject),
-            // "=" is the good case, and anything else is not a pairing line.
+        match operator {
+            "!" => replay.changed.push(subject.to_owned()),
+            "<" => replay.dropped.push(subject.to_owned()),
+            ">" => replay.added.push(subject.to_owned()),
+            // "=" is the good case: the commit still does what it did.
             _ => {}
         }
     }
     reconcile_by_subject(&mut replay);
     replay
+}
+
+/// Splits one pairing line into its operator and its subject.
+///
+/// `None` for anything that is not a pairing line in the shape above — which
+/// is the signal to stop trusting the listing, not to move on to the next
+/// line.
+fn pairing(line: &str) -> Option<(&str, &str)> {
+    let (left_index, rest) = token(line)?;
+    let (left_object, rest) = token(rest)?;
+    let (operator, rest) = token(rest)?;
+    let (right_index, rest) = token(rest)?;
+    let (right_object, subject) = token(rest)?;
+
+    let shaped = is_index(left_index)
+        && is_object(left_object)
+        && matches!(operator, "=" | "!" | "<" | ">")
+        && is_index(right_index)
+        && is_object(right_object);
+    // The subject is whatever is left, trimmed of the column padding but
+    // otherwise untouched — collapsing its internal whitespace would stop it
+    // matching the same commit's subject on the other side.
+    shaped.then_some((operator, subject.trim()))
+}
+
+/// Splits the leading whitespace-delimited token off `text`, with the rest.
+fn token(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_start();
+    if text.is_empty() {
+        return None;
+    }
+    Some(
+        text.find(char::is_whitespace)
+            .map_or((text, ""), |end| text.split_at(end)),
+    )
+}
+
+/// A commit's position in its range (`3:`), or `-:` where that side has no
+/// commit to number.
+fn is_index(field: &str) -> bool {
+    match field.strip_suffix(':') {
+        Some("-") => true,
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+        None => false,
+    }
+}
+
+/// An abbreviated object name, or the dashes standing in for the one a missing
+/// commit does not have.
+fn is_object(field: &str) -> bool {
+    !field.is_empty()
+        && (field.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || field.bytes().all(|byte| byte == b'-'))
 }
 
 /// Re-pairs commits git would not pair, by subject.
@@ -578,6 +653,90 @@ mod tests {
         assert_eq!(replay.dropped, vec!["fix the off-by-one".to_owned()]);
         assert!(replay.changed.is_empty(), "{replay:?}");
         assert!(replay.is_suspicious());
+    }
+
+    /// Verbatim `git range-diff --no-color --no-patch` output, git 2.50.1, for
+    /// a feature branch of two commits rebased onto a base that gained one.
+    ///
+    /// Recorded from a real repository rather than written by hand: this is
+    /// the format the parser bets on, so the fixture has to be evidence of
+    /// what git prints and not a restatement of what we assumed it prints.
+    const REAL_REBASE: &str = "\
+-:  ------- > 1:  b1a6479 main moves on
+1:  cbd2376 = 2:  0bb1e77 teach the parser about tabs
+2:  768e487 = 3:  67ca312 fix the off-by-one
+";
+
+    /// Verbatim output, same git, for a branch whose first commit was dropped.
+    /// That commit was created with `--allow-empty-message`, so its pairing
+    /// line ends after the fifth field.
+    const REAL_DROPPED_EMPTY_MESSAGE: &str = "\
+1:  d9e4f6e < -:  -------
+2:  1add7b2 = 1:  537a8ec keeper
+";
+
+    #[test]
+    fn the_recorded_shape_of_a_real_rebase_still_parses() {
+        // If a git upgrade changes this format, this fails here rather than
+        // silently downgrading the drift warning to "nothing to report".
+        let replay = super::parse_range_diff(REAL_REBASE);
+        assert!(replay.compared, "{replay:?}");
+        assert_eq!(replay.added, vec!["main moves on".to_owned()]);
+        assert!(!replay.is_suspicious(), "{replay:?}");
+    }
+
+    #[test]
+    fn a_dropped_commit_with_no_message_is_still_dropped() {
+        // The line is `1:  d9e4f6e < -:  -------` — five fields and no
+        // subject, because the commit has no message. Counting fields read
+        // that as "not a pairing line" and skipped it, so a rebase that ate a
+        // commit reported no drift at all.
+        let replay = super::parse_range_diff(REAL_DROPPED_EMPTY_MESSAGE);
+        assert_eq!(replay.dropped, vec![String::new()], "{replay:?}");
+        assert!(
+            replay.is_suspicious(),
+            "a commit vanished; silence here is the failure this tool exists to prevent"
+        );
+    }
+
+    #[test]
+    fn a_listing_in_an_unfamiliar_format_is_not_read_as_a_clean_one() {
+        // Whatever a future git might print, it is not this parser's grammar,
+        // and guessing at it would be worse than admitting we cannot tell.
+        for listing in [
+            "commit a1b2c3d was rewritten as d4e5f6a\n",
+            "1:  a1b2c3d ~ 1:  d4e5f6a an operator we do not know\n",
+            "1:  a1b2c3d = 1:  not-a-sha subject\n",
+            "one:  a1b2c3d = 1:  d4e5f6a subject\n",
+            "1:  a1b2c3d =\n",
+        ] {
+            let replay = super::parse_range_diff(listing);
+            assert!(
+                !replay.compared,
+                "parsed {listing:?} as if it understood it"
+            );
+            assert!(replay.is_suspicious());
+        }
+    }
+
+    #[test]
+    fn one_unreadable_line_discredits_the_whole_listing() {
+        // Not "skip that line and report the rest": a listing we can only
+        // partly read is one whose unread part may hold the drift.
+        let replay = super::parse_range_diff(
+            "1:  a1b2c3d = 1:  d4e5f6a teach the parser about tabs\n\
+             something else entirely\n",
+        );
+        assert!(!replay.compared, "{replay:?}");
+    }
+
+    #[test]
+    fn a_subject_keeps_the_whitespace_inside_it() {
+        // Subjects are matched against each other by reconcile_by_subject, so
+        // normalising one side's spacing would stop a rewritten commit pairing
+        // with itself.
+        let replay = super::parse_range_diff("1:  a1b2c3d ! 1:  d4e5f6a two  spaces\tand a tab\n");
+        assert_eq!(replay.changed, vec!["two  spaces\tand a tab".to_owned()]);
     }
 
     #[test]

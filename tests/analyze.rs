@@ -268,6 +268,47 @@ fn a_commit_dropped_by_a_rebase_is_reported() {
 }
 
 #[test]
+fn a_dropped_commit_with_no_message_is_reported_too() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "feature"]);
+    fixture.write("a.txt", "a\n");
+    fixture.git(&["add", "--", "a.txt"]);
+    // No message at all. `git range-diff` then prints a pairing line that ends
+    // after the object name, and the parser used to require a sixth field
+    // before it would believe a line was a pairing at all — so this commit
+    // disappeared out of a rebase with the report saying nothing.
+    //
+    // Pinned against the user's real git rather than only against the recorded
+    // listing in the unit tests: the recorded one proves we read git 2.50's
+    // format, this one proves we read theirs.
+    fixture.git(&["commit", "--allow-empty-message", "-m", ""]);
+
+    let (sandbox, plan) = sandbox_of(&fixture, &["rebase", "-i", "HEAD~2"]);
+    let worktree = sandbox.worktree();
+    let commits: Vec<String> = fixture
+        .git_in(&worktree, &["log", "--format=%H", "--reverse", "-2"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let todo_file = fixture.base().join("todo");
+    std::fs::write(&todo_file, format!("pick {}\n", commits[0])).expect("write the todo");
+    let todo = Todo {
+        file: todo_file,
+        editor: PathBuf::from(env!("CARGO_BIN_EXE_git-rehearse")),
+    };
+
+    let outcome = execute::run(&worktree, &plan.command, Some(&todo)).expect("the rebase runs");
+    let analysis = analyze::run(&worktree, &plan.pre_state, &plan.command, &outcome)
+        .expect("the sandbox can be read");
+
+    assert!(
+        analysis.has_unexpected_drift(),
+        "a commit vanished and the report was silent: {analysis:?}"
+    );
+    assert_eq!(analysis.drift[0].replay.dropped, vec![String::new()]);
+}
+
+#[test]
 fn a_deleted_branch_is_a_move_with_nowhere_to_go() {
     let fixture = Fixture::new();
     let (sandbox, plan) = sandbox_of(&fixture, &["branch", "-D", "feature"]);
