@@ -334,3 +334,34 @@ fn evil_merge_drift_detection() {
     assert!(text.contains("warning: content drift"), "{text}");
     assert!(text.contains("changed  three"), "{text}");
 }
+
+// 10 -------------------------------------------------------- signed history (#16)
+
+#[test]
+fn a_rebase_applied_into_a_signing_repository_stays_signed() {
+    let fixture = Fixture::new();
+    // A repository that signs *locally* — the case `git clone` does not carry,
+    // so the sandbox knew nothing about it and the commits it produced were
+    // unsigned.
+    fixture.sign_with_ssh();
+    fixture.commit_file("other.txt", "other\n", "unrelated work");
+    fixture.git(&["checkout", "feature"]);
+
+    let rehearsal = rehearse(&fixture, &["rebase", "main"]);
+    assert_eq!(rehearsal.outcome, Outcome::Clean);
+    assert!(
+        fixture.is_signed(&rehearsal.sandbox.worktree(), "feature"),
+        "the sandbox has to sign: these are the very commits apply transplants"
+    );
+
+    apply::run(&rehearsal.sandbox, NOW).expect("apply succeeds");
+
+    // The whole point of the issue. Apply is a ref transplant, so whatever the
+    // sandbox committed is now the real repository's history — and a tool that
+    // silently downgrades signed history to unsigned is doing the exact thing
+    // it exists to warn about.
+    assert!(
+        fixture.is_signed(fixture.repo(), "feature"),
+        "a rehearsed rebase must not quietly strip the signatures off a branch"
+    );
+}

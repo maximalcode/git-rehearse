@@ -140,6 +140,46 @@ impl Fixture {
         path
     }
 
+    /// Makes the repository sign its commits, with a freshly generated ssh
+    /// key, and returns the public key's path.
+    ///
+    /// A real signer rather than a stub: the guarantee under test is that a
+    /// commit made in the sandbox comes out *signed*, and only something that
+    /// actually signs can prove that. ssh rather than gpg because it needs no
+    /// keyring, no agent and no passphrase — `ssh-keygen` ships alongside git
+    /// on every platform this is tested on.
+    ///
+    /// Set in the repository's own config, like the identity above, because
+    /// repo-local is precisely the case `git clone` does not carry.
+    pub fn sign_with_ssh(&self) -> PathBuf {
+        let key = self.base.join("signing-key");
+        let generated = Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-N", "", "-C", "", "-q", "-f"])
+            .arg(&key)
+            .status()
+            .expect("ssh-keygen runs");
+        assert!(generated.success(), "ssh-keygen failed");
+
+        let public = key.with_extension("pub");
+        // Forward slashes even on Windows: backslashes in a git config value
+        // are escape sequences, and git reads forward slashes everywhere.
+        let configured = public.display().to_string().replace('\\', "/");
+        self.git(&["config", "gpg.format", "ssh"]);
+        self.git(&["config", "user.signingkey", &configured]);
+        self.git(&["config", "commit.gpgsign", "true"]);
+        public
+    }
+
+    /// Whether `reference`'s tip commit in `dir` carries a signature.
+    ///
+    /// Read off the commit object rather than verified: verifying an ssh
+    /// signature needs an allowed-signers file, and the question worth asking
+    /// is whether git signed at all.
+    pub fn is_signed(&self, dir: &Path, reference: &str) -> bool {
+        self.git_in(dir, &["cat-file", "commit", reference])
+            .contains("gpgsig")
+    }
+
     /// An empty directory beside the repository, created for the caller.
     pub fn scratch(&self, name: &str) -> PathBuf {
         let path = self.base.join(name);

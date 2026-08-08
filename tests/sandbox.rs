@@ -109,6 +109,55 @@ fn the_sandbox_carries_the_repositorys_line_ending_policy() {
 }
 
 #[test]
+fn the_sandbox_carries_the_repositorys_signing_policy() {
+    let fixture = Fixture::new();
+    // The same class of setting as the identity — local, and invisible to a
+    // clone — but with sharper teeth. Apply is a ref transplant, so the
+    // commits the sandbox makes *become* the commits in the real repository:
+    // a sandbox that cannot sign turns signed history into unsigned history,
+    // and does it silently.
+    fixture.sign_with_ssh();
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
+    let worktree = sandbox.worktree();
+
+    assert_eq!(
+        fixture.git_in(&worktree, &["config", "--local", "--get", "commit.gpgsign"]),
+        "true"
+    );
+    assert_eq!(
+        fixture.git_in(&worktree, &["config", "--local", "--get", "gpg.format"]),
+        "ssh"
+    );
+    assert_eq!(
+        fixture.git_in(
+            &worktree,
+            &["config", "--local", "--get", "user.signingkey"]
+        ),
+        fixture.git(&["config", "--local", "--get", "user.signingkey"]),
+        "and the same key, not one re-derived from somewhere else"
+    );
+}
+
+#[test]
+fn a_repository_that_does_not_sign_gets_no_signing_config_invented_for_it() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
+
+    // Carrying a setting that is configured nowhere would make the sandbox
+    // behave differently from the repository it stands in for, which is the
+    // one thing it must never do. (`--list` rather than `--get`: git exits
+    // non-zero for a key that is not set, and "not set" is the answer under
+    // test, not a failure.)
+    let config = fixture.git_in(&sandbox.worktree(), &["config", "--local", "--list"]);
+    assert!(!config.contains("gpgsign"), "{config}");
+    assert!(!config.contains("signingkey"), "{config}");
+}
+
+#[test]
 fn the_meta_file_records_what_apply_will_need() {
     let fixture = Fixture::new();
     let pre_state = fixture.refs();
