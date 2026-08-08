@@ -81,14 +81,39 @@ fn without_a_terminal_a_rehearsal_is_discarded_unless_asked_otherwise() {
     fixture.commit_file("other.txt", "other\n", "four");
     let before = fixture.refs();
 
-    fixture.rehearse(&["merge", "--no-edit", "feature"]);
+    let (code, out, err) = fixture.rehearse(&["merge", "--no-edit", "feature"]);
 
     assert_eq!(fixture.refs(), before, "nothing was applied");
-    let (_, out, _) = fixture.rehearse(&["list"]);
+    let (_, listed, _) = fixture.rehearse(&["list"]);
     assert!(
-        out.contains("no rehearsals"),
-        "and nothing was left in the cache: {out}"
+        listed.contains("no rehearsals"),
+        "and nothing was left in the cache: {listed}"
     );
+    // Exit 0 with an unchanged repository is indistinguishable from having
+    // applied, unless the run says a question was skipped.
+    assert_eq!(code, CLEAN, "{err}");
+    assert!(
+        out.contains("stdin is not a terminal") && out.contains("discarded"),
+        "the skipped question has to be visible: {out}"
+    );
+    assert!(
+        out.contains("--apply") && out.contains("--keep"),
+        "and it has to name the two ways to script it: {out}"
+    );
+}
+
+#[test]
+fn asking_for_a_decision_up_front_is_not_a_skipped_question() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+
+    // --apply and --keep are the scripted paths. Nothing was decided on the
+    // user's behalf, so the notice would be noise.
+    let (_, applied, _) = fixture.rehearse(&["--apply", "merge", "--no-edit", "feature"]);
+    let (_, kept, _) = fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+
+    assert!(!applied.contains("nobody to ask"), "{applied}");
+    assert!(!kept.contains("nobody to ask"), "{kept}");
 }
 
 #[test]
@@ -182,6 +207,16 @@ fn help_and_version_work_and_say_what_the_exit_codes_mean() {
         "{help}"
     );
     assert!(help.contains("4 refused"), "{help}");
+    // The two things about the exit codes that surprise people: 0 does not
+    // mean "applied", and a pipe answers the question for you.
+    assert!(
+        help.contains("no terminal on stdin") && help.contains("discarded"),
+        "{help}"
+    );
+    assert!(
+        help.contains("describes the rehearsal, not what became of it"),
+        "{help}"
+    );
 
     let (code, version, _) = fixture.rehearse(&["--version"]);
     assert_eq!(code, CLEAN);

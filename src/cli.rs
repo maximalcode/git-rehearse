@@ -66,7 +66,23 @@ options (before the command; everything after it belongs to git):
 exit codes:
   0 rehearsed clean   2 stopped (conflict)   3 command failed
   4 refused           1 internal error
+
+The exit code describes the rehearsal, not what became of it: a rehearsal
+that ran cleanly and was then discarded still exits 0.
+
+With no terminal on stdin there is nobody to answer the keep/apply/discard
+question, so the rehearsal is discarded. Pass --apply or --keep to script it.
 ";
+
+/// Said when the question is skipped because there is nobody to answer it.
+///
+/// Without this the non-interactive path is invisible: exit 0 and an
+/// unchanged repository, which is truthful — it rehearsed cleanly — but reads
+/// as "applied" to anyone who did not know a question had been skipped and
+/// answered on their behalf.
+const NOT_A_TERMINAL: &str = "\
+stdin is not a terminal, so there was nobody to ask: the rehearsal was discarded.
+Use --apply to apply it, or --keep to keep it for `git rehearse apply`.";
 
 /// What the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,8 +318,13 @@ fn choose<W: Write>(decision: Decision, can_apply: bool, output: &mut W) -> Resu
         Decision::Apply => Some(Choice::Apply),
         Decision::Keep => Some(Choice::Keep),
         Decision::Ask if io::stdin().is_terminal() => None,
-        // Nobody to ask: discard unless told otherwise.
-        Decision::Ask => Some(report::non_interactive(false, false)),
+        // Nobody to ask: discard unless told otherwise — and say so, because a
+        // decision was made on the user's behalf and nothing else would reveal
+        // it.
+        Decision::Ask => {
+            writeln!(output, "\n{NOT_A_TERMINAL}").map_err(Error::Spawn)?;
+            Some(report::non_interactive(false, false))
+        }
     };
     if let Some(choice) = wanted {
         if choice == Choice::Apply && !can_apply {
