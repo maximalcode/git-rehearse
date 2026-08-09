@@ -142,8 +142,10 @@ git rehearse discard [<id>|--all]
 
 Installed as a `git-rehearse` binary on PATH → `git rehearse` works automatically as a
 git subcommand. Default flow after a rehearsal: print report, then prompt
-`[a]pply / [d]iscard / [k]eep`. Flags `--apply` / `--keep` / `--json=off` for scripting;
-non-TTY default is discard-unless-`--apply`.
+`[a]pply / [d]iscard / [k]eep`. Flags `--apply` / `--keep` for scripting; non-TTY default
+is discard-unless-`--apply`. (An earlier draft listed a `--json=off` flag here, which
+contradicted the out-list below: v1.0 has no JSON output in any spelling, so there is
+nothing to switch off. JSON arrives opt-in with `--json` in v2.)
 
 **Exit codes (stable from day one — v2 depends on them):**
 `0` rehearsed clean · `2` stopped on conflicts · `3` command failed in sandbox ·
@@ -167,7 +169,8 @@ checked-out branch, ref race on apply, dirty-tree refusal, evil-merge drift dete
 
 **Explicitly OUT of v1.0** (someone will be tempted; resist):
 - Dirty-worktree snapshotting (v1.x)
-- Conflict resolution *inside* the sandbox + resume (v1.x)
+- Conflict resolution *inside* the sandbox + resume (v1.x — the resume half,
+  `git rehearse continue`, shipped after v0.1.0; see v1.x item 3)
 - `undo` command (v1.x — pre-state file + printed SHAs cover recovery meanwhile)
 - JSON output, MCP, any agent affordance beyond `--todo` and exit codes (v2)
 - Any GUI (v3)
@@ -183,9 +186,14 @@ interactive rebase to a real repo with zero surprises.
 1. `git rehearse undo` — restore pre-state refs from the undo file, same race checks.
 2. Dirty worktree: snapshot via `git stash create` (no stash-list pollution), replicate
    into sandbox, unstash on apply.
-3. Resolve-in-sandbox: on conflicts, offer `[r]esolve` → drop into `$SHELL` inside the
-   sandbox; `git rehearse continue` re-analyzes and offers apply. (Resolutions carry
-   over on apply automatically — principle 2 gives us this for free.)
+3. Resolve-in-sandbox. **`git rehearse continue` is built** (post-v0.1.0, issue #38): the
+   conflict report prints the sandbox path and the exact command, you resolve there with
+   whatever tools you already use, and `continue` runs the matching `--continue`,
+   re-analyzes and offers apply. It sits in this list for history only — **it belongs to
+   v2, not to quality-of-life**, because the MCP conflict flow cannot exist without it.
+   Still unbuilt and now optional: the `[r]esolve` prompt that drops into `$SHELL` inside
+   the sandbox, which printing the path makes largely redundant. (Resolutions carry over
+   on apply automatically — principle 2 gives us this for free.)
 4. `--stat-only` fast mode; report paging; color config.
 
 ## v2.0 — agent mode (the strategic release)
@@ -195,11 +203,18 @@ codes and `--todo` stable.
 
 - **`--json`:** one machine-readable report document — schema versioned from day one
   (`"schema": 1`), containing command, exit class, ref moves, conflict list (file +
-  hunk counts + stopped-at commit), drift diffstat, sandbox id, apply token.
+  hunk counts + stopped-at commit), drift diffstat, and sandbox id. **There is no
+  separate "apply token"**; an earlier draft listed one and never said what it was. The
+  sandbox id already names a rehearsal, and the refs-moved race check reads the
+  pre-state out of `meta.json` itself. Handing the caller a fingerprint to pass back to
+  `apply` would move that check out of the tool and into the agent, which is the
+  opposite of principle 5.
 - **MCP server:** `git-rehearse mcp` (stdio). Tools: `rehearse(command, repo)`,
-  `inspect(id)`, `resolve_file(id, path, content)`, `apply(id)`, `discard(id)`.
-  An agent's rebase story becomes: rehearse → read conflicts → write resolutions into
-  the sandbox → re-inspect → apply. The user's worktree is untouched until `apply`.
+  `inspect(id)`, `resolve_file(id, path, content)`, `continue(id)`, `apply(id)`,
+  `discard(id)` — mirroring the CLI, `continue` included, since a stopped rehearsal is
+  the case an agent hits most. An agent's rebase story becomes: rehearse → read
+  conflicts → write resolutions into the sandbox → `continue` → re-inspect → apply. The
+  user's worktree is untouched until `apply`.
 - **Docs as product:** a copy-paste CLAUDE.md/AGENTS.md snippet ("before any
   history-rewriting git command, rehearse it and act on the report") and a PreToolUse
   hook example that intercepts `git rebase|merge|reset --hard` in Bash calls and reroutes
