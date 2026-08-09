@@ -228,6 +228,141 @@ fn discard_all_empties_the_cache_for_this_repository() {
     assert!(listed.contains("no rehearsals"), "{listed}");
 }
 
+/// Every `git log --graph` the run spawned, counted off git's own trace.
+fn graph_walks(trace: &str) -> usize {
+    trace
+        .lines()
+        .filter(|line| line.contains("log --graph"))
+        .count()
+}
+
+#[test]
+fn stat_only_does_not_spawn_the_graph_walks_it_leaves_out() {
+    // The point of the flag is the processes it does not start, not the
+    // shorter output: an implementation that walked the history and then
+    // dropped the result would satisfy every assertion about the report and
+    // none about the wait. So the trace is the assertion.
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+
+    let (code, full, _, full_trace) =
+        fixture.rehearse_traced("trace-full", &["merge", "--no-edit", "feature"]);
+    assert_eq!(code, CLEAN);
+    let (code, short, _, short_trace) = fixture.rehearse_traced(
+        "trace-stat",
+        &["--stat-only", "merge", "--no-edit", "feature"],
+    );
+    assert_eq!(code, CLEAN, "{short}");
+
+    assert!(
+        graph_walks(&full_trace) > 0,
+        "the full report walks the history: {full_trace}"
+    );
+    assert_eq!(
+        graph_walks(&short_trace),
+        0,
+        "and --stat-only walks none of it: {short_trace}"
+    );
+
+    // What is left is everything that says what happened.
+    assert!(!short.contains("graph  "), "{short}");
+    assert!(full.contains("graph  refs/heads/main"), "{full}");
+    assert!(
+        short.contains("rehearsed  git merge --no-edit feature"),
+        "{short}"
+    );
+    assert!(short.contains("refs/heads/main"), "{short}");
+}
+
+#[test]
+fn stat_only_is_a_faster_report_and_never_a_weaker_check() {
+    // The trap this guards against: "optimising" the flag further by skipping
+    // the analysis. The drift check is what catches a rebase quietly changing
+    // what a commit does, and it is exactly what the short report is read for.
+    let fixture = Fixture::new();
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+    let (_, out, _) = fixture.rehearse(&["--keep", "rebase", "main"]);
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+
+    // Resolve to something neither side said: content drift, the loud case.
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept rehearsal is there");
+    let worktree = sandbox.worktree();
+    std::fs::write(worktree.join("file.txt"), "resolved\n").expect("resolve");
+    fixture.git_in(&worktree, &["add", "file.txt"]);
+    let (code, _, err) = fixture.rehearse(&["--keep", "--stat-only", "continue", &id]);
+    assert_eq!(code, CLEAN, "{err}");
+
+    let (code, shown, _, trace) =
+        fixture.rehearse_traced("trace-show", &["--stat-only", "show", &id]);
+
+    assert_eq!(code, CLEAN, "{shown}");
+    assert_eq!(graph_walks(&trace), 0, "{trace}");
+    assert!(
+        trace.contains("range-diff"),
+        "the drift check still runs — it is the stat the short report is for: {trace}"
+    );
+    assert!(
+        shown.contains("warning: content drift on refs/heads/feature"),
+        "{shown}"
+    );
+    assert!(shown.contains("M file.txt"), "{shown}");
+    assert!(!shown.contains("graph  "), "{shown}");
+}
+
+#[test]
+fn stat_only_alongside_json_is_a_no_op_rather_than_a_refusal() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+
+    let (code, document, err) =
+        fixture.rehearse(&["--json", "--stat-only", "merge", "--no-edit", "feature"]);
+
+    assert_eq!(code, CLEAN, "{err}");
+    // Still one document, and the same one: the JSON report never carried the
+    // graphs, so there is nothing for the flag to leave out.
+    let (_, plain, _) = fixture.rehearse(&["--json", "merge", "--no-edit", "feature"]);
+    assert_eq!(normalised(&document), normalised(&plain), "{document}");
+
+    // And --help says so, because a flag that silently does nothing is a bug
+    // report waiting to be filed.
+    let (_, help, _) = fixture.rehearse(&["--help"]);
+    assert!(help.contains("--stat-only"), "{help}");
+    assert!(
+        help.contains("with --json it does nothing at all"),
+        "{help}"
+    );
+}
+
+/// One JSON report with everything two separate runs are entitled to disagree
+/// about removed: the rehearsal id, its sandbox path, and the commit the merge
+/// produced (a merge commit carries the wall clock, so no two runs write the
+/// same one). What is left differs only if the flag changed the document.
+fn normalised(text: &str) -> serde_json::Value {
+    let mut value: serde_json::Value = serde_json::from_str(text).expect("one JSON document");
+    let object = value.as_object_mut().expect("the document is an object");
+    object.remove("id");
+    object.remove("sandbox");
+    if let Some(refs) = object
+        .get_mut("refs")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for entry in refs {
+            if let Some(entry) = entry.as_object_mut() {
+                entry.remove("after");
+            }
+        }
+    }
+    value
+}
+
 #[test]
 fn help_and_version_work_and_say_what_the_exit_codes_mean() {
     let fixture = Fixture::new();

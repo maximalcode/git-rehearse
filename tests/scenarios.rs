@@ -200,8 +200,12 @@ fn octopus_merge() {
     );
     // The graph renderer is git's, so a three-parent commit has to come out
     // right without any help from us.
-    let graphs =
-        report::graphs(&rehearsal.sandbox.worktree(), &rehearsal.analysis).expect("graphs render");
+    let graphs = report::graphs(
+        &rehearsal.sandbox.worktree(),
+        &rehearsal.analysis,
+        report::Detail::Full,
+    )
+    .expect("graphs render");
     let text = report::render(
         rehearsal.sandbox.meta(),
         &rehearsal.analysis,

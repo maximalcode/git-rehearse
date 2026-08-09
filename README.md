@@ -305,6 +305,7 @@ always describes the most recent one.
 | `--apply` | apply without asking |
 | `--keep` | keep without asking |
 | `--json` | one JSON document on stdout instead of the report |
+| `--stat-only` | the report without the before/after graphs |
 | `--todo <file>` | drive an interactive rebase from a prepared todo |
 | `-h`, `--help` | usage |
 | `-V`, `--version` | version |
@@ -312,6 +313,20 @@ always describes the most recent one.
 `--apply` and `--keep` work with `continue` too — it ends on the same question
 a rehearsal does, so `git rehearse --keep continue <id>` is how you script a
 resolve-and-carry-on loop.
+
+`--stat-only` leaves out the before/after graphs, which are two
+`git log --graph` walks per moved ref and the slowest part of printing a
+report. Everything that says *what happened* stays — ref moves, carried work,
+conflicts, content drift — and only the drawing of *where you were* goes. It
+works on `show` and `continue` as well as on a fresh rehearsal; re-reading a
+kept report is exactly when you already know the shape of the history.
+
+**It changes what is drawn, never what is checked.** Drift detection runs
+either way: it is the check that justifies this tool, the drift lines are part
+of the short report, and a fast mode that switched off the safety check would
+be a trap rather than a flag. With `--json` the flag does nothing at all — that
+document never carried the graphs — and saying so beats refusing a harmless
+combination.
 
 **Our options come before the command; everything after it belongs to git.**
 So `git rehearse --apply rebase -i main` is ours, and

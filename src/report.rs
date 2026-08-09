@@ -33,6 +33,43 @@ pub struct Graph {
     pub after: String,
 }
 
+/// How much of the report gets drawn.
+///
+/// **This skips rendering, never analysis — and that is the whole design.**
+/// [`graphs`] is the only thing `StatOnly` switches off: two
+/// `git log --graph` processes per moved ref, plus a fallback walk whenever the
+/// bounded range comes back empty. Everything [`crate::analyze::run`] does still
+/// runs in full, `git range-diff` drift detection included.
+///
+/// The temptation to go further is obvious — `range-diff` is the larger cost on
+/// a big rehearsal — and it is a trap. Drift detection is what catches a rebase
+/// quietly changing what a commit does, so a fast mode that turned it off would
+/// be trading away the one check that justifies the tool for a shorter wait. The
+/// flag is called `stat-only`, not `unchecked`; the drift stat is *in* the fast
+/// output, so the analysis has to run to produce it either way. Skipping it
+/// would also mean `--stat-only --json` emitting a document with fields missing,
+/// which the schema has no way to express.
+///
+/// So: if you are here to make `--stat-only` faster, the answer is not to
+/// analyse less. It is to make the analysis cheaper for both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Detail {
+    /// The whole report, before/after graphs included.
+    #[default]
+    Full,
+    /// Everything that says *what happened*, nothing that draws *where you
+    /// were*: header, ref moves, carried work, conflicts, drift.
+    StatOnly,
+}
+
+impl Detail {
+    /// Whether the before/after graphs are worth the processes they cost.
+    #[must_use]
+    pub fn wants_graphs(self) -> bool {
+        self == Self::Full
+    }
+}
+
 /// What the user decided to do with a rehearsal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
@@ -56,10 +93,18 @@ pub enum Choice {
 /// ancestor of the old and new tip, plus the boundary commit for context.
 /// Rendering the whole history would bury the three commits that changed.
 ///
+/// This is also the one place [`Detail`] is honoured, deliberately: the graphs
+/// are the entire cost `--stat-only` avoids, and a single guard here means no
+/// caller can spawn them by forgetting. [`render`] draws no graph section for an
+/// empty slice, so the rest of the report needs to know nothing about the flag.
+///
 /// # Errors
 ///
 /// [`Error::Git`](crate::Error::Git) if the sandbox cannot be read.
-pub fn graphs(worktree: &Path, analysis: &Analysis) -> Result<Vec<Graph>> {
+pub fn graphs(worktree: &Path, analysis: &Analysis, detail: Detail) -> Result<Vec<Graph>> {
+    if !detail.wants_graphs() {
+        return Ok(Vec::new());
+    }
     let mut graphs = Vec::new();
     for moved in &analysis.ref_moves {
         // HEAD moves with its branch; drawing it twice says nothing new.
@@ -449,7 +494,9 @@ fn parse(answer: &str, can_apply: bool) -> Option<Choice> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Choice, Graph, ask, can_apply, non_interactive, parse, render, short};
+    use super::{
+        Choice, Detail, Graph, ask, can_apply, graphs, non_interactive, parse, render, short,
+    };
     use crate::analyze::{Analysis, Commit, Conflict, Drift, FileChange, RefMove, Replay};
     // Two different replays meet in this file: what happened to the *commits*
     // (above) and what happened to the *carried changes* (below).
@@ -458,7 +505,7 @@ mod tests {
     use crate::sandbox::{Checkout, META_SCHEMA, Meta, Status};
     use std::collections::BTreeMap;
     use std::io::Cursor;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn meta(command: &[&str]) -> Meta {
         Meta {
@@ -873,6 +920,52 @@ mod tests {
             report.contains("  after\n    * bbbbbbb new tip"),
             "{report}"
         );
+    }
+
+    #[test]
+    fn stat_only_asks_for_no_graphs_and_full_asks_for_them() {
+        assert!(Detail::Full.wants_graphs());
+        assert!(!Detail::StatOnly.wants_graphs());
+        // The default is the whole report: a flag adds terseness, its absence
+        // never removes anything.
+        assert_eq!(Detail::default(), Detail::Full);
+    }
+
+    #[test]
+    fn stat_only_spawns_nothing_rather_than_spawning_and_discarding() {
+        // The path is not a repository and does not exist, so any `git log`
+        // against it fails. Coming back Ok is therefore proof that no process
+        // ran at all — which is the point of the flag. A test that only
+        // compared the two outputs would pass just as happily on an
+        // implementation that drew the graphs and then threw them away.
+        let nowhere = Path::new("/git-rehearse/no/such/worktree");
+
+        let skipped = graphs(nowhere, &analysis(), Detail::StatOnly).expect("nothing is spawned");
+        assert!(skipped.is_empty());
+
+        graphs(nowhere, &analysis(), Detail::Full)
+            .expect_err("the full report really does have to read the repository");
+    }
+
+    #[test]
+    fn a_report_without_graphs_still_says_everything_that_happened() {
+        // What `--stat-only` costs, stated as a test: the graph section, and
+        // nothing else. The drift line in particular survives — it is a result
+        // of the analysis, which the flag never touches.
+        let mut analysis = analysis();
+        analysis.drift = vec![drift(Replay {
+            changed: vec!["teach the parser about tabs".to_owned()],
+            compared: true,
+            ..Replay::default()
+        })];
+        let report = render(&meta(&["rebase", "main"]), &analysis, &Outcome::Clean, &[]);
+
+        assert!(!report.contains("graph  "), "{report}");
+        assert!(
+            report.contains("refs/heads/feature  aaaaaaaa -> bbbbbbbb"),
+            "{report}"
+        );
+        assert!(report.contains("warning: content drift"), "{report}");
     }
 
     #[test]

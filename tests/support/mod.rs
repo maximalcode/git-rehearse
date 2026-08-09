@@ -193,7 +193,41 @@ impl Fixture {
     /// on, and the only honest way to test an exit code is to let the process
     /// exit. Stdin is `/dev/null`, which is also how a script would run it.
     pub fn rehearse(&self, args: &[&str]) -> (i32, String, String) {
-        let output = Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+        let (code, out, err, _) = self.rehearse_tracing(None, args);
+        (code, out, err)
+    }
+
+    /// The same run, with git's own trace collected into `trace_name`.
+    ///
+    /// Returns the exit code, stdout, stderr and the trace. This is how a test
+    /// asserts which git processes a run *did not* spawn — the only honest way
+    /// to test a flag whose whole purpose is the work it avoids, since an
+    /// implementation that spawned the processes and threw the output away
+    /// would pass any assertion made about the report alone.
+    ///
+    /// `GIT_TRACE` is git's own instrument, so this needs no shim on `PATH`:
+    /// every git process started under it appends its argument list to the
+    /// named file, including the ones the binary under test starts for itself.
+    /// The path has to be absolute or git traces to stderr instead.
+    pub fn rehearse_traced(
+        &self,
+        trace_name: &str,
+        args: &[&str],
+    ) -> (i32, String, String, String) {
+        self.rehearse_tracing(Some(trace_name), args)
+    }
+
+    fn rehearse_tracing(
+        &self,
+        trace_name: Option<&str>,
+        args: &[&str],
+    ) -> (i32, String, String, String) {
+        let trace = trace_name.map(|name| self.base.join(name));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_git-rehearse"));
+        if let Some(trace) = &trace {
+            command.env("GIT_TRACE", trace);
+        }
+        let output = command
             .current_dir(&self.repo)
             .args(args)
             .env("GIT_REHEARSE_CACHE_DIR", &self.cache)
@@ -206,10 +240,14 @@ impl Fixture {
             .stdin(std::process::Stdio::null())
             .output()
             .expect("git-rehearse runs");
+        let traced = trace
+            .map(|path| std::fs::read_to_string(&path).unwrap_or_default())
+            .unwrap_or_default();
         (
             output.status.code().expect("exited rather than signalled"),
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
+            traced,
         )
     }
 

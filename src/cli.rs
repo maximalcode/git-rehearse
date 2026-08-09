@@ -23,7 +23,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::execute::{Outcome, SEQUENCE_EDITOR_ARG, Todo};
-use crate::report::Choice;
+use crate::report::{Choice, Detail};
 use crate::sandbox::{DEFAULT_TTL_SECS, Sandbox, Status};
 use crate::{
     Error, Result, analyze, apply, cache, carry, execute, git, json, now_unix, preflight, report,
@@ -40,11 +40,15 @@ pub enum Format {
     Json,
 }
 
-/// A parsed command line: what to do, and who the output is for.
+/// A parsed command line: what to do, who the output is for, and how much of
+/// it they want.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parsed {
     pub command: Command,
     pub format: Format,
+    /// From `--stat-only`. Reaches every command that prints a report, and is
+    /// harmlessly ignored by the ones that do not — see [`Detail`].
+    pub detail: Detail,
 }
 
 /// Exit codes. Stable from v0.1 on: v2's agent mode reads these, and SCOPE.md
@@ -80,6 +84,7 @@ options (before the command; everything after it belongs to git):
   --apply           apply without asking
   --keep            keep the rehearsal without asking
   --json            one JSON document on stdout instead of the report
+  --stat-only       the report without the before/after graphs
   --todo <file>     drive an interactive rebase from a prepared todo
   -h, --help        this text
   -V, --version     version
@@ -98,6 +103,14 @@ part-way is kept, because its sandbox is the only copy of where it got to and
 
 --json prints one document and nothing else, on every exit path including
 failures. It never prompts, for the same reason: there is nobody there.
+
+--stat-only leaves out the before/after graphs, which are two `git log --graph`
+walks per moved ref and the slowest part of a report. Everything that says what
+happened stays: ref moves, carried work, conflicts, content drift. It changes
+what is drawn and never what is checked — drift detection runs either way, and
+the drift lines are part of the short report. It works on `show` and `continue`
+as well as on a fresh rehearsal, and with --json it does nothing at all, since
+that document never carried the graphs to begin with.
 
 undo puts the refs back where the last apply found them, in one transaction and
 only if every one of them is still where that apply left it. One apply is
@@ -208,17 +221,19 @@ pub enum Decision {
 /// a command this version understands.
 pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut format = Format::Text;
+    let mut detail = Detail::Full;
     let mut decision = Decision::Ask;
     let mut todo = None;
     let mut rest = args.iter();
 
-    // Every `return` below goes through this, so the format reaches the caller
-    // whichever branch the command falls into.
+    // Every `return` below goes through this, so the format and the detail
+    // reach the caller whichever branch the command falls into.
     macro_rules! parsed {
         ($command:expr) => {
             return Ok(Parsed {
                 command: $command,
                 format,
+                detail,
             })
         };
     }
@@ -228,6 +243,10 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
             "-h" | "--help" => parsed!(Command::Help),
             "-V" | "--version" => parsed!(Command::Version),
             "--json" => format = Format::Json,
+            // Never an error alongside --json, just nothing: the document has
+            // no graphs to leave out, and refusing a harmless combination is
+            // noise in the one place a program is reading.
+            "--stat-only" => detail = Detail::StatOnly,
             "--apply" => decision = Decision::Apply,
             "--keep" => decision = Decision::Keep,
             "--todo" => {
@@ -304,6 +323,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     Ok(Parsed {
         command: Command::Help,
         format,
+        detail,
     })
 }
 
@@ -322,7 +342,10 @@ pub fn wants_json(args: &[String]) -> bool {
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--json" => return true,
-            "--apply" | "--keep" => {}
+            // Every valueless option of ours belongs here, or one of them
+            // standing before `--json` would end the scan and report a parse
+            // failure in English to a caller that asked for a document.
+            "--apply" | "--keep" | "--stat-only" => {}
             // Its value too: a path does not start with `-`, and letting it end
             // the scan would hide a `--json` that came after it.
             "--todo" => {
@@ -351,7 +374,11 @@ fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Option<String> {
 /// Whatever the operation returns; the caller turns it into an exit code with
 /// [`code_for`].
 pub fn run<W: Write>(parsed: Parsed, cwd: &Path, output: &mut W) -> Result<u8> {
-    let Parsed { command, format } = parsed;
+    let Parsed {
+        command,
+        format,
+        detail,
+    } = parsed;
     match command {
         Command::Help => {
             write!(output, "{USAGE}").map_err(Error::Spawn)?;
@@ -369,10 +396,12 @@ pub fn run<W: Write>(parsed: Parsed, cwd: &Path, output: &mut W) -> Result<u8> {
             command,
             todo,
             decision,
-        } => rehearse(&command, todo, decision, format, cwd, output),
+        } => rehearse(&command, todo, decision, format, detail, cwd, output),
         Command::List => list(format, cwd, output),
-        Command::Show { id } => show(id.as_deref(), format, cwd, output),
-        Command::Continue { id, decision } => resume(id.as_deref(), decision, format, cwd, output),
+        Command::Show { id } => show(id.as_deref(), format, detail, cwd, output),
+        Command::Continue { id, decision } => {
+            resume(id.as_deref(), decision, format, detail, cwd, output)
+        }
         Command::Apply { id } => apply_kept(id.as_deref(), format, cwd, output),
         Command::Undo { id } => undo_apply(id.as_deref(), format, cwd, output),
         Command::Discard { id, all } => discard(id.as_deref(), all, format, cwd, output),
@@ -427,6 +456,7 @@ fn rehearse<W: Write>(
     todo: Option<PathBuf>,
     decision: Decision,
     format: Format,
+    detail: Detail,
     cwd: &Path,
     output: &mut W,
 ) -> Result<u8> {
@@ -449,7 +479,7 @@ fn rehearse<W: Write>(
     sandbox.record(&outcome)?;
 
     let code = code_for_outcome(&outcome);
-    report_and_decide(sandbox, &outcome, decision, format, code, output)?;
+    report_and_decide(sandbox, &outcome, decision, format, detail, code, output)?;
     Ok(code)
 }
 
@@ -465,6 +495,7 @@ fn resume<W: Write>(
     id: Option<&str>,
     decision: Decision,
     format: Format,
+    detail: Detail,
     cwd: &Path,
     output: &mut W,
 ) -> Result<u8> {
@@ -482,7 +513,7 @@ fn resume<W: Write>(
     sandbox.record(&outcome)?;
 
     let code = code_for_outcome(&outcome);
-    report_and_decide(sandbox, &outcome, decision, format, code, output)?;
+    report_and_decide(sandbox, &outcome, decision, format, detail, code, output)?;
     Ok(code)
 }
 
@@ -498,6 +529,7 @@ fn report_and_decide<W: Write>(
     outcome: &Outcome,
     decision: Decision,
     format: Format,
+    detail: Detail,
     exit_code: u8,
     output: &mut W,
 ) -> Result<()> {
@@ -512,7 +544,7 @@ fn report_and_decide<W: Write>(
         );
     }
 
-    let graphs = report::graphs(&worktree, &analysis)?;
+    let graphs = report::graphs(&worktree, &analysis, detail)?;
     // A blank line first: git has just finished writing its own output to the
     // same terminal.
     writeln!(output).map_err(Error::Spawn)?;
@@ -817,7 +849,17 @@ fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
 }
 
 /// Re-prints a rehearsal's report.
-fn show<W: Write>(id: Option<&str>, format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
+///
+/// `--stat-only` earns its keep here as much as on a fresh rehearsal: re-reading
+/// a kept report is exactly when the reader already knows the shape of the
+/// history and wants the confirmation, not the drawing.
+fn show<W: Write>(
+    id: Option<&str>,
+    format: Format,
+    detail: Detail,
+    cwd: &Path,
+    output: &mut W,
+) -> Result<u8> {
     let sandbox = find(id, cwd)?;
     let meta = sandbox.meta();
     // What the command did is remembered rather than re-derived; a rehearsal
@@ -852,7 +894,7 @@ fn show<W: Write>(id: Option<&str>, format: Format, cwd: &Path, output: &mut W) 
         return Ok(exit::CLEAN);
     }
 
-    let graphs = report::graphs(&sandbox.worktree(), &analysis)?;
+    let graphs = report::graphs(&sandbox.worktree(), &analysis, detail)?;
     write!(
         output,
         "{}",
@@ -1002,6 +1044,7 @@ fn repo_id(cwd: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{Command, Decision, Format, code_for, exit, wants_json};
+    use crate::report::Detail;
     use crate::{Error, Result};
     use std::path::PathBuf;
 
@@ -1250,6 +1293,60 @@ mod tests {
         assert!(!wants_json(&args(&["rebase", "main", "--json"])));
         assert!(!wants_json(&args(&["--", "log", "--json"])));
         assert!(!wants_json(&args(&["rebase", "main"])));
+    }
+
+    /// The detail half of a parse.
+    fn detail(argv: &[&str]) -> Detail {
+        super::parse(&args(argv)).expect("parses").detail
+    }
+
+    #[test]
+    fn stat_only_is_one_of_our_options_and_obeys_the_same_rule_as_the_rest() {
+        assert_eq!(detail(&["--stat-only", "rebase", "main"]), Detail::StatOnly);
+        assert_eq!(detail(&["rebase", "main"]), Detail::Full);
+        // `show` is the case it was asked for as loudly as a fresh rehearsal,
+        // and `continue` prints the same report a rehearsal does, so it takes
+        // it for the same reason --keep does.
+        assert_eq!(detail(&["--stat-only", "show", "1786"]), Detail::StatOnly);
+        assert_eq!(detail(&["--stat-only", "continue"]), Detail::StatOnly);
+        // Alongside the other options, in either order, and it does not eat a
+        // value the way --todo does.
+        assert_eq!(
+            detail(&["--keep", "--stat-only", "--todo", "/tmp/todo", "rebase"]),
+            Detail::StatOnly
+        );
+    }
+
+    #[test]
+    fn stat_only_after_the_command_belongs_to_git_like_every_other_flag() {
+        let Command::Rehearse { command, .. } =
+            parse(&args(&["rebase", "main", "--stat-only"])).expect("parses")
+        else {
+            panic!("expected a rehearsal");
+        };
+        assert_eq!(command, self::command(&["rebase", "main", "--stat-only"]));
+        assert_eq!(detail(&["rebase", "main", "--stat-only"]), Detail::Full);
+        assert_eq!(detail(&["--", "log", "--stat-only"]), Detail::Full);
+    }
+
+    #[test]
+    fn stat_only_and_json_together_are_a_no_op_rather_than_an_error() {
+        // The document never carried the graphs, so there is nothing to leave
+        // out — and refusing a harmless combination is noise in the one place
+        // a program is reading. Both flags parse, in either order.
+        let parsed = super::parse(&args(&["--json", "--stat-only", "rebase", "main"]))
+            .expect("no refusal for a harmless combination");
+        assert_eq!(parsed.format, Format::Json);
+        assert_eq!(parsed.detail, Detail::StatOnly);
+        assert_eq!(
+            super::parse(&args(&["--stat-only", "--json", "show"]))
+                .expect("parses")
+                .format,
+            Format::Json
+        );
+        // And the failure path agrees on where our options stop, or a refusal
+        // after --stat-only would come back in English to a JSON caller.
+        assert!(wants_json(&args(&["--stat-only", "--json", "status"])));
     }
 
     #[test]

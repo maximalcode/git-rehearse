@@ -253,7 +253,25 @@ interactive rebase to a real repo with zero surprises.
    Still unbuilt and now optional: the `[r]esolve` prompt that drops into `$SHELL` inside
    the sandbox, which printing the path makes largely redundant. (Resolutions carry over
    on apply automatically — principle 2 gives us this for free.)
-4. `--stat-only` fast mode; report paging; color config.
+4. **`--stat-only`: BUILT** (#60, post-v1.1.0). The report without the before/after
+   graphs — two `git log --graph --oneline --decorate --boundary` processes per moved
+   ref, plus a `git log -3` fallback whenever the bounded range comes back empty, which
+   is the slowest part of printing a report and the only part it removes. Three things
+   this line did not anticipate, all decided while building it. It skips **rendering and
+   not analysis**, which is the question the phrase "fast mode" hides: skipping
+   `range-diff` would be the larger win on a big rehearsal and it is a trap, because
+   drift detection is what catches a rebase quietly changing what a commit does, the
+   drift stat is *in* the short output so the analysis has to run to produce it anyway,
+   and `--stat-only --json` would otherwise emit a document with fields the schema has no
+   way to mark missing. The flag is called `stat-only`, not `unchecked`. It applies to
+   **`show` and `continue`**, not only to a fresh rehearsal — re-reading a kept report is
+   the case somebody wants the short form most, and `continue` ends on the same report a
+   rehearsal does, the same reason `--keep` reaches it. And with **`--json` it is a
+   no-op** rather than an error, said in `--help`: that document never carried the graphs,
+   so there is nothing to leave out, and refusing a harmless combination is noise in the
+   one place a program is reading. Enforced in a single guard inside `report::graphs`, so
+   no caller can spawn the walks by forgetting. Report paging and colour config are still
+   unbuilt.
 
 ## v2.0 — agent mode (the strategic release)
 
