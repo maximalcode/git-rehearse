@@ -237,8 +237,12 @@ Two things worth knowing before you script this:
 - **The exit code describes the rehearsal, not what became of it.** A rehearsal
   that ran cleanly and was then discarded still exits `0`.
 - **With no terminal on stdin there is nobody to answer the prompt**, so the
-  rehearsal is discarded and the run says so. Pass `--apply` or `--keep` to
-  decide up front:
+  answer is given for you and the run says which one it gave. A rehearsal that
+  ran cleanly is **discarded** — you can always run the command again. One that
+  **stopped part-way is kept**, because its sandbox is the only copy of where it
+  got to, and discarding it would delete the path and the `continue` command the
+  report just printed. Nothing is ever applied unasked. Pass `--apply` or
+  `--keep` to decide up front:
 
   ```bash
   git rehearse --apply rebase main || echo "did not rebase cleanly: $?"

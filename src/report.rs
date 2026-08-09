@@ -307,17 +307,27 @@ pub fn can_apply(analysis: &Analysis, outcome: &Outcome) -> bool {
 
 /// What to do when nobody can be asked.
 ///
-/// Discard unless explicitly told otherwise, per SCOPE.md: a script that runs
-/// rehearsals in a loop must not silently fill the user's cache, and it must
-/// never apply anything nobody asked it to apply.
+/// Never apply: nothing is transplanted into a real repository without somebody
+/// saying so. Beyond that the answer depends on whether the rehearsal left
+/// anything worth coming back to.
+///
+/// **Clean, or failed → discard.** SCOPE.md's reasoning holds: a script running
+/// rehearsals in a loop must not silently fill the user's cache. A clean
+/// rehearsal nobody claimed can be reproduced by running it again, and a failed
+/// one left nothing in progress at all.
+///
+/// **Stopped → keep.** Here that reasoning inverts. A stopped rehearsal *is*
+/// its sandbox — a real repository sitting mid-rebase with the conflict in it —
+/// and that is the case this tool exists for. Discarding it deletes the very
+/// thing the report just gave directions to, and the directions with it: the
+/// path, the id, and the `git rehearse continue` that #38 was built for. Since
+/// [`can_apply`] is already false for a stopped rehearsal, keeping is the only
+/// answer here that destroys nothing, and the seven-day TTL still collects it.
 #[must_use]
-pub fn non_interactive(apply: bool, keep: bool) -> Choice {
-    if apply {
-        Choice::Apply
-    } else if keep {
-        Choice::Keep
-    } else {
-        Choice::Discard
+pub fn non_interactive(outcome: &Outcome) -> Choice {
+    match outcome {
+        Outcome::Stopped { .. } => Choice::Keep,
+        Outcome::Clean | Outcome::Failed { .. } => Choice::Discard,
     }
 }
 
@@ -693,10 +703,39 @@ mod tests {
     }
 
     #[test]
-    fn without_a_terminal_nothing_is_applied_or_kept_unless_asked() {
-        assert_eq!(non_interactive(false, false), Choice::Discard);
-        assert_eq!(non_interactive(true, false), Choice::Apply);
-        assert_eq!(non_interactive(false, true), Choice::Keep);
+    fn without_a_terminal_nothing_is_ever_applied() {
+        for outcome in [
+            Outcome::Clean,
+            Outcome::Stopped { conflicts: true },
+            Outcome::Failed { code: Some(1) },
+        ] {
+            assert_ne!(
+                non_interactive(&outcome),
+                Choice::Apply,
+                "nothing reaches a real repository unasked: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_terminal_a_stopped_rehearsal_is_kept_and_the_others_discarded() {
+        // The report has just printed a sandbox path and a `continue` command.
+        // Discarding here would delete both between printing and reading them.
+        assert_eq!(
+            non_interactive(&Outcome::Stopped { conflicts: true }),
+            Choice::Keep
+        );
+        assert_eq!(
+            non_interactive(&Outcome::Stopped { conflicts: false }),
+            Choice::Keep,
+            "an interactive `break` stops without conflicts and is just as resumable"
+        );
+        // Nothing to come back for: reproducible by re-running, or never started.
+        assert_eq!(non_interactive(&Outcome::Clean), Choice::Discard);
+        assert_eq!(
+            non_interactive(&Outcome::Failed { code: Some(1) }),
+            Choice::Discard
+        );
     }
 
     #[test]

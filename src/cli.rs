@@ -72,7 +72,9 @@ The exit code describes the rehearsal, not what became of it: a rehearsal
 that ran cleanly and was then discarded still exits 0.
 
 With no terminal on stdin there is nobody to answer the keep/apply/discard
-question, so the rehearsal is discarded. Pass --apply or --keep to script it.
+question. A rehearsal that ran cleanly is then discarded; one that stopped
+part-way is kept, because its sandbox is the only copy of where it got to and
+`continue` needs it. Pass --apply or --keep to decide up front either way.
 ";
 
 /// Said when the question is skipped because there is nobody to answer it.
@@ -84,6 +86,17 @@ question, so the rehearsal is discarded. Pass --apply or --keep to script it.
 const NOT_A_TERMINAL: &str = "\
 stdin is not a terminal, so there was nobody to ask: the rehearsal was discarded.
 Use --apply to apply it, or --keep to keep it for `git rehearse apply`.";
+
+/// Said instead when the rehearsal stopped part-way.
+///
+/// A stopped rehearsal is kept rather than discarded (see
+/// [`report::non_interactive`]), so this has to say something different — and
+/// it has to say it here, because the alternative is a run that prints
+/// directions to a sandbox and then deletes it.
+const NOT_A_TERMINAL_STOPPED: &str = "\
+stdin is not a terminal, so there was nobody to ask: the rehearsal was kept, because
+it stopped part-way and its sandbox is the only copy of where it got to.
+Carry it on with `git rehearse continue`, or throw it away with `git rehearse discard`.";
 
 /// What the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,12 +365,18 @@ fn report_and_decide<W: Write>(
     )
     .map_err(Error::Spawn)?;
 
+    // Whether a question is actually going to be put — not merely whether one
+    // was wanted. `Decision::Ask` means "ask if there is anybody to ask", and
+    // the next steps below tell the reader to answer a prompt, so they have to
+    // be gated on the prompt existing rather than on it having been requested.
+    let will_prompt = decision == Decision::Ask && io::stdin().is_terminal();
+
     if matches!(outcome, Outcome::Stopped { .. }) {
-        write_next_steps(&sandbox, &worktree, decision, output)?;
+        write_next_steps(&sandbox, &worktree, will_prompt, output)?;
     }
 
     let can_apply = report::can_apply(&analysis, outcome);
-    let choice = choose(decision, can_apply, output)?;
+    let choice = choose(decision, will_prompt, can_apply, outcome, output)?;
     act(choice, sandbox, output)
 }
 
@@ -370,7 +389,7 @@ fn report_and_decide<W: Write>(
 fn write_next_steps<W: Write>(
     sandbox: &Sandbox,
     worktree: &Path,
-    decision: Decision,
+    will_prompt: bool,
     output: &mut W,
 ) -> Result<()> {
     writeln!(output).map_err(Error::Spawn)?;
@@ -379,10 +398,12 @@ fn write_next_steps<W: Write>(
     // and the sandbox goes with it — so saying "cd there" without saying that
     // first would be sending the user to a directory about to be deleted.
     //
-    // Only when there is still a question to answer, though: with --keep
-    // already given, or on a rehearsal that is kept already, telling somebody
-    // to answer a prompt they will never see is worse than saying nothing.
-    if sandbox.meta().status == Status::Fresh && decision == Decision::Ask {
+    // Only when a prompt is actually coming, though. With --keep already given,
+    // or on a rehearsal that is kept already, telling somebody to answer a
+    // question they will never see is worse than saying nothing — and that is
+    // just as true when the question is skipped for want of a terminal, which
+    // is the case an agent is always in.
+    if sandbox.meta().status == Status::Fresh && will_prompt {
         writeln!(output, "  answer [k]eep below, then").map_err(Error::Spawn)?;
     }
     writeln!(output, "  cd {}", worktree.display()).map_err(Error::Spawn)?;
@@ -403,17 +424,29 @@ fn code_for_outcome(outcome: &Outcome) -> u8 {
 }
 
 /// Asks, or decides without asking.
-fn choose<W: Write>(decision: Decision, can_apply: bool, output: &mut W) -> Result<Choice> {
+fn choose<W: Write>(
+    decision: Decision,
+    will_prompt: bool,
+    can_apply: bool,
+    outcome: &Outcome,
+    output: &mut W,
+) -> Result<Choice> {
     let wanted = match decision {
         Decision::Apply => Some(Choice::Apply),
         Decision::Keep => Some(Choice::Keep),
-        Decision::Ask if io::stdin().is_terminal() => None,
-        // Nobody to ask: discard unless told otherwise — and say so, because a
-        // decision was made on the user's behalf and nothing else would reveal
-        // it.
+        Decision::Ask if will_prompt => None,
+        // Nobody to ask, so a decision gets made on the user's behalf — and it
+        // has to be announced, because nothing else in the output would reveal
+        // that a question was skipped at all.
         Decision::Ask => {
-            writeln!(output, "\n{NOT_A_TERMINAL}").map_err(Error::Spawn)?;
-            Some(report::non_interactive(false, false))
+            let choice = report::non_interactive(outcome);
+            let notice = if choice == Choice::Keep {
+                NOT_A_TERMINAL_STOPPED
+            } else {
+                NOT_A_TERMINAL
+            };
+            writeln!(output, "\n{notice}").map_err(Error::Spawn)?;
+            Some(choice)
         }
     };
     if let Some(choice) = wanted {
