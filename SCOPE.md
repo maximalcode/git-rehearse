@@ -229,10 +229,17 @@ codes and `--todo` stable.
   the case an agent hits most. An agent's rebase story becomes: rehearse → read
   conflicts → write resolutions into the sandbox → `continue` → re-inspect → apply. The
   user's worktree is untouched until `apply`.
-- **Docs as product:** a copy-paste CLAUDE.md/AGENTS.md snippet ("before any
+- **Docs as product: BUILT** (#54). A copy-paste CLAUDE.md/AGENTS.md snippet ("before any
   history-rewriting git command, rehearse it and act on the report") and a PreToolUse
-  hook example that intercepts `git rebase|merge|reset --hard` in Bash calls and reroutes
-  through rehearse. The README section for this *is* the marketing.
+  hook example that intercepts history-rewriting git calls in Bash and reroutes through
+  rehearse. The README section for this *is* the marketing.
+  **`reset --hard` was dropped from the intercept list on purpose**, and the boundary is
+  documented rather than left to be discovered: what makes it dangerous is *uncommitted*
+  work — committed history it appears to destroy is reflog-reachable for weeks — and
+  preflight refuses a dirty worktree. So on exactly the input where `reset --hard` is
+  dangerous there is nothing to rehearse, and where rehearsing works the command was not
+  very dangerous. Routing it here would *block* it, which is
+  `destructive_command_guard`'s product, not ours.
 - **Launch narrative:** "your agent can rehearse a rebase before it touches your repo" —
   aimed at the audience that gave destructive_command_guard 5.7k stars in seven months
   for *blocking* these commands. Rehearsal is the constructive version of blocking.
