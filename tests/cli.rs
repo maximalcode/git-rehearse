@@ -300,6 +300,80 @@ fn a_stopped_rehearsal_is_resolved_in_the_sandbox_and_continued() {
 }
 
 #[test]
+fn a_stopped_rehearsal_survives_having_nobody_to_ask_so_its_own_directions_work() {
+    // The regression this guards: without --keep, a stopped rehearsal printed
+    // its sandbox path and `git rehearse continue <id>`, then deleted the
+    // sandbox three lines later. Every instruction was already false by the
+    // time it was read — and since an agent never has a terminal, that was the
+    // path v2's whole audience takes.
+    let fixture = Fixture::new();
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+    let before = fixture.refs();
+
+    // No --keep, no --apply, and the harness gives the process no terminal.
+    let (code, out, err) = fixture.rehearse(&["rebase", "main"]);
+    assert_eq!(code, STOPPED, "{err}");
+
+    assert!(
+        out.contains("the rehearsal was kept"),
+        "the skipped question still has to be announced, with the answer it got: {out}"
+    );
+    assert!(
+        !out.contains("answer [k]eep below"),
+        "there is no prompt below when there is no terminal: {out}"
+    );
+
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("a stopped rehearsal is kept rather than discarded");
+    let worktree = sandbox.worktree();
+    assert!(
+        out.contains(&worktree.display().to_string()),
+        "the directions name a path: {out}"
+    );
+
+    // The point of keeping it: every instruction it printed can be carried out.
+    assert!(worktree.is_dir(), "and that path still exists");
+    std::fs::write(worktree.join("file.txt"), "resolved\n").expect("resolve");
+    fixture.git_in(&worktree, &["add", "file.txt"]);
+    let (code, cont, err) = fixture.rehearse(&["--keep", "continue", &id]);
+
+    assert_eq!(code, CLEAN, "{err}\n{cont}");
+    assert_eq!(
+        fixture.refs(),
+        before,
+        "and none of it touched the real repository"
+    );
+}
+
+#[test]
+fn a_clean_rehearsal_is_still_discarded_when_there_is_nobody_to_ask() {
+    // The other half of the rule, kept honest: only a *stopped* rehearsal is
+    // worth keeping unasked. A clean one nobody claimed can be had again by
+    // running the command again, so a scripted loop must not accumulate them.
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+
+    let (code, out, err) = fixture.rehearse(&["merge", "--no-edit", "feature"]);
+
+    assert_eq!(code, CLEAN, "{err}");
+    assert!(out.contains("the rehearsal was discarded"), "{out}");
+    assert!(
+        sandbox::list(fixture.cache(), None)
+            .expect("the cache lists")
+            .is_empty(),
+        "nothing left behind: {out}"
+    );
+}
+
+#[test]
 fn continuing_with_a_conflict_still_unresolved_is_refused_and_names_the_files() {
     let fixture = Fixture::new();
     fixture.commit("four", "four\n");

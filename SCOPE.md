@@ -145,8 +145,12 @@ git rehearse discard [<id>|--all]
 
 Installed as a `git-rehearse` binary on PATH → `git rehearse` works automatically as a
 git subcommand. Default flow after a rehearsal: print report, then prompt
-`[a]pply / [d]iscard / [k]eep`. Flags `--apply` / `--keep` for scripting; non-TTY default
-is discard-unless-`--apply`. (An earlier draft listed a `--json=off` flag here, which
+`[a]pply / [d]iscard / [k]eep`. Flags `--apply` / `--keep` for scripting. The non-TTY
+default was written here as flat discard-unless-`--apply`; it is **discard-unless-it-
+stopped** (#48). A clean rehearsal nobody claimed can be reproduced by re-running the
+command, but a stopped one *is* its sandbox — mid-rebase, conflict in it — and discarding
+that deletes the path and the `continue` command the report has just printed. Nothing is
+ever applied unasked, in either case. (An earlier draft listed a `--json=off` flag here, which
 contradicted the out-list below: v1.0 has no JSON output in any spelling, so there is
 nothing to switch off. JSON arrives opt-in with `--json` in v2.)
 
