@@ -16,11 +16,10 @@ before/after graph, the conflicts, and a warning if replaying your commits
 quietly changed what they do. Then you choose: apply it, keep it, or throw it
 away. Your repository is not touched until you say so.
 
-> **Status: v0.1.0 — the first release.** Everything on this page works; it is
-> what produced every terminal transcript here. The v1 command surface and the
-> exit codes are settled and will not shift under you.
-> [SCOPE.md](SCOPE.md) is the full plan, including the agent-facing v2 that is
-> the real target.
+> **Status: v1.1.0.** Everything on this page is in the release; every terminal
+> transcript here is real captured output. The command surface and the exit
+> codes are settled and will not shift under you.
+> [SCOPE.md](SCOPE.md) is the full plan.
 
 ## Install
 
@@ -32,9 +31,9 @@ check the sum, and put the `git-rehearse` inside on your `PATH`.
 
 | platform | archive |
 |---|---|
-| Linux, x86-64 | `git-rehearse-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS, Apple silicon | `git-rehearse-v0.1.0-aarch64-apple-darwin.tar.gz` |
-| Windows, x86-64 | `git-rehearse-v0.1.0-x86_64-pc-windows-msvc.zip` |
+| Linux, x86-64 | `git-rehearse-v1.1.0-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS, Apple silicon | `git-rehearse-v1.1.0-aarch64-apple-darwin.tar.gz` |
+| Windows, x86-64 | `git-rehearse-v1.1.0-x86_64-pc-windows-msvc.zip` |
 
 Intel macOS and ARM Linux are not built yet — [build from
 source](#from-source) there, which works fine.
@@ -44,7 +43,7 @@ source](#from-source) there, which works fine.
 Needs [Rust 1.97 or newer](https://rustup.rs) and `git` on your `PATH`.
 
 ```bash
-cargo install --git https://github.com/maximalcode/git-rehearse --tag v0.1.0
+cargo install --git https://github.com/maximalcode/git-rehearse --tag v1.1.0
 ```
 
 Or from a clone, to track `develop`:
@@ -58,10 +57,6 @@ Not on crates.io yet.
 However you install it, you get a binary called `git-rehearse`. Because git
 treats any `git-<name>` on your `PATH` as a subcommand, that is all it takes
 for `git rehearse …` to work — no alias, no config.
-
-When v0.1 is tagged, the [releases page](https://github.com/maximalcode/git-rehearse/releases)
-will carry prebuilt binaries for Linux, macOS and Windows with SHA-256 sums
-beside them.
 
 ## A real session
 
@@ -121,34 +116,60 @@ chance for it to come out differently.
 ### When it conflicts
 
 ```console
-$ git rehearse rebase main
-CONFLICT (content): Merge conflict in config.yml
-error: could not apply 9bcbf9f... raise the row limit
+$ git rehearse --keep rebase main
+CONFLICT (content): Merge conflict in config.toml
+error: could not apply 1f9ebbb... raise the timeout to 90
 
 rehearsed  git rebase main
-rehearsal  1786178811-00
+rehearsal  1786276260-00
 
 the command stopped part-way on a conflict
 
 refs
-  HEAD  9bcbf9fe -> 7665595d
+  HEAD  1f9ebbbc -> 350ba0a4
 
-conflicts  stopped at 9bcbf9fe "raise the row limit"
-  config.yml  1 hunk
+conflicts  stopped at 1f9ebbbc "raise the timeout to 90"
+  config.toml  1 hunk
+
+to work on it:
+  cd ~/Library/Caches/git-rehearse/app-b0db48dc0bcbea3e/1786276260-00/sandbox
+  # resolve the conflict, then `git add` the files
+  git rehearse continue 1786276260-00
 ```
 
 Exit code 2. Your repository is untouched — no conflict markers in your
-worktree, no half-finished rebase to abort. The sandbox is still there if you
-want to open it and see how bad the conflict really is.
+worktree, no half-finished rebase to abort. The conflict is a real one, in a
+real repository, and it is waiting for you somewhere harmless.
+
+Resolve it there however you like, then carry on:
+
+```console
+$ git rehearse continue 1786276260-00
+```
+
+`continue` runs `git rebase --continue` in the sandbox, re-reads what happened
+and prints the report again. Repeat as often as the rebase stops. It refuses,
+rather than letting git complain, if anything is still unmerged:
+
+```console
+$ git rehearse continue
+git-rehearse: 1 path(s) are still unmerged in the sandbox:
+  config.toml
+Resolve them and `git add` them there, then continue.
+```
+
+Because applying transplants the sandbox's commits rather than re-running the
+command, **the resolution you did in the sandbox is the resolution you get.**
+You never resolve the same conflict twice.
 
 ### The warning this tool exists for
 
-A conflict you resolve by hand can silently change what a commit *does*. Here
-one commit set a timeout to 90, another to 60, and the resolution said 45 —
-a value neither commit ever had:
+A conflict you resolve by hand can silently change what a commit *does*. Above,
+one commit set the timeout to 90 and the other to 60. Resolve it to 45 — a
+value neither commit ever had — and `continue` says so:
 
 ```console
-$ git rehearse show 1786178840-00
+$ git rehearse continue 1786276260-00
 
 warning: content drift on refs/heads/feature
   replaying a commit should not change what it does. These did change:
@@ -156,6 +177,10 @@ warning: content drift on refs/heads/feature
   A conflict resolution, a merge driver or a dropped commit did this.
     M config.toml
 ```
+
+That is not a complaint about the conflict — it is the report noticing that the
+commit no longer does what it used to. Sometimes that is exactly what you meant.
+The point is that you find out before it is in your repository, not after.
 
 This is judged with `git range-diff`, commit by commit — not by diffing the two
 trees. A tree diff calls every ordinary rebase "drift" and is therefore useless.
@@ -168,6 +193,7 @@ git rehearse [options] -- <any git command>
 
 git rehearse list                 kept rehearsals for this repository
 git rehearse show [<id>]          print a rehearsal's report again
+git rehearse continue [<id>]      carry on a stopped one, once it is resolved
 git rehearse apply [<id>]         transplant a rehearsal into the real repo
 git rehearse discard [<id>|--all] throw one, or all, away
 ```
@@ -179,9 +205,14 @@ rehearsal is meant.
 |---|---|
 | `--apply` | apply without asking |
 | `--keep` | keep without asking |
+| `--json` | one JSON document on stdout instead of the report |
 | `--todo <file>` | drive an interactive rebase from a prepared todo |
 | `-h`, `--help` | usage |
 | `-V`, `--version` | version |
+
+`--apply` and `--keep` work with `continue` too — it ends on the same question
+a rehearsal does, so `git rehearse --keep continue <id>` is how you script a
+resolve-and-carry-on loop.
 
 **Our options come before the command; everything after it belongs to git.**
 So `git rehearse --apply rebase -i main` is ours, and
@@ -206,12 +237,130 @@ Two things worth knowing before you script this:
 - **The exit code describes the rehearsal, not what became of it.** A rehearsal
   that ran cleanly and was then discarded still exits `0`.
 - **With no terminal on stdin there is nobody to answer the prompt**, so the
-  rehearsal is discarded and the run says so. Pass `--apply` or `--keep` to
-  decide up front:
+  answer is given for you and the run says which one it gave. A rehearsal that
+  ran cleanly is **discarded** — you can always run the command again. One that
+  **stopped part-way is kept**, because its sandbox is the only copy of where it
+  got to, and discarding it would delete the path and the `continue` command the
+  report just printed. Nothing is ever applied unasked. Pass `--apply` or
+  `--keep` to decide up front:
 
   ```bash
   git rehearse --apply rebase main || echo "did not rebase cleanly: $?"
   ```
+
+## For programs: `--json`
+
+Every command takes `--json` and answers with one document on stdout:
+
+```console
+$ git rehearse --json rebase main
+{"schema":1,"id":"1786282818-00","repository":"/home/ada/report",
+ "sandbox":"/home/ada/.cache/git-rehearse/report-8a2754ff/1786282818-00/sandbox",
+ "command":["rebase","main"],"outcome":"stopped","exit_code":2,"conflicted":true,
+ "refs":[{"name":"HEAD","before":"bff10a98…","after":"a13cff11…"}],
+ "stopped_at":{"sha":"bff10a98…","subject":"raise the timeout to 90"},
+ "conflicts":[{"path":"config.toml","hunks":1}],
+ "drift":[],"drift_unexpected":false,"can_apply":false,"decision":"kept"}
+```
+
+Four promises, because a caller that has to guess at any of them ends up parsing
+English anyway:
+
+- **Stdout is one document and nothing else.** Git's own `Auto-merging…` and
+  `CONFLICT…` go to stderr under `--json`, so the stream stays parseable.
+- **Failures are documents too**, on every exit path — including a refusal
+  before the command is even understood:
+  `{"schema":1,"kind":"refused","message":"…","exit_code":4}`.
+- **`schema` is versioned from the first release** and only changes when a field
+  changes meaning or disappears. New optional fields are not a version bump.
+- **It never prompts**, because there is nobody there. `--apply` and `--keep`
+  decide up front; otherwise the unattended rule applies and `decision` records
+  which answer was given.
+
+So the loop a program runs is `rehearse` → read `conflicts` → resolve them under
+`sandbox` → `continue` → read `drift_unexpected` → `apply`, with the real
+repository untouched until that last step.
+
+## For coding agents
+
+The tools that stop an agent wrecking your history all work by **blocking**:
+match `git rebase`, refuse, hand the problem back to you. That is the right
+instinct and the wrong end of it — the agent still does not know what the
+command would have done, and neither do you.
+
+Rehearsal is the constructive version. The agent runs the real command in a
+shadow clone, reads what actually happened, and only then asks for your
+repository.
+
+### Drop this in your `CLAUDE.md` or `AGENTS.md`
+
+````markdown
+## Rehearsing dangerous git commands
+
+Before running `git rebase`, `git merge` or `git cherry-pick` in this
+repository, rehearse it and act on the report:
+
+```bash
+git rehearse --json rebase main
+```
+
+Stdout is one JSON document. Read `outcome`:
+
+- **`"clean"`** — check `drift_unexpected`. If `false`, apply it:
+  `git rehearse --json apply <id>`. If `true`, **stop and show the user**
+  `drift[].replay.changed`: replaying those commits changed what they do, and
+  that is the thing worth catching. Do not apply it on your own judgement.
+- **`"stopped"`** — a conflict. The rehearsal is kept. `conflicts[]` names the
+  unmerged files and `sandbox` is the directory they are in. Resolve them
+  there, `git add` them there, then `git rehearse --json continue <id>` and
+  read the new document. Repeat as often as it stops.
+- **`"failed"`** — git refused the command outright; `git_exit_code` is git's
+  own. Nothing was kept and nothing was changed.
+
+A document with `"kind": "refused"` means git-rehearse itself declined — read
+`message` and fix what it names. Do not retry it unchanged.
+
+The working tree is never touched until `apply`, and `apply` transplants the
+commits you inspected rather than re-running anything.
+````
+
+### A PreToolUse hook
+
+Blocks the three commands and points at the rehearsal instead. Needs `jq`, and
+Claude Code's `PreToolUse` matcher set to `Bash`; exit code 2 blocks the call and
+puts the message in front of the model.
+
+```bash
+#!/usr/bin/env bash
+# .claude/hooks/rehearse-first.sh
+command=$(jq -r '.tool_input.command // ""')
+
+# Already going through us, or not our business.
+case "$command" in
+  *"git rehearse"*) exit 0 ;;
+  *"git rebase"*|*"git merge"*|*"git cherry-pick"*) ;;
+  *) exit 0 ;;
+esac
+
+cat >&2 <<'WHY'
+Rehearse it first: `git rehearse --json <the same command>`.
+Read the JSON, check drift_unexpected, then `git rehearse --json apply <id>`.
+WHY
+exit 2
+```
+
+### One thing this does not cover
+
+`git reset --hard` is missing from that list on purpose. What makes it dangerous
+is **uncommitted** work — the committed history it appears to destroy is
+reachable through the reflog for weeks, but unstaged edits are gone for good.
+
+git-rehearse refuses a dirty worktree. So on exactly the input where
+`reset --hard` is dangerous, there is nothing to rehearse; and where rehearsing
+works, the command was not very dangerous. Routing it through here would
+therefore *block* it rather than rehearse it, which is a different product. If
+you want that, block it directly — do not let a rehearsal step imply a safety
+net it is not providing.
 
 ## What it refuses
 
@@ -264,7 +413,7 @@ Two ideas carry the whole design:
 | | |
 |---|---|
 | **v1** | Human CLI: `rebase` / `merge` / `cherry-pick` rehearsal, before/after graph, conflict + content-drift report, apply/discard/keep |
-| **v2** | Agent mode: `--json`, stable exit codes, an MCP server — so AI coding agents rehearse history-rewriting commands *before* touching your worktree |
+| **v2** | Agent mode, so AI coding agents rehearse history-rewriting commands *before* touching your worktree. `--json` and the stable exit codes are **done**; whether it also gets an MCP server is [undecided](https://github.com/maximalcode/git-rehearse/issues/37) |
 | **v3** | Surfaces: resolve-in-sandbox polish, `undo`, visual graph panel |
 
 Details, non-goals and honest risks: [SCOPE.md](SCOPE.md).

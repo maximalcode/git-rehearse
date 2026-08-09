@@ -2,10 +2,6 @@
 
 Thanks for taking a look. This is a small project with a simple workflow.
 
-> **Pre-v0.1 note:** the tool is not implemented yet. [SCOPE.md](SCOPE.md) is
-> the plan, and until v0.1 ships, the most useful contributions are issues that
-> poke holes in it.
-
 ## Start with an issue
 
 Every change starts as a GitHub issue — bug reports, features, refactors,
