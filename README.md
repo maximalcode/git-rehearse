@@ -59,10 +59,6 @@ However you install it, you get a binary called `git-rehearse`. Because git
 treats any `git-<name>` on your `PATH` as a subcommand, that is all it takes
 for `git rehearse …` to work — no alias, no config.
 
-When v0.1 is tagged, the [releases page](https://github.com/maximalcode/git-rehearse/releases)
-will carry prebuilt binaries for Linux, macOS and Windows with SHA-256 sums
-beside them.
-
 ## A real session
 
 Every transcript below is real captured output. The only thing edited is the

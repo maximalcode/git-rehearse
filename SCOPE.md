@@ -50,7 +50,7 @@ The competitive landscape (verified 2026-08-07):
 
 | Project | Stars | What it does | What it doesn't |
 |---|---|---|---|
-| [git-sim](https://github.com/initialcommit-com/git-sim) | ~4.7k | Simulates 23 commands against your repo, renders **image/video only** | Never executes, never sandboxes, has **no apply mode** — confirmed from its own docs |
+| [git-sim](https://github.com/initialcommit-com/git-sim) | ~4.7k | Simulates 23 commands against your repo, renders **image/video only** | Never executes, never sandboxes, has **no apply mode** — confirmed from its own docs. Re-checked 2026-08-09: unchanged, and dormant (below) |
 | [learnGitBranching](https://github.com/pcottle/learnGitBranching) | ~33.8k | Teaching sandbox with a **fake** git and fixed lessons | Not your repo, not real git |
 | [git-branchless](https://github.com/arxanas/git-branchless) | ~4.1k | Best-in-class `git undo` | Repairs after the fact; no rehearsal surface |
 | [jj](https://github.com/jj-vcs/jj) | ~30.9k | Operation log makes every op undoable | **Structural substitute — the #1 risk.** Mitigation: installing a CLI is a far smaller ask than switching VCS |
@@ -59,9 +59,12 @@ The competitive landscape (verified 2026-08-07):
 The surviving angle, precisely: **execution + inspection + apply-or-discard**, and
 secondarily the agent-facing version of that. Nobody occupies either half.
 
-**Name check (2026-08-07):** `git-rehearse` is free on GitHub search; nearest neighbor is
-`openshift/pj-rehearse` (Kubernetes prow CI, unrelated). **TODO before first push: check
-crates.io and Homebrew for collisions.**
+**Name check (2026-08-07, registries settled 2026-08-09):** `git-rehearse` is free on
+GitHub search, **free on crates.io** and **free in Homebrew core**; nearest neighbor is
+`openshift/pj-rehearse` (Kubernetes prow CI, unrelated). One adjacent name is gone: the
+bare `rehearse` crate was taken 2026-06-22 — effect-aware operation planning, not git,
+57 downloads — which costs us nothing, since the binary must be called `git-rehearse` for
+git to pick it up as a subcommand anyway.
 
 ## Design principles (locked — a future session should not relitigate these)
 
@@ -242,8 +245,8 @@ codes and `--todo` stable.
 
 | Risk | Read |
 |---|---|
-| **jj** makes rehearsal obsolete as it grows | Real, structural. Bet: git's installed base moves slower than jj grows, and agents operate in git repos today. Revisit at v2 launch. |
-| git-sim adds an execute/apply mode | Verified absent 2026-08-07. Its Manim-rendering architecture makes this unlikely, but check its releases before v2 marketing. |
+| **jj** makes rehearsal obsolete as it grows | Real, structural. Bet: git's installed base moves slower than jj grows, and agents operate in git repos today. **Still open (#40), deliberately not re-checked** — the bet is from 2026-08-07 and a trend question has a minimum sampling interval; re-stamping it two days later would only manufacture confidence. Trigger: the #36 checkpoint (2026-09-09) or the decision to start building v2, whichever is first. The question then is *not* jj's star count but whether the **agent** audience is moving to jj — v2's premise is that agents run `git rebase` in git repos. |
+| git-sim adds an execute/apply mode | **Closed out 2026-08-09 (#40).** Its releases were the thing to check, and there are none to check: `v0.3.5` is the latest on both GitHub and PyPI, dated **2024-04-16**, and the only commits since are two README touch-ups. Stars flat at 4,672. A dormant Manim renderer does not grow an execute/apply mode; re-open this row only if it ships again. |
 | Usage frequency is low for humans (a few times/month) | True — this is *why* v2 exists. Agents rehearse constantly; humans occasionally. |
 | Apply-mechanism edge cases (submodules, LFS, worktrees, shallow clones) | Refuse loudly on all four in v1.0 (detect and exit 4 with an explanation). Support only if users actually ask. |
 
@@ -268,8 +271,9 @@ conventions layer for Rust.
 - [x] `unsafe_code = "forbid"` — enforced at the manifest level by the adopted `[lints]`
       block (stronger than the crate-root attribute: `forbid` can't be waived per-file),
       plus the attribute in `main.rs`
-- [x] MIT license; `README.md` with the one-liner (terminal-cast GIF lands with v0.1 —
-      there is nothing to record yet)
+- [x] MIT license; `README.md` with the one-liner (v0.1.0 shipped without the
+      terminal-cast GIF — the README carries real captured transcripts instead; whether
+      the GIF is still wanted is #31)
 - [x] `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`
 - [x] CI: `cargo fmt --check` + clippy `-Dwarnings` + `cargo deny check advisories bans`
       + tests, pinned toolchain, plus maxi-quality Layer 2 (all scaffolded by adopt.sh;

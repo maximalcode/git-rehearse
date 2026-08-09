@@ -21,7 +21,7 @@ first reply within about a week rather than within hours. There is no bug
 bounty.
 
 Supported: the **latest release**. Fixes go into the next release rather than
-being backported. (Pre-v0.1: there is no release yet; report against `main`.)
+being backported.
 
 ## What leaves your machine
 
