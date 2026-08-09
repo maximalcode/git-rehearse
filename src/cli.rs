@@ -26,8 +26,25 @@ use crate::execute::{Outcome, SEQUENCE_EDITOR_ARG, Todo};
 use crate::report::Choice;
 use crate::sandbox::{DEFAULT_TTL_SECS, Sandbox, Status};
 use crate::{
-    Error, Result, analyze, apply, cache, execute, git, now_unix, preflight, report, sandbox,
+    Error, Result, analyze, apply, cache, execute, git, json, now_unix, preflight, report, sandbox,
 };
+
+/// Whether the run talks to a person or to a program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Format {
+    /// The terminal report.
+    #[default]
+    Text,
+    /// One JSON document on stdout and nothing else — see [`crate::json`].
+    Json,
+}
+
+/// A parsed command line: what to do, and who the output is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parsed {
+    pub command: Command,
+    pub format: Format,
+}
 
 /// Exit codes. Stable from v0.1 on: v2's agent mode reads these, and SCOPE.md
 /// fixes their meanings. Do not spend them on anything else.
@@ -60,6 +77,7 @@ usage:
 options (before the command; everything after it belongs to git):
   --apply           apply without asking
   --keep            keep the rehearsal without asking
+  --json            one JSON document on stdout instead of the report
   --todo <file>     drive an interactive rebase from a prepared todo
   -h, --help        this text
   -V, --version     version
@@ -75,6 +93,9 @@ With no terminal on stdin there is nobody to answer the keep/apply/discard
 question. A rehearsal that ran cleanly is then discarded; one that stopped
 part-way is kept, because its sandbox is the only copy of where it got to and
 `continue` needs it. Pass --apply or --keep to decide up front either way.
+
+--json prints one document and nothing else, on every exit path including
+failures. It never prompts, for the same reason: there is nobody there.
 ";
 
 /// Said when the question is skipped because there is nobody to answer it.
@@ -97,6 +118,11 @@ const NOT_A_TERMINAL_STOPPED: &str = "\
 stdin is not a terminal, so there was nobody to ask: the rehearsal was kept, because
 it stopped part-way and its sandbox is the only copy of where it got to.
 Carry it on with `git rehearse continue`, or throw it away with `git rehearse discard`.";
+
+/// Said when `--apply` asks for something that does not exist.
+const NOTHING_TO_APPLY: &str = "\
+--apply was asked for, but this rehearsal has nothing that can be applied.
+A command that stopped part-way or failed leaves no result to transplant.";
 
 /// What the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,15 +184,28 @@ pub enum Decision {
 ///
 /// [`Error::Refused`] with a message worth printing, for anything that is not
 /// a command this version understands.
-pub fn parse(args: &[String]) -> Result<Command> {
+pub fn parse(args: &[String]) -> Result<Parsed> {
+    let mut format = Format::Text;
     let mut decision = Decision::Ask;
     let mut todo = None;
     let mut rest = args.iter();
 
+    // Every `return` below goes through this, so the format reaches the caller
+    // whichever branch the command falls into.
+    macro_rules! parsed {
+        ($command:expr) => {
+            return Ok(Parsed {
+                command: $command,
+                format,
+            })
+        };
+    }
+
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            "-h" | "--help" => return Ok(Command::Help),
-            "-V" | "--version" => return Ok(Command::Version),
+            "-h" | "--help" => parsed!(Command::Help),
+            "-V" | "--version" => parsed!(Command::Version),
+            "--json" => format = Format::Json,
             "--apply" => decision = Decision::Apply,
             "--keep" => decision = Decision::Keep,
             "--todo" => {
@@ -178,19 +217,18 @@ pub fn parse(args: &[String]) -> Result<Command> {
             // Everything after `--` is git's, whatever it looks like.
             "--" => {
                 let command: Vec<String> = rest.cloned().collect();
-                return if command.is_empty() {
-                    Err(Error::Refused(
+                if command.is_empty() {
+                    return Err(Error::Refused(
                         "`--` needs a git command after it.\n\
                          For example: git rehearse -- rebase -i main"
                             .to_owned(),
-                    ))
-                } else {
-                    Ok(Command::Rehearse {
-                        command,
-                        todo,
-                        decision,
-                    })
-                };
+                    ));
+                }
+                parsed!(Command::Rehearse {
+                    command,
+                    todo,
+                    decision,
+                });
             }
             SEQUENCE_EDITOR_ARG => {
                 let (Some(file), Some(target)) = (rest.next(), rest.next()) else {
@@ -198,20 +236,20 @@ pub fn parse(args: &[String]) -> Result<Command> {
                         "{SEQUENCE_EDITOR_ARG} is internal and takes exactly two paths"
                     )));
                 };
-                return Ok(Command::SequenceEditor {
+                parsed!(Command::SequenceEditor {
                     todo: PathBuf::from(file),
                     target: PathBuf::from(target),
                 });
             }
-            "list" => return Ok(Command::List),
-            "show" => return Ok(Command::Show { id: id_from(rest) }),
+            "list" => parsed!(Command::List),
+            "show" => parsed!(Command::Show { id: id_from(rest) }),
             "continue" => {
-                return Ok(Command::Continue {
+                parsed!(Command::Continue {
                     id: id_from(rest),
                     decision,
                 });
             }
-            "apply" => return Ok(Command::Apply { id: id_from(rest) }),
+            "apply" => parsed!(Command::Apply { id: id_from(rest) }),
             "discard" => {
                 let arguments: Vec<&String> = rest.collect();
                 let all = arguments.iter().any(|arg| *arg == "--all");
@@ -219,13 +257,13 @@ pub fn parse(args: &[String]) -> Result<Command> {
                     .iter()
                     .find(|arg| !arg.starts_with('-'))
                     .map(|arg| (*arg).clone());
-                return Ok(Command::Discard { id, all });
+                parsed!(Command::Discard { id, all });
             }
             // The commands worth rehearsing, and the escape hatch for the rest.
             "rebase" | "merge" | "cherry-pick" => {
                 let mut command = vec![arg.clone()];
                 command.extend(rest.cloned());
-                return Ok(Command::Rehearse {
+                parsed!(Command::Rehearse {
                     command,
                     todo,
                     decision,
@@ -240,7 +278,39 @@ pub fn parse(args: &[String]) -> Result<Command> {
             }
         }
     }
-    Ok(Command::Help)
+    Ok(Parsed {
+        command: Command::Help,
+        format,
+    })
+}
+
+/// Whether `--json` was asked for, read straight off the argument list.
+///
+/// Only for the path where [`parse`] itself failed: a refusal has to be
+/// reported in the format the caller asked for, and by then there is no
+/// [`Parsed`] to read it from.
+///
+/// It stops at the first word that is not one of our options, which is the same
+/// rule [`parse`] applies — so `git rehearse -- log --json` asks git for
+/// `--json` and not us, exactly as it reads.
+#[must_use]
+pub fn wants_json(args: &[String]) -> bool {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--json" => return true,
+            "--apply" | "--keep" => {}
+            // Its value too: a path does not start with `-`, and letting it end
+            // the scan would hide a `--json` that came after it.
+            "--todo" => {
+                rest.next();
+            }
+            // Anything else is the command, or an error inside it. Either way
+            // this scan is finished — a `--json` beyond here is git's.
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The first non-flag argument left, if any.
@@ -257,7 +327,8 @@ fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Option<String> {
 ///
 /// Whatever the operation returns; the caller turns it into an exit code with
 /// [`code_for`].
-pub fn run<W: Write>(command: Command, cwd: &Path, output: &mut W) -> Result<u8> {
+pub fn run<W: Write>(parsed: Parsed, cwd: &Path, output: &mut W) -> Result<u8> {
+    let Parsed { command, format } = parsed;
     match command {
         Command::Help => {
             write!(output, "{USAGE}").map_err(Error::Spawn)?;
@@ -275,13 +346,45 @@ pub fn run<W: Write>(command: Command, cwd: &Path, output: &mut W) -> Result<u8>
             command,
             todo,
             decision,
-        } => rehearse(&command, todo, decision, cwd, output),
-        Command::List => list(cwd, output),
-        Command::Show { id } => show(id.as_deref(), cwd, output),
-        Command::Continue { id, decision } => resume(id.as_deref(), decision, cwd, output),
-        Command::Apply { id } => apply_kept(id.as_deref(), cwd, output),
-        Command::Discard { id, all } => discard(id.as_deref(), all, cwd, output),
+        } => rehearse(&command, todo, decision, format, cwd, output),
+        Command::List => list(format, cwd, output),
+        Command::Show { id } => show(id.as_deref(), format, cwd, output),
+        Command::Continue { id, decision } => resume(id.as_deref(), decision, format, cwd, output),
+        Command::Apply { id } => apply_kept(id.as_deref(), format, cwd, output),
+        Command::Discard { id, all } => discard(id.as_deref(), all, format, cwd, output),
     }
+}
+
+/// Prints a document and nothing else.
+///
+/// One line, newline-terminated: a caller reading a stream gets a complete
+/// document per line, which is exactly what MCP's stdio framing wants if the
+/// server in SCOPE's v2 ever gets built.
+/// Where git's own stdout belongs, given who is reading ours.
+///
+/// Git writes `Auto-merging …` and `CONFLICT …` to stdout. Under `--json` that
+/// lands in front of the document and breaks any caller that parses the stream,
+/// so it is moved to stderr — where it is still readable, just not in the way.
+fn chatter(format: Format) -> git::Chatter {
+    match format {
+        Format::Text => git::Chatter::Inherit,
+        Format::Json => git::Chatter::ToStderr,
+    }
+}
+
+/// Prints the failure document for a run that did not get as far as a report.
+///
+/// # Errors
+///
+/// [`Error::Spawn`] if stdout cannot be written.
+pub fn write_failure<W: Write>(message: &str, exit_code: u8, output: &mut W) -> Result<()> {
+    write_json(&json::Failure::new(message.to_owned(), exit_code), output)
+}
+
+fn write_json<W: Write, T: serde::Serialize>(document: &T, output: &mut W) -> Result<()> {
+    let text = serde_json::to_string(document)
+        .map_err(|e| Error::Sandbox(format!("could not build the JSON report: {e}")))?;
+    writeln!(output, "{text}").map_err(Error::Spawn)
 }
 
 /// The exit code for a result, per SCOPE.md.
@@ -299,6 +402,7 @@ fn rehearse<W: Write>(
     command: &[String],
     todo: Option<PathBuf>,
     decision: Decision,
+    format: Format,
     cwd: &Path,
     output: &mut W,
 ) -> Result<u8> {
@@ -307,11 +411,16 @@ fn rehearse<W: Write>(
     let mut sandbox = sandbox::create(&cache_root, &plan, now_unix())?;
 
     let todo = todo.map(Todo::new).transpose()?;
-    let outcome = execute::run(&sandbox.worktree(), &plan.command, todo.as_ref())?;
+    let outcome = execute::run_with(
+        &sandbox.worktree(),
+        &plan.command,
+        todo.as_ref(),
+        chatter(format),
+    )?;
     sandbox.record(&outcome)?;
 
     let code = code_for_outcome(&outcome);
-    report_and_decide(sandbox, &outcome, decision, output)?;
+    report_and_decide(sandbox, &outcome, decision, format, code, output)?;
     Ok(code)
 }
 
@@ -326,15 +435,16 @@ fn rehearse<W: Write>(
 fn resume<W: Write>(
     id: Option<&str>,
     decision: Decision,
+    format: Format,
     cwd: &Path,
     output: &mut W,
 ) -> Result<u8> {
     let mut sandbox = find(id, cwd)?;
-    let outcome = execute::resume(&sandbox.worktree())?;
+    let outcome = execute::resume_with(&sandbox.worktree(), chatter(format))?;
     sandbox.record(&outcome)?;
 
     let code = code_for_outcome(&outcome);
-    report_and_decide(sandbox, &outcome, decision, output)?;
+    report_and_decide(sandbox, &outcome, decision, format, code, output)?;
     Ok(code)
 }
 
@@ -349,11 +459,21 @@ fn report_and_decide<W: Write>(
     sandbox: Sandbox,
     outcome: &Outcome,
     decision: Decision,
+    format: Format,
+    exit_code: u8,
     output: &mut W,
 ) -> Result<()> {
     let worktree = sandbox.worktree();
     let meta = sandbox.meta();
     let analysis = analyze::run(&worktree, &meta.pre_state, &meta.command, outcome)?;
+    let can_apply = report::can_apply(&analysis, outcome);
+
+    if format == Format::Json {
+        return decide_as_json(
+            sandbox, &analysis, outcome, decision, exit_code, can_apply, output,
+        );
+    }
+
     let graphs = report::graphs(&worktree, &analysis)?;
     // A blank line first: git has just finished writing its own output to the
     // same terminal.
@@ -375,9 +495,64 @@ fn report_and_decide<W: Write>(
         write_next_steps(&sandbox, &worktree, will_prompt, output)?;
     }
 
-    let can_apply = report::can_apply(&analysis, outcome);
     let choice = choose(decision, will_prompt, can_apply, outcome, output)?;
     act(choice, sandbox, output)
+}
+
+/// The same decision, made without a prompt, reported as one document.
+///
+/// `--json` and the prompt cannot coexist: the question would land in the
+/// middle of the document, and the caller reading it is a program with no way
+/// to answer. So the unattended rule decides — which only became a sane default
+/// with #48, since before it a stopped rehearsal was discarded and the `id`
+/// handed back would already have been dead on arrival.
+///
+/// The document is built *after* applying or keeping and *before* discarding,
+/// because it reports both what was done and where the sandbox is.
+fn decide_as_json<W: Write>(
+    mut sandbox: Sandbox,
+    analysis: &analyze::Analysis,
+    outcome: &Outcome,
+    decision: Decision,
+    exit_code: u8,
+    can_apply: bool,
+    output: &mut W,
+) -> Result<()> {
+    let choice = match decision {
+        Decision::Apply => Choice::Apply,
+        Decision::Keep => Choice::Keep,
+        Decision::Ask => report::non_interactive(outcome),
+    };
+    if choice == Choice::Apply && !can_apply {
+        return Err(Error::Refused(NOTHING_TO_APPLY.to_owned()));
+    }
+
+    let applied = if choice == Choice::Apply {
+        Some(apply::run(&sandbox, now_unix())?)
+    } else {
+        None
+    };
+    if choice == Choice::Keep {
+        sandbox.keep()?;
+    }
+
+    let document = json::Report::new(
+        &sandbox,
+        analysis,
+        outcome,
+        exit_code,
+        can_apply,
+        choice,
+        applied.as_ref(),
+    );
+    write_json(&document, output)?;
+
+    // Applying transplants the refs and then the sandbox has served its
+    // purpose, exactly as it does on the text path.
+    if choice != Choice::Keep {
+        sandbox.discard()?;
+    }
+    Ok(())
 }
 
 /// Says where the stopped rehearsal is and how to carry it on.
@@ -451,11 +626,7 @@ fn choose<W: Write>(
     };
     if let Some(choice) = wanted {
         if choice == Choice::Apply && !can_apply {
-            return Err(Error::Refused(
-                "--apply was asked for, but this rehearsal has nothing that can be applied.\n\
-                 A command that stopped part-way or failed leaves no result to transplant."
-                    .to_owned(),
-            ));
+            return Err(Error::Refused(NOTHING_TO_APPLY.to_owned()));
         }
         return Ok(choice);
     }
@@ -515,11 +686,21 @@ fn report_applied<W: Write>(applied: &apply::Applied, output: &mut W) -> Result<
 }
 
 /// Lists this repository's rehearsals, pruning expired ones first.
-fn list<W: Write>(cwd: &Path, output: &mut W) -> Result<u8> {
+fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
     let cache_root = cache::root()?;
     let pruned = sandbox::prune(&cache_root, now_unix(), DEFAULT_TTL_SECS)?;
     let repo_id = repo_id(cwd)?;
     let rehearsals = sandbox::list(&cache_root, Some(&repo_id))?;
+
+    if format == Format::Json {
+        let document = json::Listing {
+            schema: json::SCHEMA,
+            rehearsals: rehearsals.iter().map(json::Entry::of).collect(),
+            pruned,
+        };
+        write_json(&document, output)?;
+        return Ok(exit::CLEAN);
+    }
 
     if rehearsals.is_empty() {
         writeln!(output, "no rehearsals for this repository").map_err(Error::Spawn)?;
@@ -548,7 +729,7 @@ fn list<W: Write>(cwd: &Path, output: &mut W) -> Result<u8> {
 }
 
 /// Re-prints a rehearsal's report.
-fn show<W: Write>(id: Option<&str>, cwd: &Path, output: &mut W) -> Result<u8> {
+fn show<W: Write>(id: Option<&str>, format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
     let sandbox = find(id, cwd)?;
     let meta = sandbox.meta();
     // What the command did is remembered rather than re-derived; a rehearsal
@@ -565,6 +746,24 @@ fn show<W: Write>(id: Option<&str>, cwd: &Path, output: &mut W) -> Result<u8> {
         &meta.command,
         &outcome,
     )?;
+
+    if format == Format::Json {
+        // `show` decides nothing — the rehearsal is sitting in the cache, which
+        // is what `kept` means. The exit code is this command's, not the
+        // rehearsal's: looking at a stopped rehearsal succeeded.
+        let document = json::Report::new(
+            &sandbox,
+            &analysis,
+            &outcome,
+            exit::CLEAN,
+            report::can_apply(&analysis, &outcome),
+            Choice::Keep,
+            None,
+        );
+        write_json(&document, output)?;
+        return Ok(exit::CLEAN);
+    }
+
     let graphs = report::graphs(&sandbox.worktree(), &analysis)?;
     write!(
         output,
@@ -576,31 +775,64 @@ fn show<W: Write>(id: Option<&str>, cwd: &Path, output: &mut W) -> Result<u8> {
 }
 
 /// Applies a rehearsal that was kept.
-fn apply_kept<W: Write>(id: Option<&str>, cwd: &Path, output: &mut W) -> Result<u8> {
+fn apply_kept<W: Write>(
+    id: Option<&str>,
+    format: Format,
+    cwd: &Path,
+    output: &mut W,
+) -> Result<u8> {
     let sandbox = find(id, cwd)?;
     let applied = apply::run(&sandbox, now_unix())?;
-    report_applied(&applied, output)?;
+    if format == Format::Json {
+        let document = json::ApplyResult {
+            schema: json::SCHEMA,
+            id: sandbox.id().to_owned(),
+            repository: sandbox.meta().repo_path.display().to_string(),
+            exit_code: exit::CLEAN,
+            applied: json::applied_report(&applied),
+        };
+        write_json(&document, output)?;
+    } else {
+        report_applied(&applied, output)?;
+    }
     sandbox.discard()?;
     Ok(exit::CLEAN)
 }
 
 /// Throws rehearsals away.
-fn discard<W: Write>(id: Option<&str>, all: bool, cwd: &Path, output: &mut W) -> Result<u8> {
+fn discard<W: Write>(
+    id: Option<&str>,
+    all: bool,
+    format: Format,
+    cwd: &Path,
+    output: &mut W,
+) -> Result<u8> {
     let cache_root = cache::root()?;
+    let mut discarded = Vec::new();
     if all {
         let repo_id = repo_id(cwd)?;
-        let mut count = 0;
         for sandbox in sandbox::list(&cache_root, Some(&repo_id))? {
+            discarded.push(sandbox.id().to_owned());
             sandbox.discard()?;
-            count += 1;
         }
-        writeln!(output, "discarded {count} rehearsal(s)").map_err(Error::Spawn)?;
-        return Ok(exit::CLEAN);
+    } else {
+        let sandbox = find(id, cwd)?;
+        discarded.push(sandbox.id().to_owned());
+        sandbox.discard()?;
     }
-    let sandbox = find(id, cwd)?;
-    let discarded = sandbox.id().to_owned();
-    sandbox.discard()?;
-    writeln!(output, "discarded {discarded}").map_err(Error::Spawn)?;
+
+    if format == Format::Json {
+        let document = json::DiscardResult {
+            schema: json::SCHEMA,
+            discarded,
+            exit_code: exit::CLEAN,
+        };
+        write_json(&document, output)?;
+    } else if all {
+        writeln!(output, "discarded {} rehearsal(s)", discarded.len()).map_err(Error::Spawn)?;
+    } else {
+        writeln!(output, "discarded {}", discarded.join(", ")).map_err(Error::Spawn)?;
+    }
     Ok(exit::CLEAN)
 }
 
@@ -626,12 +858,20 @@ fn repo_id(cwd: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Decision, code_for, exit, parse};
-    use crate::Error;
+    use super::{Command, Decision, Format, code_for, exit, wants_json};
+    use crate::{Error, Result};
     use std::path::PathBuf;
 
     fn args(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    /// The command half of a parse.
+    ///
+    /// Shadows [`super::parse`] so the assertions below stay about the command
+    /// surface, which is what they are for. The format has its own tests.
+    fn parse(args: &[String]) -> Result<Command> {
+        super::parse(args).map(|parsed| parsed.command)
     }
 
     fn command(args: &[&str]) -> Vec<String> {
@@ -800,6 +1040,54 @@ mod tests {
                 target: PathBuf::from("/repo/.git/todo"),
             }
         );
+    }
+
+    /// The format half of a parse.
+    fn format(argv: &[&str]) -> Format {
+        super::parse(&args(argv)).expect("parses").format
+    }
+
+    #[test]
+    fn json_is_one_of_our_options_and_obeys_the_same_rule_as_the_rest() {
+        assert_eq!(format(&["--json", "rebase", "main"]), Format::Json);
+        assert_eq!(format(&["rebase", "main"]), Format::Text);
+        // Every command, not just a rehearsal: the flag is parsed before the
+        // command, so `--json list` gets typed by anyone who has it in mind,
+        // and printing human text there would be the worst of both.
+        assert_eq!(format(&["--json", "list"]), Format::Json);
+        assert_eq!(format(&["--json", "show"]), Format::Json);
+        assert_eq!(format(&["--json", "apply"]), Format::Json);
+        assert_eq!(format(&["--json", "discard", "--all"]), Format::Json);
+        assert_eq!(format(&["--json", "continue"]), Format::Json);
+    }
+
+    #[test]
+    fn json_after_the_command_belongs_to_git_like_every_other_flag() {
+        // Same rule as --apply: ours come first. git will reject it in git's
+        // own words rather than us swallowing an argument meant for git.
+        let Command::Rehearse { command, .. } =
+            parse(&args(&["rebase", "main", "--json"])).expect("parses")
+        else {
+            panic!("expected a rehearsal");
+        };
+        assert_eq!(command, self::command(&["rebase", "main", "--json"]));
+        assert_eq!(format(&["rebase", "main", "--json"]), Format::Text);
+        assert_eq!(format(&["--", "log", "--json"]), Format::Text);
+    }
+
+    #[test]
+    fn the_failure_path_reads_the_flag_off_the_arguments() {
+        // main() needs the format for a run where parse() itself failed, so
+        // wants_json has to agree with parse on where our options stop.
+        assert!(wants_json(&args(&["--json", "rebase", "main"])));
+        assert!(wants_json(&args(&["--keep", "--json", "status"])));
+        assert!(
+            wants_json(&args(&["--todo", "/tmp/todo", "--json", "rebase"])),
+            "--todo's value must not end the scan"
+        );
+        assert!(!wants_json(&args(&["rebase", "main", "--json"])));
+        assert!(!wants_json(&args(&["--", "log", "--json"])));
+        assert!(!wants_json(&args(&["rebase", "main"])));
     }
 
     #[test]

@@ -19,17 +19,26 @@ fn main() -> ExitCode {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
 
-    let result = cli::parse(&args).and_then(|command| match std::env::current_dir() {
-        Ok(cwd) => cli::run(command, &cwd, &mut output),
+    let result = cli::parse(&args).and_then(|parsed| match std::env::current_dir() {
+        Ok(cwd) => cli::run(parsed, &cwd, &mut output),
         Err(err) => Err(git_rehearse::Error::Spawn(err)),
     });
+    let code = cli::code_for(&result);
 
     if let Err(error) = &result {
+        // A caller that asked for JSON gets JSON on every exit path, including
+        // this one: one that parses stdout on success and meets English on
+        // failure has to parse English anyway. Read off the arguments rather
+        // than the parse, because parsing is one of the things that can fail
+        // here. The human line still goes to stderr, which nobody parses.
+        if cli::wants_json(&args) {
+            let _ = cli::write_failure(&error.to_string(), code, &mut output);
+        }
         // Flush first: the report is on stdout and the failure is on stderr,
         // and a report that arrives after the error explaining it reads as a
         // different run.
         let _ = output.flush();
         eprintln!("git-rehearse: {error}");
     }
-    ExitCode::from(cli::code_for(&result))
+    ExitCode::from(code)
 }

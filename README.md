@@ -206,6 +206,7 @@ rehearsal is meant.
 |---|---|
 | `--apply` | apply without asking |
 | `--keep` | keep without asking |
+| `--json` | one JSON document on stdout instead of the report |
 | `--todo <file>` | drive an interactive rebase from a prepared todo |
 | `-h`, `--help` | usage |
 | `-V`, `--version` | version |
@@ -247,6 +248,39 @@ Two things worth knowing before you script this:
   ```bash
   git rehearse --apply rebase main || echo "did not rebase cleanly: $?"
   ```
+
+## For programs: `--json`
+
+Every command takes `--json` and answers with one document on stdout:
+
+```console
+$ git rehearse --json rebase main
+{"schema":1,"id":"1786282818-00","repository":"/home/ada/report",
+ "sandbox":"/home/ada/.cache/git-rehearse/report-8a2754ff/1786282818-00/sandbox",
+ "command":["rebase","main"],"outcome":"stopped","exit_code":2,"conflicted":true,
+ "refs":[{"name":"HEAD","before":"bff10a98…","after":"a13cff11…"}],
+ "stopped_at":{"sha":"bff10a98…","subject":"raise the timeout to 90"},
+ "conflicts":[{"path":"config.toml","hunks":1}],
+ "drift":[],"drift_unexpected":false,"can_apply":false,"decision":"kept"}
+```
+
+Four promises, because a caller that has to guess at any of them ends up parsing
+English anyway:
+
+- **Stdout is one document and nothing else.** Git's own `Auto-merging…` and
+  `CONFLICT…` go to stderr under `--json`, so the stream stays parseable.
+- **Failures are documents too**, on every exit path — including a refusal
+  before the command is even understood:
+  `{"schema":1,"kind":"refused","message":"…","exit_code":4}`.
+- **`schema` is versioned from the first release** and only changes when a field
+  changes meaning or disappears. New optional fields are not a version bump.
+- **It never prompts**, because there is nobody there. `--apply` and `--keep`
+  decide up front; otherwise the unattended rule applies and `decision` records
+  which answer was given.
+
+So the loop a program runs is `rehearse` → read `conflicts` → resolve them under
+`sandbox` → `continue` → read `drift_unexpected` → `apply`, with the real
+repository untouched until that last step.
 
 ## What it refuses
 

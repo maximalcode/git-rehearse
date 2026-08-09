@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::Write as _;
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -115,17 +115,67 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    spawn_with(dir, args, env, Chatter::Inherit)
+}
+
+/// Where git's own stdout goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chatter {
+    /// Straight through to ours. The user is watching git work, and principle 1
+    /// says they see their git behaving exactly as it does anywhere else.
+    Inherit,
+    /// Forwarded to *our* stderr instead.
+    ///
+    /// For `--json`, where stdout carries one document and nothing else. Git
+    /// writes `Auto-merging …` and `CONFLICT …` to its stdout, and inheriting
+    /// that puts two lines of English in front of the document — enough to
+    /// break any caller that parses the stream. Forwarded rather than dropped:
+    /// it is still what git said, and it still belongs in a log.
+    ToStderr,
+}
+
+/// [`spawn`], with a say in where git's stdout goes.
+///
+/// # Errors
+///
+/// As [`spawn`], plus [`Error::Spawn`] if git's output cannot be read back.
+pub fn spawn_with<I, S>(
+    dir: &Path,
+    args: I,
+    env: &[(&str, OsString)],
+    chatter: Chatter,
+) -> Result<ExitStatus>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = Command::new("git");
     command.arg("-C").arg(dir).args(args);
     for (key, value) in env {
         command.env(key, value);
     }
-    command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(Error::Spawn)
+    command.stdin(Stdio::inherit()).stderr(Stdio::inherit());
+
+    if chatter == Chatter::Inherit {
+        return command
+            .stdout(Stdio::inherit())
+            .status()
+            .map_err(Error::Spawn);
+    }
+
+    // Only stdout is piped, and it is drained before the wait — git's stderr
+    // still goes straight out, so there is no second pipe to fill and deadlock
+    // against.
+    let mut child = command
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(Error::Spawn)?;
+    if let Some(mut chatter) = child.stdout.take() {
+        let mut said = Vec::new();
+        chatter.read_to_end(&mut said).map_err(Error::Spawn)?;
+        io::stderr().write_all(&said).map_err(Error::Spawn)?;
+    }
+    child.wait().map_err(Error::Spawn)
 }
 
 /// The refs under `pattern` as `name -> sha`, with `strip` leading components
