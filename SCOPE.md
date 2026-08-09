@@ -130,6 +130,14 @@ Step details a builder needs:
 
 ## v1.0 — exact scope
 
+> **Numbering, settled 2026-08-09 (#35).** This section shipped as the tag **`v0.1.0`** —
+> every feature below, all nine scenarios tested. The three deviations (no gix, no
+> cargo-dist, no Homebrew tap) are documented and none of them is functional. So `v0.1.0`
+> *was* this v1.0, wearing a cautious number while it was unproven; the release that
+> followed it is **`v1.1.0`**, and the numbers now say what the roadmap says. There is no
+> `v1.0.0` tag and there will not be one — inventing history to tidy a version sequence is
+> a worse lie than a gap in it.
+
 **Command surface:**
 
 ```bash

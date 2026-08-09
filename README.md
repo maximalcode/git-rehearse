@@ -16,13 +16,9 @@ before/after graph, the conflicts, and a warning if replaying your commits
 quietly changed what they do. Then you choose: apply it, keep it, or throw it
 away. Your repository is not touched until you say so.
 
-> **Status: v0.1.0 is the current release**, and the v1 command surface and the
-> exit codes are settled — they will not shift under you.
->
-> **This page documents `develop`.** Everything here is built and tested, and
-> every terminal transcript is real captured output, but two things are not in
-> the v0.1.0 tag yet: `git rehearse continue` and `--json`. [Build from
-> source](#from-source) for those, or wait for the next tag.
+> **Status: v1.1.0.** Everything on this page is in the release; every terminal
+> transcript here is real captured output. The command surface and the exit
+> codes are settled and will not shift under you.
 > [SCOPE.md](SCOPE.md) is the full plan.
 
 ## Install
@@ -35,9 +31,9 @@ check the sum, and put the `git-rehearse` inside on your `PATH`.
 
 | platform | archive |
 |---|---|
-| Linux, x86-64 | `git-rehearse-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS, Apple silicon | `git-rehearse-v0.1.0-aarch64-apple-darwin.tar.gz` |
-| Windows, x86-64 | `git-rehearse-v0.1.0-x86_64-pc-windows-msvc.zip` |
+| Linux, x86-64 | `git-rehearse-v1.1.0-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS, Apple silicon | `git-rehearse-v1.1.0-aarch64-apple-darwin.tar.gz` |
+| Windows, x86-64 | `git-rehearse-v1.1.0-x86_64-pc-windows-msvc.zip` |
 
 Intel macOS and ARM Linux are not built yet — [build from
 source](#from-source) there, which works fine.
@@ -47,7 +43,7 @@ source](#from-source) there, which works fine.
 Needs [Rust 1.97 or newer](https://rustup.rs) and `git` on your `PATH`.
 
 ```bash
-cargo install --git https://github.com/maximalcode/git-rehearse --tag v0.1.0
+cargo install --git https://github.com/maximalcode/git-rehearse --tag v1.1.0
 ```
 
 Or from a clone, to track `develop`:
