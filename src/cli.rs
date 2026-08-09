@@ -496,7 +496,46 @@ fn report_and_decide<W: Write>(
     }
 
     let choice = choose(decision, will_prompt, can_apply, outcome, output)?;
+    if choice == Choice::Apply && !can_apply {
+        return Err(refuse_apply(sandbox, outcome));
+    }
     act(choice, sandbox, output)
+}
+
+/// Refuses an `--apply` that cannot be honoured, without abandoning the sandbox.
+///
+/// Returning the refusal on its own leaves the rehearsal in the cache with
+/// nobody having asked for it — never `Kept`, so `list` shows a `Fresh` entry
+/// that no code path deliberately creates, and it sits there for the full TTL
+/// (#51).
+///
+/// What becomes of it follows the same rule as an unanswered question: a
+/// stopped rehearsal keeps its sandbox, because that sandbox is the only copy
+/// of where the command got to, and anything else lets it go. One exception —
+/// a rehearsal that was already `Kept` was kept on purpose by an earlier run,
+/// and a refusal here is no reason to undo that.
+///
+/// The refusal then says which happened, because "cannot be applied" without
+/// "and here is where it went" is half an answer.
+fn refuse_apply(mut sandbox: Sandbox, outcome: &Outcome) -> Error {
+    let id = sandbox.id().to_owned();
+    let already_kept = sandbox.meta().status == Status::Kept;
+
+    if already_kept || report::non_interactive(outcome) == Choice::Keep {
+        if !already_kept && let Err(error) = sandbox.keep() {
+            return error;
+        }
+        return Error::Refused(format!(
+            "{NOTHING_TO_APPLY}\n\
+             The rehearsal is kept as {id} — `git rehearse continue {id}` to carry it on, \
+             or `git rehearse discard {id}` to throw it away."
+        ));
+    }
+
+    if let Err(error) = sandbox.discard() {
+        return error;
+    }
+    Error::Refused(NOTHING_TO_APPLY.to_owned())
 }
 
 /// The same decision, made without a prompt, reported as one document.
@@ -524,7 +563,7 @@ fn decide_as_json<W: Write>(
         Decision::Ask => report::non_interactive(outcome),
     };
     if choice == Choice::Apply && !can_apply {
-        return Err(Error::Refused(NOTHING_TO_APPLY.to_owned()));
+        return Err(refuse_apply(sandbox, outcome));
     }
 
     let applied = if choice == Choice::Apply {
@@ -599,6 +638,10 @@ fn code_for_outcome(outcome: &Outcome) -> u8 {
 }
 
 /// Asks, or decides without asking.
+///
+/// Whether the choice is a *possible* one is not settled here — a `--apply`
+/// that cannot be honoured is refused by the caller, which owns the sandbox and
+/// therefore can dispose of it on the way out. See [`refuse_apply`].
 fn choose<W: Write>(
     decision: Decision,
     will_prompt: bool,
@@ -625,9 +668,6 @@ fn choose<W: Write>(
         }
     };
     if let Some(choice) = wanted {
-        if choice == Choice::Apply && !can_apply {
-            return Err(Error::Refused(NOTHING_TO_APPLY.to_owned()));
-        }
         return Ok(choice);
     }
     writeln!(output).map_err(Error::Spawn)?;

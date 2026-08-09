@@ -354,6 +354,46 @@ fn a_stopped_rehearsal_survives_having_nobody_to_ask_so_its_own_directions_work(
 }
 
 #[test]
+fn a_refused_apply_does_not_walk_away_from_its_sandbox() {
+    // The regression: the refusal returned before anything disposed of the
+    // rehearsal, so it sat in the cache as `Fresh` for the full TTL — a state
+    // no code path deliberately creates, and one `list` then displayed.
+    let fixture = Fixture::new();
+
+    // Git refused the command outright: nothing in progress, nothing to return
+    // to, so it goes.
+    let (code, _, err) = fixture.rehearse(&["--apply", "merge", "no-such-branch"]);
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(
+        sandbox::list(fixture.cache(), None)
+            .expect("the cache lists")
+            .is_empty(),
+        "a failed rehearsal leaves nothing worth keeping"
+    );
+
+    // A stopped one is the opposite: its sandbox is the only copy of where the
+    // command got to, so the refusal keeps it and says where it went.
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+    let (code, _, err) = fixture.rehearse(&["--apply", "rebase", "main"]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    let kept = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("a stopped rehearsal survives a refused --apply");
+    assert_eq!(
+        kept.meta().status,
+        sandbox::Status::Kept,
+        "and it is Kept, not left Fresh"
+    );
+    assert!(
+        err.contains(kept.id()) && err.contains("git rehearse continue"),
+        "the refusal has to say where it went: {err}"
+    );
+}
+
+#[test]
 fn a_clean_rehearsal_is_still_discarded_when_there_is_nobody_to_ask() {
     // The other half of the rule, kept honest: only a *stopped* rehearsal is
     // worth keeping unasked. A clean one nobody claimed can be had again by
