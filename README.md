@@ -16,11 +16,14 @@ before/after graph, the conflicts, and a warning if replaying your commits
 quietly changed what they do. Then you choose: apply it, keep it, or throw it
 away. Your repository is not touched until you say so.
 
-> **Status: v0.1.0 — the first release.** Everything on this page works; it is
-> what produced every terminal transcript here. The v1 command surface and the
-> exit codes are settled and will not shift under you.
-> [SCOPE.md](SCOPE.md) is the full plan, including the agent-facing v2 that is
-> the real target.
+> **Status: v0.1.0 is the current release**, and the v1 command surface and the
+> exit codes are settled — they will not shift under you.
+>
+> **This page documents `develop`.** Everything here is built and tested, and
+> every terminal transcript is real captured output, but two things are not in
+> the v0.1.0 tag yet: `git rehearse continue` and `--json`. [Build from
+> source](#from-source) for those, or wait for the next tag.
+> [SCOPE.md](SCOPE.md) is the full plan.
 
 ## Install
 
@@ -282,6 +285,87 @@ So the loop a program runs is `rehearse` → read `conflicts` → resolve them u
 `sandbox` → `continue` → read `drift_unexpected` → `apply`, with the real
 repository untouched until that last step.
 
+## For coding agents
+
+The tools that stop an agent wrecking your history all work by **blocking**:
+match `git rebase`, refuse, hand the problem back to you. That is the right
+instinct and the wrong end of it — the agent still does not know what the
+command would have done, and neither do you.
+
+Rehearsal is the constructive version. The agent runs the real command in a
+shadow clone, reads what actually happened, and only then asks for your
+repository.
+
+### Drop this in your `CLAUDE.md` or `AGENTS.md`
+
+````markdown
+## Rehearsing dangerous git commands
+
+Before running `git rebase`, `git merge` or `git cherry-pick` in this
+repository, rehearse it and act on the report:
+
+```bash
+git rehearse --json rebase main
+```
+
+Stdout is one JSON document. Read `outcome`:
+
+- **`"clean"`** — check `drift_unexpected`. If `false`, apply it:
+  `git rehearse --json apply <id>`. If `true`, **stop and show the user**
+  `drift[].replay.changed`: replaying those commits changed what they do, and
+  that is the thing worth catching. Do not apply it on your own judgement.
+- **`"stopped"`** — a conflict. The rehearsal is kept. `conflicts[]` names the
+  unmerged files and `sandbox` is the directory they are in. Resolve them
+  there, `git add` them there, then `git rehearse --json continue <id>` and
+  read the new document. Repeat as often as it stops.
+- **`"failed"`** — git refused the command outright; `git_exit_code` is git's
+  own. Nothing was kept and nothing was changed.
+
+A document with `"kind": "refused"` means git-rehearse itself declined — read
+`message` and fix what it names. Do not retry it unchanged.
+
+The working tree is never touched until `apply`, and `apply` transplants the
+commits you inspected rather than re-running anything.
+````
+
+### A PreToolUse hook
+
+Blocks the three commands and points at the rehearsal instead. Needs `jq`, and
+Claude Code's `PreToolUse` matcher set to `Bash`; exit code 2 blocks the call and
+puts the message in front of the model.
+
+```bash
+#!/usr/bin/env bash
+# .claude/hooks/rehearse-first.sh
+command=$(jq -r '.tool_input.command // ""')
+
+# Already going through us, or not our business.
+case "$command" in
+  *"git rehearse"*) exit 0 ;;
+  *"git rebase"*|*"git merge"*|*"git cherry-pick"*) ;;
+  *) exit 0 ;;
+esac
+
+cat >&2 <<'WHY'
+Rehearse it first: `git rehearse --json <the same command>`.
+Read the JSON, check drift_unexpected, then `git rehearse --json apply <id>`.
+WHY
+exit 2
+```
+
+### One thing this does not cover
+
+`git reset --hard` is missing from that list on purpose. What makes it dangerous
+is **uncommitted** work — the committed history it appears to destroy is
+reachable through the reflog for weeks, but unstaged edits are gone for good.
+
+git-rehearse refuses a dirty worktree. So on exactly the input where
+`reset --hard` is dangerous, there is nothing to rehearse; and where rehearsing
+works, the command was not very dangerous. Routing it through here would
+therefore *block* it rather than rehearse it, which is a different product. If
+you want that, block it directly — do not let a rehearsal step imply a safety
+net it is not providing.
+
 ## What it refuses
 
 Principle 5 is *refuse loudly rather than guess*. All of these exit `4` with an
@@ -333,7 +417,7 @@ Two ideas carry the whole design:
 | | |
 |---|---|
 | **v1** | Human CLI: `rebase` / `merge` / `cherry-pick` rehearsal, before/after graph, conflict + content-drift report, apply/discard/keep |
-| **v2** | Agent mode: `--json`, stable exit codes, an MCP server — so AI coding agents rehearse history-rewriting commands *before* touching your worktree |
+| **v2** | Agent mode, so AI coding agents rehearse history-rewriting commands *before* touching your worktree. `--json` and the stable exit codes are **done**; whether it also gets an MCP server is [undecided](https://github.com/maximalcode/git-rehearse/issues/37) |
 | **v3** | Surfaces: resolve-in-sandbox polish, `undo`, visual graph panel |
 
 Details, non-goals and honest risks: [SCOPE.md](SCOPE.md).
