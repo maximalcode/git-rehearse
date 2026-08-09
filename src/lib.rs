@@ -14,6 +14,7 @@
 pub mod analyze;
 pub mod apply;
 pub mod cache;
+pub mod carry;
 pub mod cli;
 pub mod error;
 pub mod execute;

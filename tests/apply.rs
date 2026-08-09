@@ -153,7 +153,12 @@ fn uncommitted_work_is_never_destroyed_by_an_apply() {
     let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
 
     assert!(message.contains("reset --hard"), "{message}");
-    assert!(message.contains("Commit or stash"), "{message}");
+    assert!(message.contains("commit or stash them"), "{message}");
+    assert!(
+        message.contains("not there when you rehearsed"),
+        "the rehearsal carried nothing, so this edit appeared afterwards and is nobody's \
+         business but the user's: {message}"
+    );
     assert_eq!(
         std::fs::read_to_string(fixture.repo().join("file.txt")).expect("real worktree"),
         "work in progress\n",

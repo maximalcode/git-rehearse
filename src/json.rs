@@ -29,8 +29,12 @@
 
 use serde::Serialize;
 
-use crate::analyze::{Analysis, Commit, Conflict, Drift, FileChange, RefMove, Replay};
+use crate::analyze::{Analysis, Commit, Conflict, Drift, FileChange, RefMove};
+// Two different replays meet in this file: what happened to the *commits* when
+// they were replayed, and what happened to the *carried changes*.
+use crate::analyze::Replay as CommitReplay;
 use crate::apply::Applied;
+use crate::carry::{Carry, Replay};
 use crate::execute::Outcome;
 use crate::report::Choice;
 use crate::sandbox::{Meta, Sandbox, Status};
@@ -137,8 +141,73 @@ pub struct AppliedReport {
     /// The branch whose worktree was reset, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_reset: Option<String>,
+    /// The uncommitted paths put back over the reset worktree, if the
+    /// rehearsal carried any and there was anything left to put back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried_back: Option<Vec<String>>,
     /// Where the pre-state was written down, so it can be undone by hand.
     pub undo: String,
+}
+
+/// How the carried uncommitted work fared.
+///
+/// Spelled out rather than derived from [`crate::carry::Replay`], like every
+/// other name in this module: that enum belongs to `meta.json` and a rename
+/// there must not reach the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CarryStatus {
+    /// Not replayed yet — the command did not finish, so there was nothing to
+    /// put the changes on.
+    Pending,
+    /// The changes go back on cleanly.
+    Restored,
+    /// They go back on and leave nothing behind: the rehearsed history already
+    /// contains them.
+    Contained,
+    /// They conflict with the rehearsed history. `conflicts` names the paths.
+    Conflicted,
+    /// The replay could not be attempted; `reason` says why in git's words.
+    Refused,
+    /// Nothing to replay onto: applying this rehearsal does not move the
+    /// worktree the changes are in, so they stay exactly where they are.
+    NotNeeded,
+}
+
+/// The uncommitted work a rehearsal carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CarriedReport {
+    /// The tracked paths that were dirty when the rehearsal started.
+    pub paths: Vec<String>,
+    pub status: CarryStatus,
+    /// Unmerged paths in the sandbox, when `status` is `conflicted`.
+    pub conflicts: Vec<String>,
+    /// Git's own words, when `status` is `refused`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl CarriedReport {
+    /// The document for a rehearsal's carried work.
+    #[must_use]
+    pub fn of(carry: &Carry) -> Self {
+        let (status, conflicts, reason) = match &carry.replay {
+            None => (CarryStatus::Pending, Vec::new(), None),
+            Some(Replay::Restored { result: Some(_) }) => (CarryStatus::Restored, Vec::new(), None),
+            Some(Replay::Restored { result: None }) => (CarryStatus::Contained, Vec::new(), None),
+            Some(Replay::Conflicted { paths }) => (CarryStatus::Conflicted, paths.clone(), None),
+            Some(Replay::Refused { reason }) => {
+                (CarryStatus::Refused, Vec::new(), Some(reason.clone()))
+            }
+            Some(Replay::NotNeeded) => (CarryStatus::NotNeeded, Vec::new(), None),
+        };
+        Self {
+            paths: carry.paths.clone(),
+            status,
+            conflicts,
+            reason,
+        }
+    }
 }
 
 /// The rehearsal report.
@@ -174,6 +243,13 @@ pub struct Report {
     /// Whether `drift` is a surprise. True only where replaying should have
     /// preserved content and did not — the warning this tool exists for.
     pub drift_unexpected: bool,
+    /// The uncommitted work this rehearsal carried, and whether it comes back.
+    /// Absent when the worktree was clean.
+    ///
+    /// An added optional field, so [`SCHEMA`] does not move: no caller can be
+    /// broken by a key it has never read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carried: Option<CarriedReport>,
     /// Whether this rehearsal is in a state that could be applied.
     pub can_apply: bool,
     pub decision: Decision,
@@ -364,6 +440,7 @@ impl Report {
             conflicts: analysis.conflicts.iter().map(conflict).collect(),
             drift: analysis.drift.iter().map(drift).collect(),
             drift_unexpected: analysis.has_unexpected_drift(),
+            carried: meta.carry.as_ref().map(CarriedReport::of),
             can_apply,
             decision: match choice {
                 Choice::Apply => Decision::Applied,
@@ -413,7 +490,7 @@ fn file(change: &FileChange) -> FileEntry {
     }
 }
 
-fn replay(found: &Replay) -> ReplayReport {
+fn replay(found: &CommitReplay) -> ReplayReport {
     ReplayReport {
         changed: found.changed.clone(),
         dropped: found.dropped.clone(),
@@ -438,14 +515,18 @@ pub fn applied_report(applied: &Applied) -> AppliedReport {
     AppliedReport {
         refs: applied.moved.iter().map(reference).collect(),
         worktree_reset: applied.reset.clone(),
+        carried_back: applied.carried.clone(),
         undo: applied.undo.display().to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Decision, Failure, FailureKind, OutcomeKind, Report, SCHEMA};
+    use super::{
+        CarriedReport, CarryStatus, Decision, Failure, FailureKind, OutcomeKind, Report, SCHEMA,
+    };
     use crate::analyze::{Analysis, Commit, Conflict};
+    use crate::carry::{Carry, Replay};
     use crate::cli::exit;
     use crate::execute::Outcome;
 
@@ -541,10 +622,49 @@ mod tests {
             conflicts: analysis().conflicts.iter().map(super::conflict).collect(),
             drift: Vec::new(),
             drift_unexpected: false,
+            carried: None,
             can_apply: false,
             decision: Decision::Kept,
             applied: None,
         }
+    }
+
+    #[test]
+    fn the_carried_work_is_one_object_a_caller_can_branch_on() {
+        let carry = Carry {
+            snapshot: "5ea51a5h".to_owned(),
+            paths: vec!["notes.txt".to_owned()],
+            replay: Some(Replay::Conflicted {
+                paths: vec!["notes.txt".to_owned()],
+            }),
+        };
+        let json = serde_json::to_value(CarriedReport::of(&carry)).expect("serialises");
+        assert_eq!(json["status"], "conflicted");
+        assert_eq!(json["conflicts"][0], "notes.txt");
+        assert!(json.get("reason").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_replay_that_left_nothing_behind_is_not_the_same_as_one_that_did() {
+        // `contained` means the rehearsed history already has the changes;
+        // `restored` means a tree comes back. A caller deciding whether to
+        // expect a dirty worktree after `apply` needs them apart.
+        let carry = |replay| Carry {
+            snapshot: "5ea51a5h".to_owned(),
+            paths: vec!["notes.txt".to_owned()],
+            replay: Some(replay),
+        };
+        assert_eq!(
+            CarriedReport::of(&carry(Replay::Restored {
+                result: Some("re914yed".to_owned())
+            }))
+            .status,
+            CarryStatus::Restored
+        );
+        assert_eq!(
+            CarriedReport::of(&carry(Replay::Restored { result: None })).status,
+            CarryStatus::Contained
+        );
     }
 
     #[test]

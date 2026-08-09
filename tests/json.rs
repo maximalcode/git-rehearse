@@ -222,7 +222,11 @@ fn a_failure_is_a_document_as_well() {
     // A caller that parses JSON on success and meets English on failure has to
     // parse English anyway, so every exit path emits one.
     let fixture = Fixture::new();
-    fixture.write("file.txt", "uncommitted\n");
+    fixture.commit_file(
+        ".gitattributes",
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        "track binaries with lfs",
+    );
 
     let (code, out, err) = fixture.rehearse(&["--json", "merge", "feature"]);
 
@@ -234,11 +238,11 @@ fn a_failure_is_a_document_as_well() {
         json["message"]
             .as_str()
             .expect("a message")
-            .contains("uncommitted changes"),
+            .contains("Git LFS"),
         "{json}"
     );
     // And the human still gets it on stderr, which nobody parses.
-    assert!(err.contains("uncommitted changes"), "{err}");
+    assert!(err.contains("Git LFS"), "{err}");
 }
 
 #[test]

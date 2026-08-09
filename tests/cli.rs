@@ -57,13 +57,17 @@ fn a_command_git_refuses_exits_three() {
 #[test]
 fn our_own_refusal_exits_four_and_explains_itself_on_stderr() {
     let fixture = Fixture::new();
-    fixture.write("file.txt", "uncommitted\n");
+    fixture.commit_file(
+        ".gitattributes",
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        "track binaries with lfs",
+    );
 
     let (code, _, err) = fixture.rehearse(&["merge", "feature"]);
 
     assert_eq!(code, REFUSED);
-    assert!(err.contains("uncommitted changes"), "{err}");
-    assert!(err.contains("commit or stash"), "{err}");
+    assert!(err.contains("Git LFS"), "{err}");
+    assert!(err.contains("not supported in v1"), "{err}");
 }
 
 #[test]

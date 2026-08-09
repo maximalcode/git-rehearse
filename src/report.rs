@@ -14,9 +14,10 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use crate::analyze::{Analysis, RefMove};
+use crate::carry::{Carry, Replay};
 use crate::execute::Outcome;
 use crate::sandbox::Meta;
-use crate::{Result, git};
+use crate::{Result, carry, git};
 
 /// How many characters of a commit id the report shows.
 const SHORT: usize = 8;
@@ -128,6 +129,16 @@ pub fn render(meta: &Meta, analysis: &Analysis, outcome: &Outcome, graphs: &[Gra
 
     match outcome {
         Outcome::Clean => {}
+        // The command finished; it is putting the uncommitted work back that
+        // stopped. Saying "the command stopped" here would send someone
+        // looking for a half-finished rebase that is not there.
+        Outcome::Stopped { .. } if carry::stopped_on_replay(meta) => {
+            let _ = writeln!(
+                out,
+                "the command ran, but your uncommitted changes did not go back on"
+            );
+            let _ = writeln!(out);
+        }
         Outcome::Stopped { conflicts } => {
             let _ = writeln!(
                 out,
@@ -151,11 +162,66 @@ pub fn render(meta: &Meta, analysis: &Analysis, outcome: &Outcome, graphs: &[Gra
     }
 
     render_refs(&mut out, &analysis.ref_moves);
+    render_carried(&mut out, meta.carry.as_ref());
     render_conflicts(&mut out, analysis);
     render_graphs(&mut out, graphs);
     render_drift(&mut out, analysis);
 
     out
+}
+
+/// What was carried through the rehearsal, and whether it came back.
+///
+/// The second half of the question, and the reason this feature exists: a
+/// report that says the rebase is fine and nothing about the work in your
+/// worktree has answered the easy half.
+fn render_carried(out: &mut String, carry: Option<&Carry>) {
+    let Some(carry) = carry else {
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "carried  {} uncommitted path(s): {}",
+        carry.paths.len(),
+        carry::describe(&carry.paths)
+    );
+    match &carry.replay {
+        None => {
+            let _ = writeln!(
+                out,
+                "  not put back — the command did not finish, so there was nothing to put them on"
+            );
+        }
+        Some(Replay::Restored { result: Some(_) }) => {
+            let _ = writeln!(out, "  they come back clean on the rehearsed history");
+        }
+        Some(Replay::Restored { result: None }) => {
+            let _ = writeln!(
+                out,
+                "  nothing comes back — the rehearsed history already contains these changes"
+            );
+        }
+        Some(Replay::Conflicted { paths }) => {
+            let _ = writeln!(
+                out,
+                "  they do NOT come back clean — {} path(s) conflict in the sandbox:",
+                paths.len()
+            );
+            for path in paths {
+                let _ = writeln!(out, "    {path}");
+            }
+        }
+        Some(Replay::Refused { reason }) => {
+            let _ = writeln!(out, "  they could not be put back: {reason}");
+        }
+        Some(Replay::NotNeeded) => {
+            let _ = writeln!(
+                out,
+                "  they stay where they are — this rehearsal does not move your worktree"
+            );
+        }
+    }
+    let _ = writeln!(out);
 }
 
 fn render_refs(out: &mut String, moves: &[RefMove]) {
@@ -385,6 +451,9 @@ fn parse(answer: &str, can_apply: bool) -> Option<Choice> {
 mod tests {
     use super::{Choice, Graph, ask, can_apply, non_interactive, parse, render, short};
     use crate::analyze::{Analysis, Commit, Conflict, Drift, FileChange, RefMove, Replay};
+    // Two different replays meet in this file: what happened to the *commits*
+    // (above) and what happened to the *carried changes* (below).
+    use crate::carry::{Carry, Replay as Carried};
     use crate::execute::Outcome;
     use crate::sandbox::{Checkout, META_SCHEMA, Meta, Status};
     use std::collections::BTreeMap;
@@ -400,9 +469,22 @@ mod tests {
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
             checkout: Checkout::Branch("feature".to_owned()),
             pre_state: BTreeMap::new(),
+            carry: None,
             created_unix: 1_786_248_000,
             status: Status::Fresh,
             result: None,
+        }
+    }
+
+    /// The same, with uncommitted work carried through it.
+    fn meta_carrying(command: &[&str], replay: Option<Carried>) -> Meta {
+        Meta {
+            carry: Some(Carry {
+                snapshot: "5ea51a5h".to_owned(),
+                paths: vec!["notes.txt".to_owned(), "src/main.rs".to_owned()],
+                replay,
+            }),
+            ..meta(command)
         }
     }
 
@@ -597,6 +679,111 @@ mod tests {
         );
         assert!(report.contains("content  refs/heads/main"), "{report}");
         assert!(report.contains("M src/main.rs"), "{report}");
+    }
+
+    #[test]
+    fn carried_work_that_comes_back_clean_says_so_in_one_line() {
+        let report = render(
+            &meta_carrying(
+                &["rebase", "main"],
+                Some(Carried::Restored {
+                    result: Some("re914yed".to_owned()),
+                }),
+            ),
+            &analysis(),
+            &Outcome::Clean,
+            &[],
+        );
+        assert!(
+            report.contains("carried  2 uncommitted path(s): notes.txt, src/main.rs"),
+            "{report}"
+        );
+        assert!(report.contains("come back clean"), "{report}");
+    }
+
+    #[test]
+    fn carried_work_the_new_history_already_contains_is_not_silently_dropped() {
+        // The changes are gone from the worktree after an apply, and the
+        // reason is that they are in the commits now. Saying nothing here
+        // would look exactly like losing them.
+        let report = render(
+            &meta_carrying(
+                &["rebase", "main"],
+                Some(Carried::Restored { result: None }),
+            ),
+            &analysis(),
+            &Outcome::Clean,
+            &[],
+        );
+        assert!(report.contains("nothing comes back"), "{report}");
+        assert!(report.contains("already contains"), "{report}");
+    }
+
+    #[test]
+    fn a_replay_that_conflicts_is_reported_as_the_command_having_run() {
+        // The rebase worked. What stopped is putting the uncommitted work
+        // back, and a report that said "the command stopped part-way" would
+        // send someone looking for a half-finished rebase that is not there.
+        let report = render(
+            &meta_carrying(
+                &["rebase", "main"],
+                Some(Carried::Conflicted {
+                    paths: vec!["notes.txt".to_owned()],
+                }),
+            ),
+            &analysis(),
+            &Outcome::Stopped { conflicts: true },
+            &[],
+        );
+        assert!(
+            report.contains("the command ran, but your uncommitted changes did not go back on"),
+            "{report}"
+        );
+        assert!(!report.contains("the command stopped part-way"), "{report}");
+        assert!(report.contains("do NOT come back clean"), "{report}");
+        assert!(report.contains("    notes.txt"), "{report}");
+    }
+
+    #[test]
+    fn a_replay_that_never_happened_says_why_rather_than_nothing() {
+        let stopped = render(
+            &meta_carrying(&["rebase", "main"], None),
+            &analysis(),
+            &Outcome::Stopped { conflicts: true },
+            &[],
+        );
+        assert!(stopped.contains("not put back"), "{stopped}");
+        // And the ordinary stopped-command wording is back, because this time
+        // it is the command that stopped.
+        assert!(
+            stopped.contains("the command stopped part-way"),
+            "{stopped}"
+        );
+
+        let blocked = render(
+            &meta_carrying(
+                &["--", "checkout", "-p"],
+                Some(Carried::Refused {
+                    reason: "error: your local changes would be overwritten".to_owned(),
+                }),
+            ),
+            &analysis(),
+            &Outcome::Stopped { conflicts: false },
+            &[],
+        );
+        assert!(blocked.contains("could not be put back"), "{blocked}");
+        assert!(blocked.contains("would be overwritten"), "{blocked}");
+    }
+
+    #[test]
+    fn a_rehearsal_that_carried_nothing_has_no_carried_section_at_all() {
+        let report = render(
+            &meta(&["rebase", "main"]),
+            &analysis(),
+            &Outcome::Clean,
+            &[],
+        );
+        assert!(!report.contains("carried"), "{report}");
     }
 
     #[test]

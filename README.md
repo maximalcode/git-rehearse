@@ -196,6 +196,68 @@ Because applying transplants the sandbox's commits rather than re-running the
 command, **the resolution you did in the sandbox is the resolution you get.**
 You never resolve the same conflict twice.
 
+### With work in progress
+
+You do not have to commit or stash first. Uncommitted changes to tracked files
+are **carried through the rehearsal**: snapshotted with `git stash create`,
+which never touches your stash list, and then put back *in the sandbox* after
+the command has run — so the report answers the question you actually have,
+which is not "does my rebase work" but "does my rebase work **and do I get my
+uncommitted work back**".
+
+```console
+$ git rehearse --apply rebase main
+Rebasing (1/1)Successfully rebased and updated refs/heads/feature.
+
+rehearsed  git rebase main
+repository /home/ada/report
+rehearsal  1786294984-00
+
+refs
+  HEAD                bcd0638b -> bbc67ded
+  refs/heads/feature  bcd0638b -> bbc67ded
+
+carried  1 uncommitted path(s): limits.toml
+  they come back clean on the rehearsed history
+
+applied:
+  refs/heads/feature bbc67ded2e6083ff63196c4c898182fe2b1f2168
+  worktree reset to feature
+  1 uncommitted path(s) put back: limits.toml
+```
+
+The command itself still runs against a **clean** sandbox — `git rebase` refuses
+a dirty tree, and rehearsing something git would refuse to run is not a
+rehearsal. Applying then checks the tree the sandbox produced out over the reset
+worktree; it does not merge your changes in your own repository for the first
+time, because a first time is the failure this tool exists to prevent.
+
+When the changes do *not* go back on cleanly, that is a stopped rehearsal like
+any other — exit `2`, the sandbox kept, and the same resolve-there-and-`continue`
+loop as a conflicting rebase:
+
+```console
+$ git rehearse --keep rebase main
+the command ran, but your uncommitted changes did not go back on
+
+carried  1 uncommitted path(s): config.toml
+  they do NOT come back clean — 1 path(s) conflict in the sandbox:
+    config.toml
+```
+
+Four things worth knowing:
+
+- **Untracked files are left alone** — not carried, not touched. They are not in
+  a stash without `-u`, and git was never going to destroy them.
+- **Apply refuses if your worktree has changed since.** What the report promised
+  to put back was rehearsed; anything you typed afterwards was not.
+- **Everything comes back unstaged**, in your worktree, exactly where
+  `git stash pop` without `--index` would leave it. A transplanted tree does not
+  carry the staged/unstaged distinction.
+- **`undo` refuses while those changes are in the way**, because rewinding the
+  branch means `git reset --hard` and that would eat them. Stash them, undo,
+  put them back.
+
 ### The warning this tool exists for
 
 A conflict you resolve by hand can silently change what a commit *does*. Above,
@@ -267,7 +329,7 @@ Stable from v0.1 on — v2's agent mode reads them.
 | `1` | an internal error in git-rehearse |
 | `2` | the rehearsed command stopped part-way, usually a conflict |
 | `3` | the rehearsed command failed in the sandbox |
-| `4` | refused: dirty worktree, refs moved since the rehearsal, unsupported repository |
+| `4` | refused: refs or worktree moved since the rehearsal, unsupported repository |
 
 Two things worth knowing before you script this:
 
@@ -392,22 +454,27 @@ exit 2
 is **uncommitted** work — the committed history it appears to destroy is
 reachable through the reflog for weeks, but unstaged edits are gone for good.
 
-git-rehearse refuses a dirty worktree. So on exactly the input where
-`reset --hard` is dangerous, there is nothing to rehearse; and where rehearsing
-works, the command was not very dangerous. Routing it through here would
-therefore *block* it rather than rehearse it, which is a different product. If
-you want that, block it directly — do not let a rehearsal step imply a safety
-net it is not providing.
+git-rehearse *carries* your uncommitted work through a rehearsal and puts it
+back, which is exactly why `reset --hard` does not belong here: rehearsing it
+would preserve the very thing the command exists to destroy, so the rehearsal
+would answer a kinder question than the one you asked. The report says so out
+loud — nothing about it is silent — but an intercept that quietly turns a
+destructive command into a safe one is a different product from a rehearsal. If
+you want that, block it directly; do not let a rehearsal step imply a safety net
+it is not providing.
 
 ## What it refuses
 
 Principle 5 is *refuse loudly rather than guess*. All of these exit `4` with an
 explanation rather than doing something approximate:
 
-a dirty worktree · a bare repository · a shallow clone · a repository with
-submodules · one using Git LFS · one with multiple worktrees · one with no
-commits yet · and, at apply time, a repository whose refs have moved since the
-rehearsal.
+a bare repository · a shallow clone · a repository with submodules · one using
+Git LFS · one with multiple worktrees · one with no commits yet · and, at apply
+time, a repository whose refs have moved since the rehearsal, or whose worktree
+no longer holds the uncommitted changes the rehearsal carried.
+
+A dirty worktree used to head that list. It is now carried through the
+rehearsal instead — the principle did not change, only the thing being refused.
 
 `undo` refuses on the same principle: no record to undo, a record from a
 different apply than the one you named, a ref that has moved since that apply,
@@ -454,9 +521,9 @@ Two ideas carry the whole design:
 
 | | |
 |---|---|
-| **v1** | Human CLI: `rebase` / `merge` / `cherry-pick` rehearsal, before/after graph, conflict + content-drift report, apply/undo/discard/keep |
+| **v1** | Human CLI: `rebase` / `merge` / `cherry-pick` rehearsal, before/after graph, conflict + content-drift report, uncommitted work carried through, apply/undo/discard/keep |
 | **v2** | Agent mode, so AI coding agents rehearse history-rewriting commands *before* touching your worktree. `--json` and the stable exit codes are **done**; whether it also gets an MCP server is [undecided](https://github.com/maximalcode/git-rehearse/issues/37) |
-| **v3** | Surfaces: resolve-in-sandbox polish, dirty-worktree snapshots, visual graph panel |
+| **v3** | Surfaces: resolve-in-sandbox polish, visual graph panel |
 
 Details, non-goals and honest risks: [SCOPE.md](SCOPE.md).
 

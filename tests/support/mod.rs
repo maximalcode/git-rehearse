@@ -226,13 +226,15 @@ impl Fixture {
         refs_of(self, dir)
     }
 
-    /// A plan against this fixture, with a truthful pre-state.
+    /// A plan against this fixture, with a truthful pre-state and whatever
+    /// uncommitted work is in the worktree.
     pub fn plan(&self, command: &[&str], checkout: Checkout) -> Plan {
         Plan {
             repo: self.repo.clone(),
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
             checkout,
             pre_state: self.refs(),
+            carry: git_rehearse::carry::snapshot(&self.repo).expect("the worktree snapshots"),
         }
     }
 }

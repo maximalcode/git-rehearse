@@ -26,8 +26,8 @@ use crate::execute::{Outcome, SEQUENCE_EDITOR_ARG, Todo};
 use crate::report::Choice;
 use crate::sandbox::{DEFAULT_TTL_SECS, Sandbox, Status};
 use crate::{
-    Error, Result, analyze, apply, cache, execute, git, json, now_unix, preflight, report, sandbox,
-    undo,
+    Error, Result, analyze, apply, cache, carry, execute, git, json, now_unix, preflight, report,
+    sandbox, undo,
 };
 
 /// Whether the run talks to a person or to a program.
@@ -103,6 +103,13 @@ undo puts the refs back where the last apply found them, in one transaction and
 only if every one of them is still where that apply left it. One apply is
 undoable at a time: applying again overwrites the record, and a successful undo
 uses it up. Give it an id to insist on which apply you mean.
+
+Uncommitted changes to tracked files are carried through a rehearsal: they are
+snapshotted with `git stash create` (your stash list is never touched), the
+command runs against a clean sandbox, and the changes are then put back there,
+so the report says whether they survive. Applying checks that rehearsed result
+out over the reset worktree rather than merging anything, and refuses if your
+worktree has changed since. Untracked files are left alone throughout.
 ";
 
 /// Said when the question is skipped because there is nobody to answer it.
@@ -434,6 +441,11 @@ fn rehearse<W: Write>(
         todo.as_ref(),
         chatter(format),
     )?;
+    // The second half of the rehearsal: the command ran against committed
+    // history, and now any uncommitted work goes back on top of it — in the
+    // sandbox, where it is safe to find out that it does not. See
+    // [`crate::carry`].
+    let outcome = carry::after_command(&mut sandbox, outcome)?;
     sandbox.record(&outcome)?;
 
     let code = code_for_outcome(&outcome);
@@ -457,7 +469,16 @@ fn resume<W: Write>(
     output: &mut W,
 ) -> Result<u8> {
     let mut sandbox = find(id, cwd)?;
-    let outcome = execute::resume_with(&sandbox.worktree(), chatter(format))?;
+    // Which half stopped decides what carrying on means. A rehearsal waiting
+    // on its replay has no operation for `git … --continue` to advance: what
+    // it is waiting for is the resolution in the sandbox worktree, which
+    // `carry::resume` captures rather than re-merges.
+    let outcome = if carry::stopped_on_replay(sandbox.meta()) {
+        carry::resume(&mut sandbox)?
+    } else {
+        let outcome = execute::resume_with(&sandbox.worktree(), chatter(format))?;
+        carry::after_command(&mut sandbox, outcome)?
+    };
     sandbox.record(&outcome)?;
 
     let code = code_for_outcome(&outcome);
@@ -732,6 +753,15 @@ fn report_applied<W: Write>(applied: &apply::Applied, output: &mut W) -> Result<
     }
     if let Some(branch) = &applied.reset {
         writeln!(output, "  worktree reset to {branch}").map_err(Error::Spawn)?;
+    }
+    if let Some(carried) = &applied.carried {
+        writeln!(
+            output,
+            "  {} uncommitted path(s) put back: {}",
+            carried.len(),
+            carry::describe(carried)
+        )
+        .map_err(Error::Spawn)?;
     }
     writeln!(
         output,

@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
+use crate::carry::{Carry, Replay};
 use crate::execute::Outcome;
 
 /// The clone itself, inside the rehearsal directory.
@@ -67,6 +68,9 @@ pub struct Plan {
     /// Stored verbatim: apply re-reads it to prove nothing moved underneath
     /// the user, so it is evidence, not a cache.
     pub pre_state: BTreeMap<String, String>,
+    /// The uncommitted work to carry through the rehearsal, if there was any.
+    /// [`build`] moves it into the sandbox; [`crate::carry`] owns the rest.
+    pub carry: Option<Carry>,
 }
 
 /// A rehearsal directory on disk.
@@ -114,6 +118,24 @@ impl Sandbox {
     /// if `meta.json` cannot be rewritten.
     pub fn record(&mut self, outcome: &Outcome) -> Result<()> {
         self.meta.result = Some(outcome.clone());
+        self.meta.write(&self.root)
+    }
+
+    /// Records what became of the carried uncommitted work.
+    ///
+    /// Separate from [`Sandbox::record`] because the two are answered at
+    /// different moments: the command's outcome the instant git exits, the
+    /// replay's only afterwards — and, when the replay stopped and was
+    /// resolved by hand, in an entirely later process.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`](crate::Error::Io) or [`Error::Meta`](crate::Error::Meta)
+    /// if `meta.json` cannot be rewritten.
+    pub fn record_replay(&mut self, replay: Replay) -> Result<()> {
+        if let Some(carry) = self.meta.carry.as_mut() {
+            carry.replay = Some(replay);
+        }
         self.meta.write(&self.root)
     }
 
