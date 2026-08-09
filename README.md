@@ -16,31 +16,48 @@ before/after graph, the conflicts, and a warning if replaying your commits
 quietly changed what they do. Then you choose: apply it, keep it, or throw it
 away. Your repository is not touched until you say so.
 
-> **Status: v0.1 is built, but not released yet.** The code below all works —
-> it is what produced every terminal transcript on this page — and it is merged
-> on `develop`. There is no tagged release and nothing on crates.io yet, so
-> [install from source](#install) for now. [SCOPE.md](SCOPE.md) is the full
-> plan, including the agent-facing v2 that is the real target.
+> **Status: v0.1.0 — the first release.** Everything on this page works; it is
+> what produced every terminal transcript here. The v1 command surface and the
+> exit codes are settled and will not shift under you.
+> [SCOPE.md](SCOPE.md) is the full plan, including the agent-facing v2 that is
+> the real target.
 
 ## Install
 
-No release is tagged yet, so the two paths that work today both build from
-source. You need [Rust 1.97 or newer](https://rustup.rs) and `git` on your
-`PATH`.
+### A prebuilt binary
+
+The [releases page](https://github.com/maximalcode/git-rehearse/releases)
+carries an archive per platform with a SHA-256 sum beside it. Download it,
+check the sum, and put the `git-rehearse` inside on your `PATH`.
+
+| platform | archive |
+|---|---|
+| Linux, x86-64 | `git-rehearse-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS, Apple silicon | `git-rehearse-v0.1.0-aarch64-apple-darwin.tar.gz` |
+| Windows, x86-64 | `git-rehearse-v0.1.0-x86_64-pc-windows-msvc.zip` |
+
+Intel macOS and ARM Linux are not built yet — [build from
+source](#from-source) there, which works fine.
+
+### From source
+
+Needs [Rust 1.97 or newer](https://rustup.rs) and `git` on your `PATH`.
 
 ```bash
-cargo install --git https://github.com/maximalcode/git-rehearse --branch develop
+cargo install --git https://github.com/maximalcode/git-rehearse --tag v0.1.0
 ```
 
-Or from a clone:
+Or from a clone, to track `develop`:
 
 ```bash
 git clone https://github.com/maximalcode/git-rehearse && cd git-rehearse && cargo install --path .
 ```
 
-Both install a binary called `git-rehearse`. Because git treats any
-`git-<name>` on your `PATH` as a subcommand, that is all it takes for
-`git rehearse …` to work — no alias, no config.
+Not on crates.io yet.
+
+However you install it, you get a binary called `git-rehearse`. Because git
+treats any `git-<name>` on your `PATH` as a subcommand, that is all it takes
+for `git rehearse …` to work — no alias, no config.
 
 When v0.1 is tagged, the [releases page](https://github.com/maximalcode/git-rehearse/releases)
 will carry prebuilt binaries for Linux, macOS and Windows with SHA-256 sums
