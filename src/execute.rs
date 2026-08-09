@@ -19,6 +19,7 @@ use std::process::ExitStatus;
 
 use serde::{Deserialize, Serialize};
 
+use crate::git::Chatter;
 use crate::{Error, Result, git};
 
 /// The argument that makes this binary act as git's sequence editor.
@@ -92,11 +93,29 @@ impl Todo {
 /// [`Error::Spawn`] if git cannot be started, [`Error::Git`] if inspecting the
 /// stopped state afterwards fails.
 pub fn run(worktree: &Path, command: &[String], todo: Option<&Todo>) -> Result<Outcome> {
+    run_with(worktree, command, todo, Chatter::Inherit)
+}
+
+/// [`run`], with a say in where git's own stdout goes.
+///
+/// Separate rather than a parameter on [`run`] because inheriting is right
+/// everywhere except under `--json`, and a call that reads
+/// `run(worktree, command, todo)` should keep meaning what it has always meant.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn run_with(
+    worktree: &Path,
+    command: &[String],
+    todo: Option<&Todo>,
+    chatter: Chatter,
+) -> Result<Outcome> {
     let env = match todo {
         Some(todo) => vec![("GIT_SEQUENCE_EDITOR", sequence_editor(todo, command)?)],
         None => Vec::new(),
     };
-    let status = git::spawn(worktree, command, &env)?;
+    let status = git::spawn_with(worktree, command, &env, chatter)?;
     classify(worktree, status)
 }
 
@@ -252,6 +271,15 @@ pub fn unmerged(worktree: &Path) -> Result<Vec<String>> {
 /// unmerged, or for a bisect, which cannot be continued mechanically.
 /// [`Error::Spawn`] if git cannot be started.
 pub fn resume(worktree: &Path) -> Result<Outcome> {
+    resume_with(worktree, Chatter::Inherit)
+}
+
+/// [`resume`], with a say in where git's own stdout goes. See [`run_with`].
+///
+/// # Errors
+///
+/// As [`resume`].
+pub fn resume_with(worktree: &Path, chatter: Chatter) -> Result<Outcome> {
     let Some(operation) = in_progress(worktree)? else {
         return Err(Error::Refused(
             "this rehearsal has nothing in progress — there is nothing to continue.\n\
@@ -282,7 +310,7 @@ pub fn resume(worktree: &Path) -> Result<Outcome> {
         )));
     }
 
-    let status = git::spawn(worktree, [subcommand, "--continue"], &[])?;
+    let status = git::spawn_with(worktree, [subcommand, "--continue"], &[], chatter)?;
     classify(worktree, status)
 }
 

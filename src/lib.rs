@@ -18,6 +18,7 @@ pub mod cli;
 pub mod error;
 pub mod execute;
 pub mod git;
+pub mod json;
 pub mod preflight;
 pub mod report;
 pub mod sandbox;

@@ -208,9 +208,16 @@ interactive rebase to a real repo with zero surprises.
 Everything here rides on v1's mechanics; nothing requires rework if v1 keeps its exit
 codes and `--todo` stable.
 
-- **`--json`:** one machine-readable report document — schema versioned from day one
-  (`"schema": 1`), containing command, exit class, ref moves, conflict list (file +
-  hunk counts + stopped-at commit), drift diffstat, and sandbox id. **There is no
+- **`--json`: BUILT** (#50, post-v0.1.0). One machine-readable report document — schema
+  versioned from day one (`"schema": 1`), containing command, exit class, ref moves,
+  conflict list (file + hunk counts + stopped-at commit), drift diffstat, and sandbox id.
+  Four things this list did not anticipate, all decided while building it: the document
+  lives in its own module with its own types (deriving `Serialize` on the analysis structs
+  would let a private rename rewrite a published schema); **failures are documents too**,
+  on every exit path, or a caller parses English anyway; git's own stdout is moved to
+  stderr, because `Auto-merging …` on stdout breaks the one-document rule; and `--json`
+  never prompts, so `decision` records which unattended answer was given. Every command
+  takes it, not just rehearsals. **There is no
   separate "apply token"**; an earlier draft listed one and never said what it was. The
   sandbox id already names a rehearsal, and the refs-moved race check reads the
   pre-state out of `meta.json` itself. Handing the caller a fingerprint to pass back to
