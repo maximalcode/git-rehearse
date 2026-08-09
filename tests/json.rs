@@ -221,6 +221,32 @@ fn even_a_refusal_from_the_parser_itself_is_a_document() {
 }
 
 #[test]
+fn a_refused_apply_tells_the_caller_where_the_rehearsal_went() {
+    // A program cannot go looking in a cache directory. If the refusal keeps
+    // the sandbox, the document is the only place that fact can reach it.
+    let fixture = Fixture::new();
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+
+    let (code, out, err) = fixture.rehearse(&["--json", "--apply", "rebase", "main"]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    let json = document(&out);
+    assert_eq!(json["kind"], "refused");
+    let message = json["message"].as_str().expect("a message");
+    assert!(message.contains("kept as"), "{message}");
+    assert!(message.contains("git rehearse continue"), "{message}");
+
+    // And it really is there, under the id the message names.
+    let (code, out, _) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, CLEAN);
+    let listed = document(&out);
+    let id = listed["rehearsals"][0]["id"].as_str().expect("an id");
+    assert_eq!(listed["rehearsals"][0]["status"], "kept");
+    assert!(message.contains(id), "{message}");
+}
+
+#[test]
 fn a_command_git_refuses_carries_gits_own_exit_code() {
     let fixture = Fixture::new();
 
