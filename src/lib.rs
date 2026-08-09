@@ -22,6 +22,7 @@ pub mod json;
 pub mod preflight;
 pub mod report;
 pub mod sandbox;
+pub mod undo;
 
 pub use error::{Error, Result};
 

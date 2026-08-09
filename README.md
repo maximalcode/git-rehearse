@@ -107,11 +107,45 @@ applied:
   refs/heads/feature 74f61021291212257c19698105c43987491a29d6
   worktree reset to feature
 where everything was is written down in /home/ada/report/.git/rehearse-undo
+take it back with `git rehearse undo`
 ```
 
 Applying **transplants the refs** — it moves your branches onto the exact
 commits you just inspected. It never re-runs the command, so there is no second
 chance for it to come out differently.
+
+### Taking it back
+
+```console
+$ git rehearse undo
+put back:
+  refs/heads/feature 1f9ebbb0c2f4a1d90bb6dd7e7b1a58e6b4a1c0d3
+  worktree reset to feature
+from the apply of rehearsal 1786178829-00 at 1786178954 (unix time).
+The record is used up — one apply is undoable at a time.
+```
+
+Undo is the apply run backwards, out of a record written **before** the apply
+moved anything — so it survives a crash, and it works after the rehearsal
+itself has been discarded or pruned. It is one transaction, and it refuses
+outright unless every ref is still exactly where that apply left it: a commit
+made since is work an undo would throw away, and this tool does not throw work
+away to be convenient.
+
+Three properties worth knowing before you rely on it:
+
+- **One level deep.** There is one record per repository, so applying again
+  overwrites it and a successful undo uses it up. `git rehearse undo <id>`
+  refuses if the record is not the apply you meant — which is the only warning
+  you can get, since a second `undo` has nothing left to work from.
+- **Nothing is destroyed by an apply**, which is why this can exist at all. The
+  commits it moved away from are unreferenced, not deleted, and your reflog
+  keeps them for weeks. The rehearsed commits are kept too, under
+  `refs/rehearse/<id>/*`, so undoing does not orphan them.
+- **The record is a file you can use yourself.** Every line in
+  `.git/rehearse-undo` is a complete `git update-ref` argument list — paste one
+  after `git update-ref` and that ref goes back, with git refusing if it has
+  moved on since.
 
 ### When it conflicts
 
@@ -195,11 +229,14 @@ git rehearse list                 kept rehearsals for this repository
 git rehearse show [<id>]          print a rehearsal's report again
 git rehearse continue [<id>]      carry on a stopped one, once it is resolved
 git rehearse apply [<id>]         transplant a rehearsal into the real repo
+git rehearse undo [<id>]          put the refs back where the last apply found them
 git rehearse discard [<id>|--all] throw one, or all, away
 ```
 
 `<id>` can be any unambiguous prefix. Leave it out and the most recent
-rehearsal is meant.
+rehearsal is meant. `undo` is the exception: it takes an id only to insist
+which apply you mean, because there is one undo record per repository and it
+always describes the most recent one.
 
 | option | |
 |---|---|
@@ -372,6 +409,11 @@ submodules · one using Git LFS · one with multiple worktrees · one with no
 commits yet · and, at apply time, a repository whose refs have moved since the
 rehearsal.
 
+`undo` refuses on the same principle: no record to undo, a record from a
+different apply than the one you named, a ref that has moved since that apply,
+a worktree with uncommitted changes it would have to rewind, and a branch that
+undoing would delete while you are standing on it.
+
 ## Where things live
 
 Sandboxes go in your cache directory — `~/Library/Caches/git-rehearse` on
@@ -412,9 +454,9 @@ Two ideas carry the whole design:
 
 | | |
 |---|---|
-| **v1** | Human CLI: `rebase` / `merge` / `cherry-pick` rehearsal, before/after graph, conflict + content-drift report, apply/discard/keep |
+| **v1** | Human CLI: `rebase` / `merge` / `cherry-pick` rehearsal, before/after graph, conflict + content-drift report, apply/undo/discard/keep |
 | **v2** | Agent mode, so AI coding agents rehearse history-rewriting commands *before* touching your worktree. `--json` and the stable exit codes are **done**; whether it also gets an MCP server is [undecided](https://github.com/maximalcode/git-rehearse/issues/37) |
-| **v3** | Surfaces: resolve-in-sandbox polish, `undo`, visual graph panel |
+| **v3** | Surfaces: resolve-in-sandbox polish, dirty-worktree snapshots, visual graph panel |
 
 Details, non-goals and honest risks: [SCOPE.md](SCOPE.md).
 

@@ -183,6 +183,33 @@ fn a_kept_rehearsal_can_be_listed_shown_and_applied_later() {
 }
 
 #[test]
+fn undo_puts_the_last_apply_back_and_then_has_nothing_left_to_do() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let before = fixture.git(&["rev-parse", "main"]);
+
+    let (code, _, err) = fixture.rehearse(&["--apply", "merge", "--no-edit", "feature"]);
+    assert_eq!(code, CLEAN, "{err}");
+    assert_ne!(fixture.git(&["rev-parse", "main"]), before);
+
+    let (code, out, err) = fixture.rehearse(&["undo"]);
+
+    assert_eq!(code, CLEAN, "{err}");
+    assert!(out.contains("put back:"), "{out}");
+    assert!(out.contains("refs/heads/main"), "{out}");
+    assert!(
+        out.contains("from the apply of rehearsal"),
+        "an undo with no prompt has to say which apply it took back: {out}"
+    );
+    assert_eq!(fixture.git(&["rev-parse", "main"]), before);
+
+    // Consumed, so the second one is a clean nothing rather than a repeat.
+    let (code, _, err) = fixture.rehearse(&["undo"]);
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(err.contains("nothing to undo"), "{err}");
+}
+
+#[test]
 fn discard_all_empties_the_cache_for_this_repository() {
     let fixture = Fixture::new();
     fixture.commit_file("other.txt", "other\n", "four");
@@ -208,6 +235,7 @@ fn help_and_version_work_and_say_what_the_exit_codes_mean() {
         "{help}"
     );
     assert!(help.contains("4 refused"), "{help}");
+    assert!(help.contains("git rehearse undo"), "{help}");
     // The two things about the exit codes that surprise people: 0 does not
     // mean "applied", and a pipe answers the question for you.
     assert!(

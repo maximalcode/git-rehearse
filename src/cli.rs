@@ -27,6 +27,7 @@ use crate::report::Choice;
 use crate::sandbox::{DEFAULT_TTL_SECS, Sandbox, Status};
 use crate::{
     Error, Result, analyze, apply, cache, execute, git, json, now_unix, preflight, report, sandbox,
+    undo,
 };
 
 /// Whether the run talks to a person or to a program.
@@ -72,6 +73,7 @@ usage:
   git rehearse show [<id>]
   git rehearse continue [<id>]
   git rehearse apply [<id>]
+  git rehearse undo [<id>]
   git rehearse discard [<id>|--all]
 
 options (before the command; everything after it belongs to git):
@@ -96,6 +98,11 @@ part-way is kept, because its sandbox is the only copy of where it got to and
 
 --json prints one document and nothing else, on every exit path including
 failures. It never prompts, for the same reason: there is nobody there.
+
+undo puts the refs back where the last apply found them, in one transaction and
+only if every one of them is still where that apply left it. One apply is
+undoable at a time: applying again overwrites the record, and a successful undo
+uses it up. Give it an id to insist on which apply you mean.
 ";
 
 /// Said when the question is skipped because there is nobody to answer it.
@@ -153,6 +160,14 @@ pub enum Command {
     },
     /// Apply a rehearsal.
     Apply {
+        id: Option<String>,
+    },
+    /// Put the refs back where the last apply found them.
+    ///
+    /// The id is optional and, unlike everywhere else, does not select
+    /// anything: there is one undo record per repository, so it is only a way
+    /// of insisting which apply is meant. See [`crate::undo`].
+    Undo {
         id: Option<String>,
     },
     /// Throw one — or all — away.
@@ -250,6 +265,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 });
             }
             "apply" => parsed!(Command::Apply { id: id_from(rest) }),
+            "undo" => parsed!(Command::Undo { id: id_from(rest) }),
             "discard" => {
                 let arguments: Vec<&String> = rest.collect();
                 let all = arguments.iter().any(|arg| *arg == "--all");
@@ -351,6 +367,7 @@ pub fn run<W: Write>(parsed: Parsed, cwd: &Path, output: &mut W) -> Result<u8> {
         Command::Show { id } => show(id.as_deref(), format, cwd, output),
         Command::Continue { id, decision } => resume(id.as_deref(), decision, format, cwd, output),
         Command::Apply { id } => apply_kept(id.as_deref(), format, cwd, output),
+        Command::Undo { id } => undo_apply(id.as_deref(), format, cwd, output),
         Command::Discard { id, all } => discard(id.as_deref(), all, format, cwd, output),
     }
 }
@@ -718,7 +735,8 @@ fn report_applied<W: Write>(applied: &apply::Applied, output: &mut W) -> Result<
     }
     writeln!(
         output,
-        "where everything was is written down in {}",
+        "where everything was is written down in {}\n\
+         take it back with `git rehearse undo`",
         applied.undo.display()
     )
     .map_err(Error::Spawn)?;
@@ -839,6 +857,56 @@ fn apply_kept<W: Write>(
     Ok(exit::CLEAN)
 }
 
+/// Puts the refs back where the last apply found them.
+///
+/// Reads its way out of the repository rather than out of the cache: the undo
+/// record lives in the real repository's git dir, so this works after the
+/// rehearsal it undoes has been discarded, pruned, or applied on a machine
+/// whose cache has since been wiped. That is the point of writing the record
+/// down instead of keeping the sandbox.
+fn undo_apply<W: Write>(
+    id: Option<&str>,
+    format: Format,
+    cwd: &Path,
+    output: &mut W,
+) -> Result<u8> {
+    let repo = repo_root(cwd)?;
+    let undone = undo::run(&repo, id)?;
+    if format == Format::Json {
+        let document = json::UndoResult::new(repo.display().to_string(), &undone, exit::CLEAN);
+        write_json(&document, output)?;
+    } else {
+        report_undone(&undone, output)?;
+    }
+    Ok(exit::CLEAN)
+}
+
+fn report_undone<W: Write>(undone: &undo::Undone, output: &mut W) -> Result<()> {
+    writeln!(output, "put back:").map_err(Error::Spawn)?;
+    for restored in &undone.restored {
+        writeln!(
+            output,
+            "  {} {}",
+            restored.name,
+            restored.after.as_deref().unwrap_or("deleted")
+        )
+        .map_err(Error::Spawn)?;
+    }
+    if let Some(branch) = &undone.reset {
+        writeln!(output, "  worktree reset to {branch}").map_err(Error::Spawn)?;
+    }
+    // Which apply this was, said afterwards rather than asked about
+    // beforehand: there is no prompt here, so the only way somebody finds out
+    // they undid a different apply than they meant is if the run says which.
+    writeln!(
+        output,
+        "from the apply of rehearsal {} at {} (unix time).\n\
+         The record is used up — one apply is undoable at a time.",
+        undone.rehearsal, undone.applied_at_unix
+    )
+    .map_err(Error::Spawn)
+}
+
 /// Throws rehearsals away.
 fn discard<W: Write>(
     id: Option<&str>,
@@ -880,12 +948,12 @@ fn find(id: Option<&str>, cwd: &Path) -> Result<Sandbox> {
     sandbox::find(&cache::root()?, &repo_id(cwd)?, id)
 }
 
-/// The cache directory name for the repository `cwd` is in.
+/// The worktree root of the repository `cwd` is in, canonicalised.
 ///
-/// Deliberately not a full preflight: `list` and `discard` have to work in a
-/// repository preflight would refuse to rehearse — that is often exactly when
-/// somebody wants to clean up.
-fn repo_id(cwd: &Path) -> Result<String> {
+/// Deliberately not a full preflight: `list`, `discard` and `undo` have to work
+/// in a repository preflight would refuse to rehearse — a dirty worktree is
+/// often exactly when somebody wants to clean up, or to take an apply back.
+fn repo_root(cwd: &Path) -> Result<PathBuf> {
     let top = git::run(cwd, ["rev-parse", "--show-toplevel"]).map_err(|_| {
         Error::Refused(format!(
             "not a git repository: {}\n\
@@ -893,7 +961,12 @@ fn repo_id(cwd: &Path) -> Result<String> {
             cwd.display()
         ))
     })?;
-    Ok(cache::repo_id(&git::canonicalize(&PathBuf::from(top))?))
+    git::canonicalize(&PathBuf::from(top))
+}
+
+/// The cache directory name for that repository.
+fn repo_id(cwd: &Path) -> Result<String> {
+    Ok(cache::repo_id(&repo_root(cwd)?))
 }
 
 #[cfg(test)]
@@ -1016,6 +1089,24 @@ mod tests {
     }
 
     #[test]
+    fn undo_takes_an_id_that_insists_rather_than_selects() {
+        // Shaped like every other management command, because a user should
+        // not have to remember which ids look one another up. What it does with
+        // the id is undo's business: there is one record per repository, so it
+        // is checked against that record rather than used to find one.
+        assert_eq!(
+            parse(&args(&["undo"])).expect("parses"),
+            Command::Undo { id: None }
+        );
+        assert_eq!(
+            parse(&args(&["undo", "1786248000-00"])).expect("parses"),
+            Command::Undo {
+                id: Some("1786248000-00".to_owned())
+            }
+        );
+    }
+
+    #[test]
     fn continue_takes_an_optional_id_and_honours_the_decision_flags() {
         assert_eq!(
             parse(&args(&["continue"])).expect("parses"),
@@ -1097,6 +1188,7 @@ mod tests {
         assert_eq!(format(&["--json", "list"]), Format::Json);
         assert_eq!(format(&["--json", "show"]), Format::Json);
         assert_eq!(format(&["--json", "apply"]), Format::Json);
+        assert_eq!(format(&["--json", "undo"]), Format::Json);
         assert_eq!(format(&["--json", "discard", "--all"]), Format::Json);
         assert_eq!(format(&["--json", "continue"]), Format::Json);
     }

@@ -14,23 +14,23 @@
 //! 1. Check the repository is still the one that was rehearsed.
 //! 2. Fetch the sandbox's objects, which changes no ref the user can see.
 //! 3. Write the undo record — *before* moving anything, so a crash mid-apply
-//!    still leaves the way back written down.
+//!    still leaves the way back written down. It records both sides of every
+//!    move, because `git rehearse undo` needs the values this transaction is
+//!    about to write in order to state them back as expected old values; see
+//!    [`crate::undo`], which owns the format.
 //! 4. One `update-ref` transaction, with every expected old value stated, so
 //!    git itself refuses the whole batch if anything moved underneath us.
 //! 5. Only then touch the worktree.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::analyze::{RefMove, ref_moves};
 use crate::preflight::HEAD_KEY;
 use crate::sandbox::{Checkout, Sandbox};
+use crate::undo::{self, Record};
 use crate::{Error, Result, git};
-
-/// Where the undo record is written, inside the real repository's git dir.
-pub const UNDO_FILE: &str = "rehearse-undo";
 
 /// What an apply did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +86,7 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
     let anchor = format!("refs/rehearse/{}/", meta.id);
     fetch_objects(repo, &worktree, &anchor)?;
 
-    let undo = write_undo(repo, meta.id.as_str(), &meta.pre_state, now_unix)?;
+    let undo = undo::write(repo, &Record::of_apply(meta.id.clone(), now_unix, &moved))?;
 
     transplant(repo, &moved, &meta.id)?;
 
@@ -218,33 +218,6 @@ fn fetch_objects(repo: &Path, worktree: &Path, anchor: &str) -> Result<()> {
         ],
     )?;
     Ok(())
-}
-
-/// Writes down where every ref was, before anything moves.
-fn write_undo(
-    repo: &Path,
-    id: &str,
-    pre_state: &BTreeMap<String, String>,
-    now_unix: u64,
-) -> Result<PathBuf> {
-    let git_dir = PathBuf::from(git::run(repo, ["rev-parse", "--absolute-git-dir"])?);
-    let path = git_dir.join(UNDO_FILE);
-
-    let mut record = String::new();
-    let _ = writeln!(record, "# git-rehearse undo record");
-    let _ = writeln!(
-        record,
-        "# rehearsal {id}, applied at {now_unix} (unix time)"
-    );
-    let _ = writeln!(
-        record,
-        "# restore a ref with: git update-ref <ref> <commit>"
-    );
-    for (name, sha) in pre_state {
-        let _ = writeln!(record, "{sha} {name}");
-    }
-    fs::write(&path, record).map_err(Error::io(&path))?;
-    Ok(path)
 }
 
 /// The transplant itself: one transaction, all or nothing.

@@ -30,7 +30,7 @@ Three releases, one arc:
    autonomously and people are visibly afraid of that; no tool occupies this. The CLI in
    v1 exists partly to prove the mechanics and partly because the author will use it —
    but the growth story is agents.
-3. **v3.x — surfaces.** Conflict-resolution flow polish, `undo`, dirty-worktree
+3. **v3.x — surfaces.** Conflict-resolution flow polish, dirty-worktree
    snapshots, and (optionally) a visual before/after graph panel inside
    [git-city](https://github.com/maximalcode/git-city), which already renders repos and
    ships a git client.
@@ -126,7 +126,8 @@ Step details a builder needs:
   someone committed meanwhile), then a single `git update-ref --stdin` transaction. If
   the checked-out branch was rewritten: verify worktree is still clean, then
   `git reset --hard` to the new tip. Write the pre-state SHAs to
-  `.git/rehearse-undo` and print them (manual recovery in v1; `undo` command in v1.x).
+  `.git/rehearse-undo` and print them. Recovery by hand still works — that is what the
+  file's format is for — and `git rehearse undo` does it for you (v1.x item 1).
 
 ## v1.0 — exact scope
 
@@ -186,7 +187,8 @@ checked-out branch, ref race on apply, dirty-tree refusal, evil-merge drift dete
 - Dirty-worktree snapshotting (v1.x)
 - Conflict resolution *inside* the sandbox + resume (v1.x — the resume half,
   `git rehearse continue`, shipped after v0.1.0; see v1.x item 3)
-- `undo` command (v1.x — pre-state file + printed SHAs cover recovery meanwhile)
+- `undo` command (v1.x — built after v1.1.0, see v1.x item 1; the pre-state file and the
+  printed SHAs covered recovery meanwhile)
 - JSON output, MCP, any agent affordance beyond `--todo` and exit codes (v2)
 - Any GUI (v3)
 - `push`/`pull` rehearsal — push mutates remote state and cannot be truly rehearsed;
@@ -198,7 +200,21 @@ interactive rebase to a real repo with zero surprises.
 
 ## v1.x — quality-of-life (order by annoyance, ship as patch releases)
 
-1. `git rehearse undo` — restore pre-state refs from the undo file, same race checks.
+1. **`git rehearse undo`: BUILT** (#58, post-v1.1.0). The pre-state refs go back in one
+   `update-ref` transaction, with the same race checks apply makes, pointed the other way.
+   Four things this line did not anticipate, all decided while building it. The record had
+   to grow the **post-apply** values: apply's guarantee comes from stating every expected
+   old value, so git itself refuses the batch if anything moved, and the pre-state alone
+   gives undo nothing to state — an unconditional restore would silently clobber whatever
+   was committed after the apply. (Re-deriving those values from the sandbox was the
+   alternative and is worse: the sandbox is prunable and usually gone.) It gained a
+   **version marker**, which `meta.json` has had since the first commit and this file never
+   did. It is **one level deep** and now says so — a fixed filename cannot hold a history,
+   so a second apply overwrites the record and a successful undo *consumes* it, which is
+   what makes the second `undo` a clean "there is nothing to undo" rather than an unsafe
+   repeat of the first. And `HEAD` is deliberately **not** in the file: every other line in
+   it is a complete `git update-ref` argument list, and `git update-ref HEAD …` would
+   detach the HEAD of the person who used the file exactly as it invites.
 2. Dirty worktree: snapshot via `git stash create` (no stash-list pollution), replicate
    into sandbox, unstash on apply.
 3. Resolve-in-sandbox. **`git rehearse continue` is built** (post-v0.1.0, issue #38): the

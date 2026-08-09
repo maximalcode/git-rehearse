@@ -34,6 +34,7 @@ use crate::apply::Applied;
 use crate::execute::Outcome;
 use crate::report::Choice;
 use crate::sandbox::{Meta, Sandbox, Status};
+use crate::undo::Undone;
 
 /// Version of the document below.
 ///
@@ -235,6 +236,46 @@ pub struct ApplyResult {
     pub repository: String,
     pub exit_code: u8,
     pub applied: AppliedReport,
+}
+
+/// `git rehearse --json undo`.
+///
+/// A new document rather than a new field on [`ApplyResult`], and adding one
+/// does not move [`SCHEMA`]: no caller can be broken by a document type that
+/// only a command they have never called produces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UndoResult {
+    pub schema: u32,
+    pub repository: String,
+    /// The rehearsal whose apply was taken back.
+    pub rehearsal: String,
+    /// When that apply happened, seconds since the Unix epoch. There is one
+    /// record per repository, so this is how a caller tells whether the apply
+    /// it undid is the one it made.
+    pub applied_at_unix: u64,
+    /// The refs that were put back, stated in the direction the undo moved
+    /// them: `before` is where the apply had left them.
+    pub restored: Vec<Ref>,
+    /// The branch whose worktree was reset, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_reset: Option<String>,
+    pub exit_code: u8,
+}
+
+impl UndoResult {
+    /// The document for an undo that has already happened.
+    #[must_use]
+    pub fn new(repository: String, undone: &Undone, exit_code: u8) -> Self {
+        Self {
+            schema: SCHEMA,
+            repository,
+            rehearsal: undone.rehearsal.clone(),
+            applied_at_unix: undone.applied_at_unix,
+            restored: undone.restored.iter().map(reference).collect(),
+            worktree_reset: undone.reset.clone(),
+            exit_code,
+        }
+    }
 }
 
 /// `git rehearse --json discard`.
