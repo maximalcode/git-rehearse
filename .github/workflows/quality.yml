@@ -2,6 +2,16 @@ name: quality
 
 on: [push, pull_request]
 
+# Read-only for every job, including the reusable one below: a called workflow
+# inherits the caller's token, and this ceiling is deliberate. maxi-quality's
+# quality.yml declares no permissions of its own and needs none beyond reading
+# the tree — it checks out, downloads pinned tools, and renders Semgrep findings
+# through `::error` workflow commands rather than the Checks API. SARIF upload is
+# explicitly out of scope there, so `security-events: write` is not wanted either.
+# If a future version does need more, widen it here per-job, not at the top.
+permissions:
+  contents: read
+
 jobs:
   quality:
     uses: maximalcode/maxi-quality/.github/workflows/quality.yml@v1
@@ -12,7 +22,13 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
+      # persist-credentials: false — nothing here talks to this repo over the
+      # network after checkout, so leaving the token in .git/config for the rest
+      # of the job only widens what a compromised build script could reach.
+      # cargo-deny fetches the RustSec advisory database anonymously.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Pinned Rust toolchain
         run: |
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
@@ -52,6 +68,8 @@ jobs:
         os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Pinned Rust toolchain
         run: |
           rustup toolchain install 1.97.1 --profile minimal
