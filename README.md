@@ -121,34 +121,60 @@ chance for it to come out differently.
 ### When it conflicts
 
 ```console
-$ git rehearse rebase main
-CONFLICT (content): Merge conflict in config.yml
-error: could not apply 9bcbf9f... raise the row limit
+$ git rehearse --keep rebase main
+CONFLICT (content): Merge conflict in config.toml
+error: could not apply 1f9ebbb... raise the timeout to 90
 
 rehearsed  git rebase main
-rehearsal  1786178811-00
+rehearsal  1786276260-00
 
 the command stopped part-way on a conflict
 
 refs
-  HEAD  9bcbf9fe -> 7665595d
+  HEAD  1f9ebbbc -> 350ba0a4
 
-conflicts  stopped at 9bcbf9fe "raise the row limit"
-  config.yml  1 hunk
+conflicts  stopped at 1f9ebbbc "raise the timeout to 90"
+  config.toml  1 hunk
+
+to work on it:
+  cd ~/Library/Caches/git-rehearse/app-b0db48dc0bcbea3e/1786276260-00/sandbox
+  # resolve the conflict, then `git add` the files
+  git rehearse continue 1786276260-00
 ```
 
 Exit code 2. Your repository is untouched — no conflict markers in your
-worktree, no half-finished rebase to abort. The sandbox is still there if you
-want to open it and see how bad the conflict really is.
+worktree, no half-finished rebase to abort. The conflict is a real one, in a
+real repository, and it is waiting for you somewhere harmless.
+
+Resolve it there however you like, then carry on:
+
+```console
+$ git rehearse continue 1786276260-00
+```
+
+`continue` runs `git rebase --continue` in the sandbox, re-reads what happened
+and prints the report again. Repeat as often as the rebase stops. It refuses,
+rather than letting git complain, if anything is still unmerged:
+
+```console
+$ git rehearse continue
+git-rehearse: 1 path(s) are still unmerged in the sandbox:
+  config.toml
+Resolve them and `git add` them there, then continue.
+```
+
+Because applying transplants the sandbox's commits rather than re-running the
+command, **the resolution you did in the sandbox is the resolution you get.**
+You never resolve the same conflict twice.
 
 ### The warning this tool exists for
 
-A conflict you resolve by hand can silently change what a commit *does*. Here
-one commit set a timeout to 90, another to 60, and the resolution said 45 —
-a value neither commit ever had:
+A conflict you resolve by hand can silently change what a commit *does*. Above,
+one commit set the timeout to 90 and the other to 60. Resolve it to 45 — a
+value neither commit ever had — and `continue` says so:
 
 ```console
-$ git rehearse show 1786178840-00
+$ git rehearse continue 1786276260-00
 
 warning: content drift on refs/heads/feature
   replaying a commit should not change what it does. These did change:
@@ -156,6 +182,10 @@ warning: content drift on refs/heads/feature
   A conflict resolution, a merge driver or a dropped commit did this.
     M config.toml
 ```
+
+That is not a complaint about the conflict — it is the report noticing that the
+commit no longer does what it used to. Sometimes that is exactly what you meant.
+The point is that you find out before it is in your repository, not after.
 
 This is judged with `git range-diff`, commit by commit — not by diffing the two
 trees. A tree diff calls every ordinary rebase "drift" and is therefore useless.
@@ -168,6 +198,7 @@ git rehearse [options] -- <any git command>
 
 git rehearse list                 kept rehearsals for this repository
 git rehearse show [<id>]          print a rehearsal's report again
+git rehearse continue [<id>]      carry on a stopped one, once it is resolved
 git rehearse apply [<id>]         transplant a rehearsal into the real repo
 git rehearse discard [<id>|--all] throw one, or all, away
 ```
@@ -182,6 +213,10 @@ rehearsal is meant.
 | `--todo <file>` | drive an interactive rebase from a prepared todo |
 | `-h`, `--help` | usage |
 | `-V`, `--version` | version |
+
+`--apply` and `--keep` work with `continue` too — it ends on the same question
+a rehearsal does, so `git rehearse --keep continue <id>` is how you script a
+resolve-and-carry-on loop.
 
 **Our options come before the command; everything after it belongs to git.**
 So `git rehearse --apply rebase -i main` is ours, and

@@ -6,6 +6,7 @@
 
 mod support;
 
+use git_rehearse::sandbox;
 use support::Fixture;
 
 /// 0 clean, 1 internal, 2 stopped, 3 failed, 4 refused.
@@ -240,4 +241,100 @@ fn a_rehearsal_never_touches_the_real_repository_before_the_decision() {
         "no conflict markers in the real worktree"
     );
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_stopped_rehearsal_is_resolved_in_the_sandbox_and_continued() {
+    let fixture = Fixture::new();
+    // main and feature both changed file.txt, so the rebase stops.
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+    let before = fixture.refs();
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "rebase", "main"]);
+    assert_eq!(code, STOPPED, "{err}");
+
+    // The report has to say where the conflict is and what to type next.
+    // Naming the unmerged files without saying where they are is half a tool.
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept rehearsal is there");
+    let worktree = sandbox.worktree();
+    assert!(
+        out.contains(&worktree.display().to_string()),
+        "the report must say where the sandbox is: {out}"
+    );
+    assert!(out.contains("git rehearse continue"), "{out}");
+
+    // Resolve it exactly as a person would: edit the file, stage it.
+    std::fs::write(worktree.join("file.txt"), "resolved\n").expect("resolve");
+    fixture.git_in(&worktree, &["add", "file.txt"]);
+
+    let (code, cont, err) = fixture.rehearse(&["--keep", "continue", &id]);
+
+    assert_eq!(code, CLEAN, "{err}\n{cont}");
+    assert_eq!(
+        fixture.refs(),
+        before,
+        "continuing must not touch the real repository — only apply does that"
+    );
+
+    // And what gets applied is what was resolved, because apply transplants
+    // the sandbox's commits rather than replaying the command.
+    let (code, applied, err) = fixture.rehearse(&["apply", &id]);
+    assert_eq!(code, CLEAN, "{err}\n{applied}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("file.txt")).expect("worktree"),
+        "resolved\n"
+    );
+    assert_eq!(
+        fixture.git(&["log", "-1", "--format=%s", "feature"]),
+        "three"
+    );
+}
+
+#[test]
+fn continuing_with_a_conflict_still_unresolved_is_refused_and_names_the_files() {
+    let fixture = Fixture::new();
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+    let (_, out, _) = fixture.rehearse(&["--keep", "rebase", "main"]);
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+
+    // Nothing resolved, nothing staged.
+    let (code, _, err) = fixture.rehearse(&["continue", &id]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(err.contains("still unmerged"), "{err}");
+    assert!(
+        err.contains("file.txt"),
+        "naming the file beats git's generic advice: {err}"
+    );
+}
+
+#[test]
+fn continuing_something_that_is_not_stopped_is_refused() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let (_, out, _) = fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+
+    let (code, _, err) = fixture.rehearse(&["continue", &id]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(err.contains("nothing in progress"), "{err}");
 }
