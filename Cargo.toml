@@ -1,6 +1,6 @@
 [package]
 name = "git-rehearse"
-version = "0.1.0-dev"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Rehearse dangerous git commands in a shadow clone of your real repo — see exactly what would happen, then apply or discard."
@@ -9,6 +9,17 @@ license = "MIT"
 readme = "README.md"
 
 [dependencies]
+# meta.json is the only record of a rehearsal's pre-state, and apply refuses
+# unless it can verify that record — so its reader has to be exact, not a
+# hand-rolled parser. Two crates, both permissive, both already audited by
+# every Rust supply-chain tool we run.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Integration tests build real git repositories and a throwaway cache root;
+# tempfile cleans both up even when a test panics mid-way.
+tempfile = "3"
 
 # maxi-quality — Rust lint baseline (clippy + rustc lints), issue #58.
 #
