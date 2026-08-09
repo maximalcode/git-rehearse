@@ -4,6 +4,11 @@
 //! > range, rewritten checked-out branch, ref race on apply, dirty-tree
 //! > refusal, evil-merge drift detection
 //!
+//! Eight of the nine still say what they said. The eighth changed shape with
+//! #59: a dirty tree is no longer refused, it is carried, so the scenario
+//! covers the whole of that instead — which is the same repository shape being
+//! answered better rather than a scenario dropped.
+//!
 //! Each one runs the whole pipeline — preflight, sandbox, execute, analyse,
 //! apply — against a repository built by running real git, because the point
 //! is to find out what git actually does with these shapes rather than what
@@ -17,9 +22,10 @@
 mod support;
 
 use git_rehearse::analyze::Analysis;
+use git_rehearse::carry::Replay;
 use git_rehearse::execute::Outcome;
 use git_rehearse::sandbox::{Plan, Sandbox};
-use git_rehearse::{Error, analyze, apply, execute, preflight, report, sandbox};
+use git_rehearse::{Error, analyze, apply, carry, execute, preflight, report, sandbox};
 use support::Fixture;
 
 const NOW: u64 = 1_786_248_000;
@@ -36,8 +42,12 @@ fn rehearse(fixture: &Fixture, command: &[&str]) -> Rehearsal {
     let plan = preflight::run(fixture.repo())
         .expect("the fixture passes preflight")
         .into_plan(command.iter().map(|arg| (*arg).to_owned()).collect());
-    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
+    let mut sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
     let outcome = execute::run(&sandbox.worktree(), &plan.command, None).expect("the command runs");
+    // The whole pipeline, which since #59 includes putting any carried
+    // uncommitted work back — in the sandbox, before anybody is asked
+    // anything.
+    let outcome = carry::after_command(&mut sandbox, outcome).expect("the replay runs");
     let analysis = analyze::run(
         &sandbox.worktree(),
         &plan.pre_state,
@@ -190,8 +200,12 @@ fn octopus_merge() {
     );
     // The graph renderer is git's, so a three-parent commit has to come out
     // right without any help from us.
-    let graphs =
-        report::graphs(&rehearsal.sandbox.worktree(), &rehearsal.analysis).expect("graphs render");
+    let graphs = report::graphs(
+        &rehearsal.sandbox.worktree(),
+        &rehearsal.analysis,
+        report::Detail::Full,
+    )
+    .expect("graphs render");
     let text = report::render(
         rehearsal.sandbox.meta(),
         &rehearsal.analysis,
@@ -287,21 +301,60 @@ fn ref_race_on_apply() {
     assert_eq!(fixture.refs(), before, "and nothing moved");
 }
 
-// 8 -------------------------------------------------------- dirty-tree refusal
+// 8 --------------------------------------------------------- dirty tree carried
 
 #[test]
-fn dirty_tree_refusal() {
+fn dirty_tree_carried_through_and_put_back() {
     let fixture = Fixture::new();
-    fixture.write("file.txt", "half-finished work\n");
-
-    let error = preflight::run(fixture.repo()).expect_err("refused");
-
-    assert!(matches!(error, Error::Refused(_)), "{error:?}");
-    assert!(error.to_string().contains("file.txt"), "{error}");
-    // Untracked files, on the other hand, are not in anybody's way.
-    fixture.git(&["checkout", "--", "file.txt"]);
+    // main moves on; the feature branch has half-finished work in it.
+    fixture.commit_file("other.txt", "other\n", "unrelated work");
+    fixture.git(&["checkout", "feature"]);
+    fixture.write("file.txt", "three\nhalf-finished work\n");
     fixture.write("scratch.txt", "notes\n");
-    preflight::run(fixture.repo()).expect("untracked files do not block a rehearsal");
+
+    let rehearsal = rehearse(&fixture, &["rebase", "main"]);
+
+    assert_eq!(rehearsal.outcome, Outcome::Clean);
+    let carry = rehearsal
+        .sandbox
+        .meta()
+        .carry
+        .as_ref()
+        .expect("the uncommitted work was carried");
+    assert_eq!(
+        carry.paths,
+        ["file.txt"],
+        "tracked changes only — scratch.txt is untracked and stays out"
+    );
+    assert!(
+        matches!(carry.replay, Some(Replay::Restored { result: Some(_) })),
+        "{:?}",
+        carry.replay
+    );
+    // The command itself ran against a clean tree: the rehearsed commit is the
+    // committed history, with none of the work in progress baked into it.
+    assert_eq!(
+        fixture.git_in(&rehearsal.sandbox.worktree(), &["show", "feature:file.txt"]),
+        "three"
+    );
+
+    apply::run(&rehearsal.sandbox, NOW).expect("apply succeeds");
+
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("file.txt")).expect("worktree"),
+        "three\nhalf-finished work\n",
+        "the work in progress is back, on top of the rebased history"
+    );
+    assert_eq!(
+        fixture.git(&["status", "--porcelain", "--untracked-files=no"]),
+        " M file.txt",
+        "and it is uncommitted, exactly as it was"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("scratch.txt")).expect("untracked file"),
+        "notes\n",
+        "untracked files are neither carried nor disturbed"
+    );
 }
 
 // 9 -------------------------------------------------- evil-merge drift detection

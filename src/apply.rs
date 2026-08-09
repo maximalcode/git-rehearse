@@ -14,23 +14,29 @@
 //! 1. Check the repository is still the one that was rehearsed.
 //! 2. Fetch the sandbox's objects, which changes no ref the user can see.
 //! 3. Write the undo record — *before* moving anything, so a crash mid-apply
-//!    still leaves the way back written down.
+//!    still leaves the way back written down. It records both sides of every
+//!    move, because `git rehearse undo` needs the values this transaction is
+//!    about to write in order to state them back as expected old values; see
+//!    [`crate::undo`], which owns the format.
 //! 4. One `update-ref` transaction, with every expected old value stated, so
 //!    git itself refuses the whole batch if anything moved underneath us.
 //! 5. Only then touch the worktree.
+//!
+//! Uncommitted work carried through the rehearsal is transplanted the same
+//! way and for the same reason: [`crate::carry::restore`] checks out the tree
+//! the sandbox produced rather than merging the user's changes here for the
+//! first time. Principle 2 covers the worktree, not only the refs.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::analyze::{RefMove, ref_moves};
+use crate::carry::Carry;
 use crate::preflight::HEAD_KEY;
 use crate::sandbox::{Checkout, Sandbox};
-use crate::{Error, Result, git};
-
-/// Where the undo record is written, inside the real repository's git dir.
-pub const UNDO_FILE: &str = "rehearse-undo";
+use crate::undo::{self, Record};
+use crate::{Error, Result, carry, git};
 
 /// What an apply did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +46,9 @@ pub struct Applied {
     /// The branch whose worktree was reset, if the rewritten branch was the
     /// one checked out.
     pub reset: Option<String>,
+    /// The uncommitted paths that were put back on top of the reset worktree,
+    /// if this rehearsal carried any and there was anything left to put back.
+    pub carried: Option<Vec<String>>,
     /// Where the pre-state was written down.
     pub undo: PathBuf,
     /// The namespace the rehearsed commits were fetched into, kept as an
@@ -77,16 +86,21 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
     check_checkout(repo, &meta.checkout)?;
     check_unchanged(&meta.pre_state, &now, &meta.id)?;
     let reset = branch_to_reset(&meta.checkout, &moved);
-    if reset.is_some() {
-        check_clean(repo)?;
-    }
+    // Only the reset path cares about the worktree at all: if the checked-out
+    // branch was not rewritten, nothing below touches a single file, and what
+    // is in the worktree is no more this apply's business than the weather.
+    let carried = if reset.is_some() {
+        check_worktree(repo, meta.carry.as_ref(), &meta.id)?
+    } else {
+        None
+    };
 
     // Objects first: this adds nothing a user can see and leaves the
     // repository unchanged if it fails.
     let anchor = format!("refs/rehearse/{}/", meta.id);
-    fetch_objects(repo, &worktree, &anchor)?;
+    fetch_objects(repo, &worktree, &anchor, &meta.id, carried.is_some())?;
 
-    let undo = write_undo(repo, meta.id.as_str(), &meta.pre_state, now_unix)?;
+    let undo = undo::write(repo, &Record::of_apply(meta.id.clone(), now_unix, &moved))?;
 
     transplant(repo, &moved, &meta.id)?;
 
@@ -95,6 +109,9 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         // while the index and worktree still hold the old one. Resetting to
         // HEAD — not to a commit id — because HEAD is already right.
         git::run(repo, ["reset", "--hard", "--quiet"])?;
+        if let Some(carried) = &carried {
+            carry::restore(repo, carried.result)?;
+        }
     }
 
     Ok(Applied {
@@ -102,7 +119,46 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         reset,
         undo,
         anchor,
+        carried: carried.map(|carried| carried.paths.to_vec()),
     })
+}
+
+/// The uncommitted work this apply has to put back over the reset worktree.
+struct Carried<'a> {
+    /// The commit the sandbox produced by replaying it — the tree that gets
+    /// checked out, never merged. See [`crate::carry`].
+    result: &'a str,
+    /// The paths it restores, for the report.
+    paths: &'a [String],
+}
+
+/// Decides what may happen to the worktree, and refuses if the answer is
+/// nothing good.
+///
+/// Two rules, and they are the same rule seen from two sides. A rehearsal that
+/// promised nothing about this worktree needs it clean, because
+/// `git reset --hard` would destroy whatever is there and it was never in the
+/// report. A rehearsal that promised to put work back needs the worktree to
+/// still hold *exactly* that work, for the same reason: what the report
+/// promised was rehearsed, and anything edited since was not.
+///
+/// "Promised" rather than "carried": a rehearsal whose replay conflicted, or
+/// never ran because nothing was going to move this worktree, carried the work
+/// but made no claim about putting it back — so it falls under the first rule.
+fn check_worktree<'a>(
+    repo: &Path,
+    carry: Option<&'a Carry>,
+    id: &str,
+) -> Result<Option<Carried<'a>>> {
+    let Some(carry) = carry.filter(|carry| carry.promises_the_worktree()) else {
+        check_clean(repo, carry.is_some())?;
+        return Ok(None);
+    };
+    carry::check_unchanged(repo, carry, id)?;
+    Ok(carry::result_of(carry).map(|result| Carried {
+        result,
+        paths: &carry.paths,
+    }))
 }
 
 /// A repository's branches and `HEAD`, in the same shape as the pre-state, so
@@ -183,19 +239,32 @@ fn branch_to_reset(checkout: &Checkout, moved: &[RefMove]) -> Option<String> {
 }
 
 /// Refuses to reset a worktree that has work in it.
-fn check_clean(repo: &Path) -> Result<()> {
-    // Same rule as preflight: tracked changes only, because `git reset --hard`
-    // discards those and leaves untracked files alone.
+///
+/// Only for a rehearsal that carried nothing — which means the worktree was
+/// clean when it was rehearsed, so anything in it now appeared afterwards and
+/// was never in the report. Carried work goes through
+/// [`carry::check_unchanged`] instead.
+fn check_clean(repo: &Path, carried: bool) -> Result<()> {
+    // Tracked changes only, because `git reset --hard` discards those and
+    // leaves untracked files alone.
     let status = git::run(repo, ["status", "--porcelain", "--untracked-files=no"])?;
     if status.is_empty() {
         return Ok(());
     }
-    Err(Error::Refused(
+    // Two ways to arrive here and they need different advice, because one of
+    // them has a rehearsal sitting there that could still be finished.
+    let why = if carried {
+        "The rehearsal carried them, but they never went back on in the sandbox, so nothing \
+         in the report accounts for them — carry it on with `git rehearse continue`, or \
+         commit or stash them."
+    } else {
+        "They were not there when you rehearsed, so nothing in the report accounts for them — \
+         commit or stash them, or rehearse again from here."
+    };
+    Err(Error::Refused(format!(
         "applying this rehearsal rewrites the branch you have checked out, and your worktree \
-         has uncommitted changes that `git reset --hard` would destroy.\n\
-         Commit or stash them first."
-            .to_owned(),
-    ))
+         has uncommitted changes that `git reset --hard` would destroy.\n{why}"
+    )))
 }
 
 /// Copies the rehearsed objects into the real repository.
@@ -205,46 +274,28 @@ fn check_clean(repo: &Path) -> Result<()> {
 /// commits that are about to become the user's history. The namespace also
 /// leaves a trail — after an apply, `git log refs/rehearse/<id>/<branch>` is
 /// still the rehearsed result even if the branch moves on.
-fn fetch_objects(repo: &Path, worktree: &Path, anchor: &str) -> Result<()> {
-    let refspec = format!("+refs/heads/*:{anchor}*");
-    git::run(
-        repo,
-        [
-            std::ffi::OsString::from("fetch"),
-            std::ffi::OsString::from("--no-tags"),
-            std::ffi::OsString::from("--quiet"),
-            worktree.as_os_str().to_os_string(),
-            std::ffi::OsString::from(refspec),
-        ],
-    )?;
-    Ok(())
-}
-
-/// Writes down where every ref was, before anything moves.
-fn write_undo(
+fn fetch_objects(
     repo: &Path,
+    worktree: &Path,
+    anchor: &str,
     id: &str,
-    pre_state: &BTreeMap<String, String>,
-    now_unix: u64,
-) -> Result<PathBuf> {
-    let git_dir = PathBuf::from(git::run(repo, ["rev-parse", "--absolute-git-dir"])?);
-    let path = git_dir.join(UNDO_FILE);
-
-    let mut record = String::new();
-    let _ = writeln!(record, "# git-rehearse undo record");
-    let _ = writeln!(
-        record,
-        "# rehearsal {id}, applied at {now_unix} (unix time)"
-    );
-    let _ = writeln!(
-        record,
-        "# restore a ref with: git update-ref <ref> <commit>"
-    );
-    for (name, sha) in pre_state {
-        let _ = writeln!(record, "{sha} {name}");
+    carried: bool,
+) -> Result<()> {
+    let mut args = vec![
+        std::ffi::OsString::from("fetch"),
+        std::ffi::OsString::from("--no-tags"),
+        std::ffi::OsString::from("--quiet"),
+        worktree.as_os_str().to_os_string(),
+        std::ffi::OsString::from(format!("+refs/heads/*:{anchor}*")),
+    ];
+    // The replayed worktree comes with them, anchored the same way: it is a
+    // commit the report described and apply is about to check out, so it must
+    // not be collectable in between.
+    if carried {
+        args.push(std::ffi::OsString::from(carry::result_refspec(id)));
     }
-    fs::write(&path, record).map_err(Error::io(&path))?;
-    Ok(path)
+    git::run(repo, args)?;
+    Ok(())
 }
 
 /// The transplant itself: one transaction, all or nothing.

@@ -19,14 +19,15 @@ use std::path::{Path, PathBuf};
 
 use super::meta::{META_SCHEMA, Meta};
 use super::{HOOKS_DIR, Plan, Sandbox, WORKTREE_DIR};
-use crate::{Error, Result, cache, git};
+use crate::{Error, Result, cache, carry, git};
 
 /// Builds a sandbox for `plan` under `cache_root`.
 ///
 /// The steps, in order: claim a directory, clone with `--local`, promote every
 /// branch to a local branch, strip the remote, point hooks at nothing, check
-/// out, write `meta.json`. If any step fails the directory is removed again —
-/// a half-built sandbox that still has a remote is worse than no sandbox.
+/// out, park any carried uncommitted work, write `meta.json`. If any step
+/// fails the directory is removed again — a half-built sandbox that still has
+/// a remote is worse than no sandbox.
 ///
 /// `now_unix` is passed in rather than read so the whole lifecycle is testable
 /// without waiting seven days for a prune.
@@ -93,6 +94,13 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
     disable_hooks(&worktree, &hooks)?;
     carry_config(&plan.repo, &worktree)?;
     checkout(&worktree, &plan.checkout)?;
+    // After the hooks are disabled, because this step runs git in the sandbox
+    // and a rehearsal fires none of the user's hooks — and after the checkout,
+    // because the sandbox worktree stays *clean* for the rehearsed command.
+    // The snapshot is parked as an object, not applied. See [`crate::carry`].
+    if let Some(carried) = &plan.carry {
+        carry::park(&plan.repo, &worktree, carried)?;
+    }
 
     let meta = Meta {
         schema: META_SCHEMA,
@@ -102,6 +110,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
         command: plan.command.clone(),
         checkout: plan.checkout.clone(),
         pre_state: plan.pre_state.clone(),
+        carry: plan.carry.clone(),
         created_unix: now_unix,
         status: super::Status::Fresh,
         result: None,

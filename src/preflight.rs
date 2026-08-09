@@ -12,21 +12,23 @@
 //!    guess*. Every message here is product surface: it is read by someone
 //!    mid-rebase who wants to know what is in the way and what to do about it,
 //!    so it says both, in that order, and never more than that.
+//!
+//! A dirty worktree used to be one of those refusals and is now part of the
+//! snapshot instead: the uncommitted changes are captured here and carried
+//! through the rehearsal by [`crate::carry`], which owns everything about
+//! them. Untracked files stay out, exactly as they were out of the refusal.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::carry::Carry;
 use crate::sandbox::{Checkout, Plan};
-use crate::{Error, Result, git};
+use crate::{Error, Result, carry, git};
 
 /// The key the pre-state records `HEAD`'s commit under, alongside the full
 /// `refs/heads/*` names.
 pub const HEAD_KEY: &str = "HEAD";
-
-/// How many changed paths a refusal names before it says "and N more".
-const PATHS_IN_MESSAGE: usize = 3;
 
 /// A repository that passed preflight, and what was true of it at that moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,8 @@ pub struct Preflight {
     pub checkout: Checkout,
     /// Every `refs/heads/*` plus [`HEAD_KEY`], as `name -> sha`.
     pub pre_state: BTreeMap<String, String>,
+    /// The uncommitted work to carry through the rehearsal, if there is any.
+    pub carry: Option<Carry>,
 }
 
 impl Preflight {
@@ -48,6 +52,7 @@ impl Preflight {
             command,
             checkout: self.checkout,
             pre_state: self.pre_state,
+            carry: self.carry,
         }
     }
 }
@@ -72,12 +77,15 @@ pub fn run(cwd: &Path) -> Result<Preflight> {
     refuse_if_lfs(&repo)?;
 
     let (checkout, head_sha) = head(&repo)?;
-    refuse_if_dirty(&repo)?;
+    // Not a refusal any more, and deliberately last: a structural problem is
+    // worth reporting before anything is written into the object store.
+    let carry = carry::snapshot(&repo)?;
 
     Ok(Preflight {
         repo: repo.clone(),
         checkout,
         pre_state: snapshot(&repo, head_sha)?,
+        carry,
     })
 }
 
@@ -193,40 +201,6 @@ fn refuse_if_lfs(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-fn refuse_if_dirty(repo: &Path) -> Result<()> {
-    // Untracked files are deliberately not a refusal: `git rebase` itself runs
-    // happily with untracked files present, and principle 5 refuses where git
-    // refuses — being stricter than git is its own kind of surprise.
-    let status = git::run(repo, ["status", "--porcelain", "--untracked-files=no"])?;
-    if status.is_empty() {
-        return Ok(());
-    }
-    Err(refused(dirty_message(&status)))
-}
-
-/// Builds the dirty-worktree refusal from `git status --porcelain` output.
-fn dirty_message(status: &str) -> String {
-    let paths: Vec<&str> = status
-        .lines()
-        // "XY path" — the two status columns and their space are always ASCII.
-        .filter_map(|line| line.get(3..))
-        .collect();
-    let mut named = paths
-        .iter()
-        .take(PATHS_IN_MESSAGE)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if let Some(rest) = paths.len().checked_sub(PATHS_IN_MESSAGE).filter(|n| *n > 0) {
-        let _ = write!(named, " and {rest} more");
-    }
-    format!(
-        "you have uncommitted changes: {named}.\n\
-         v0.1 rehearses committed history only, so the rehearsal would not include them — \
-         commit or stash first. (Rehearsing a dirty worktree is planned for v1.x.)"
-    )
-}
-
 /// Where `HEAD` is, as something the sandbox can reproduce, plus its commit.
 fn head(repo: &Path) -> Result<(Checkout, String)> {
     let sha = match git::run(repo, ["rev-parse", "--verify", "--quiet", "HEAD"]) {
@@ -262,42 +236,4 @@ fn snapshot(repo: &Path, head_sha: String) -> Result<BTreeMap<String, String>> {
 
 fn refused(message: String) -> Error {
     Error::Refused(message)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::dirty_message;
-
-    #[test]
-    fn a_dirty_worktree_is_told_what_is_dirty() {
-        let message = dirty_message(" M src/main.rs\nM  Cargo.toml");
-        assert!(message.contains("src/main.rs"), "{message}");
-        assert!(message.contains("Cargo.toml"), "{message}");
-        assert!(message.contains("commit or stash"), "{message}");
-    }
-
-    #[test]
-    fn a_very_dirty_worktree_is_summarised_not_dumped() {
-        let status = (0..12)
-            .map(|n| format!(" M file{n}.rs"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let message = dirty_message(&status);
-        assert!(
-            message.contains("file0.rs, file1.rs, file2.rs"),
-            "{message}"
-        );
-        assert!(message.contains("and 9 more"), "{message}");
-        assert!(!message.contains("file11.rs"), "{message}");
-    }
-
-    #[test]
-    fn every_refusal_says_what_is_wrong_then_what_to_do() {
-        // The two-line shape is the contract the CLI prints against, and the
-        // reason these messages read as help rather than as an error dump.
-        let message = dirty_message(" M src/main.rs");
-        let (problem, remedy) = message.split_once('\n').expect("two lines");
-        assert!(problem.ends_with('.'), "{problem}");
-        assert!(!remedy.is_empty());
-    }
 }

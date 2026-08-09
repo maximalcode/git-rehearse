@@ -77,9 +77,11 @@ prevent.
    hooks disabled by default, lives under the user cache dir, auto-pruned.
 4. **Zero telemetry, zero network, zero spend.** The tool never phones
    anywhere; CI stays on the GitHub Actions free tier.
-5. **Refuse loudly rather than guess.** Dirty worktree → refuse. Refs moved
-   between rehearse and apply → refuse. Submodules/LFS/worktrees/shallow (v1)
-   → refuse with an explanation, exit code 4.
+5. **Refuse loudly rather than guess.** Refs moved between rehearse and apply
+   → refuse. Submodules/LFS/worktrees/shallow (v1) → refuse with an
+   explanation, exit code 4. (A dirty worktree was on this list until #59; it
+   is now carried through the rehearsal, and what gets refused is a worktree
+   that no longer holds what was carried. See SCOPE.md's v1.x item 2.)
 
 ## 6. Code conventions
 

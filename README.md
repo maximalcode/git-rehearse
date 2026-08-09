@@ -107,11 +107,45 @@ applied:
   refs/heads/feature 74f61021291212257c19698105c43987491a29d6
   worktree reset to feature
 where everything was is written down in /home/ada/report/.git/rehearse-undo
+take it back with `git rehearse undo`
 ```
 
 Applying **transplants the refs** — it moves your branches onto the exact
 commits you just inspected. It never re-runs the command, so there is no second
 chance for it to come out differently.
+
+### Taking it back
+
+```console
+$ git rehearse undo
+put back:
+  refs/heads/feature 1f9ebbb0c2f4a1d90bb6dd7e7b1a58e6b4a1c0d3
+  worktree reset to feature
+from the apply of rehearsal 1786178829-00 at 1786178954 (unix time).
+The record is used up — one apply is undoable at a time.
+```
+
+Undo is the apply run backwards, out of a record written **before** the apply
+moved anything — so it survives a crash, and it works after the rehearsal
+itself has been discarded or pruned. It is one transaction, and it refuses
+outright unless every ref is still exactly where that apply left it: a commit
+made since is work an undo would throw away, and this tool does not throw work
+away to be convenient.
+
+Three properties worth knowing before you rely on it:
+
+- **One level deep.** There is one record per repository, so applying again
+  overwrites it and a successful undo uses it up. `git rehearse undo <id>`
+  refuses if the record is not the apply you meant — which is the only warning
+  you can get, since a second `undo` has nothing left to work from.
+- **Nothing is destroyed by an apply**, which is why this can exist at all. The
+  commits it moved away from are unreferenced, not deleted, and your reflog
+  keeps them for weeks. The rehearsed commits are kept too, under
+  `refs/rehearse/<id>/*`, so undoing does not orphan them.
+- **The record is a file you can use yourself.** Every line in
+  `.git/rehearse-undo` is a complete `git update-ref` argument list — paste one
+  after `git update-ref` and that ref goes back, with git refusing if it has
+  moved on since.
 
 ### When it conflicts
 
@@ -162,6 +196,68 @@ Because applying transplants the sandbox's commits rather than re-running the
 command, **the resolution you did in the sandbox is the resolution you get.**
 You never resolve the same conflict twice.
 
+### With work in progress
+
+You do not have to commit or stash first. Uncommitted changes to tracked files
+are **carried through the rehearsal**: snapshotted with `git stash create`,
+which never touches your stash list, and then put back *in the sandbox* after
+the command has run — so the report answers the question you actually have,
+which is not "does my rebase work" but "does my rebase work **and do I get my
+uncommitted work back**".
+
+```console
+$ git rehearse --apply rebase main
+Rebasing (1/1)Successfully rebased and updated refs/heads/feature.
+
+rehearsed  git rebase main
+repository /home/ada/report
+rehearsal  1786294984-00
+
+refs
+  HEAD                bcd0638b -> bbc67ded
+  refs/heads/feature  bcd0638b -> bbc67ded
+
+carried  1 uncommitted path(s): limits.toml
+  they come back clean on the rehearsed history
+
+applied:
+  refs/heads/feature bbc67ded2e6083ff63196c4c898182fe2b1f2168
+  worktree reset to feature
+  1 uncommitted path(s) put back: limits.toml
+```
+
+The command itself still runs against a **clean** sandbox — `git rebase` refuses
+a dirty tree, and rehearsing something git would refuse to run is not a
+rehearsal. Applying then checks the tree the sandbox produced out over the reset
+worktree; it does not merge your changes in your own repository for the first
+time, because a first time is the failure this tool exists to prevent.
+
+When the changes do *not* go back on cleanly, that is a stopped rehearsal like
+any other — exit `2`, the sandbox kept, and the same resolve-there-and-`continue`
+loop as a conflicting rebase:
+
+```console
+$ git rehearse --keep rebase main
+the command ran, but your uncommitted changes did not go back on
+
+carried  1 uncommitted path(s): config.toml
+  they do NOT come back clean — 1 path(s) conflict in the sandbox:
+    config.toml
+```
+
+Four things worth knowing:
+
+- **Untracked files are left alone** — not carried, not touched. They are not in
+  a stash without `-u`, and git was never going to destroy them.
+- **Apply refuses if your worktree has changed since.** What the report promised
+  to put back was rehearsed; anything you typed afterwards was not.
+- **Everything comes back unstaged**, in your worktree, exactly where
+  `git stash pop` without `--index` would leave it. A transplanted tree does not
+  carry the staged/unstaged distinction.
+- **`undo` refuses while those changes are in the way**, because rewinding the
+  branch means `git reset --hard` and that would eat them. Stash them, undo,
+  put them back.
+
 ### The warning this tool exists for
 
 A conflict you resolve by hand can silently change what a commit *does*. Above,
@@ -195,17 +291,21 @@ git rehearse list                 kept rehearsals for this repository
 git rehearse show [<id>]          print a rehearsal's report again
 git rehearse continue [<id>]      carry on a stopped one, once it is resolved
 git rehearse apply [<id>]         transplant a rehearsal into the real repo
+git rehearse undo [<id>]          put the refs back where the last apply found them
 git rehearse discard [<id>|--all] throw one, or all, away
 ```
 
 `<id>` can be any unambiguous prefix. Leave it out and the most recent
-rehearsal is meant.
+rehearsal is meant. `undo` is the exception: it takes an id only to insist
+which apply you mean, because there is one undo record per repository and it
+always describes the most recent one.
 
 | option | |
 |---|---|
 | `--apply` | apply without asking |
 | `--keep` | keep without asking |
 | `--json` | one JSON document on stdout instead of the report |
+| `--stat-only` | the report without the before/after graphs |
 | `--todo <file>` | drive an interactive rebase from a prepared todo |
 | `-h`, `--help` | usage |
 | `-V`, `--version` | version |
@@ -213,6 +313,20 @@ rehearsal is meant.
 `--apply` and `--keep` work with `continue` too — it ends on the same question
 a rehearsal does, so `git rehearse --keep continue <id>` is how you script a
 resolve-and-carry-on loop.
+
+`--stat-only` leaves out the before/after graphs, which are two
+`git log --graph` walks per moved ref and the slowest part of printing a
+report. Everything that says *what happened* stays — ref moves, carried work,
+conflicts, content drift — and only the drawing of *where you were* goes. It
+works on `show` and `continue` as well as on a fresh rehearsal; re-reading a
+kept report is exactly when you already know the shape of the history.
+
+**It changes what is drawn, never what is checked.** Drift detection runs
+either way: it is the check that justifies this tool, the drift lines are part
+of the short report, and a fast mode that switched off the safety check would
+be a trap rather than a flag. With `--json` the flag does nothing at all — that
+document never carried the graphs — and saying so beats refusing a harmless
+combination.
 
 **Our options come before the command; everything after it belongs to git.**
 So `git rehearse --apply rebase -i main` is ours, and
@@ -230,7 +344,7 @@ Stable from v0.1 on — v2's agent mode reads them.
 | `1` | an internal error in git-rehearse |
 | `2` | the rehearsed command stopped part-way, usually a conflict |
 | `3` | the rehearsed command failed in the sandbox |
-| `4` | refused: dirty worktree, refs moved since the rehearsal, unsupported repository |
+| `4` | refused: refs or worktree moved since the rehearsal, unsupported repository |
 
 Two things worth knowing before you script this:
 
@@ -355,22 +469,32 @@ exit 2
 is **uncommitted** work — the committed history it appears to destroy is
 reachable through the reflog for weeks, but unstaged edits are gone for good.
 
-git-rehearse refuses a dirty worktree. So on exactly the input where
-`reset --hard` is dangerous, there is nothing to rehearse; and where rehearsing
-works, the command was not very dangerous. Routing it through here would
-therefore *block* it rather than rehearse it, which is a different product. If
-you want that, block it directly — do not let a rehearsal step imply a safety
-net it is not providing.
+git-rehearse *carries* your uncommitted work through a rehearsal and puts it
+back, which is exactly why `reset --hard` does not belong here: rehearsing it
+would preserve the very thing the command exists to destroy, so the rehearsal
+would answer a kinder question than the one you asked. The report says so out
+loud — nothing about it is silent — but an intercept that quietly turns a
+destructive command into a safe one is a different product from a rehearsal. If
+you want that, block it directly; do not let a rehearsal step imply a safety net
+it is not providing.
 
 ## What it refuses
 
 Principle 5 is *refuse loudly rather than guess*. All of these exit `4` with an
 explanation rather than doing something approximate:
 
-a dirty worktree · a bare repository · a shallow clone · a repository with
-submodules · one using Git LFS · one with multiple worktrees · one with no
-commits yet · and, at apply time, a repository whose refs have moved since the
-rehearsal.
+a bare repository · a shallow clone · a repository with submodules · one using
+Git LFS · one with multiple worktrees · one with no commits yet · and, at apply
+time, a repository whose refs have moved since the rehearsal, or whose worktree
+no longer holds the uncommitted changes the rehearsal carried.
+
+A dirty worktree used to head that list. It is now carried through the
+rehearsal instead — the principle did not change, only the thing being refused.
+
+`undo` refuses on the same principle: no record to undo, a record from a
+different apply than the one you named, a ref that has moved since that apply,
+a worktree with uncommitted changes it would have to rewind, and a branch that
+undoing would delete while you are standing on it.
 
 ## Where things live
 
@@ -412,9 +536,9 @@ Two ideas carry the whole design:
 
 | | |
 |---|---|
-| **v1** | Human CLI: `rebase` / `merge` / `cherry-pick` rehearsal, before/after graph, conflict + content-drift report, apply/discard/keep |
+| **v1** | Human CLI: `rebase` / `merge` / `cherry-pick` rehearsal, before/after graph, conflict + content-drift report, uncommitted work carried through, apply/undo/discard/keep |
 | **v2** | Agent mode, so AI coding agents rehearse history-rewriting commands *before* touching your worktree. `--json` and the stable exit codes are **done**; whether it also gets an MCP server is [undecided](https://github.com/maximalcode/git-rehearse/issues/37) |
-| **v3** | Surfaces: resolve-in-sandbox polish, `undo`, visual graph panel |
+| **v3** | Surfaces: resolve-in-sandbox polish, visual graph panel |
 
 Details, non-goals and honest risks: [SCOPE.md](SCOPE.md).
 

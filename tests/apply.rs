@@ -153,7 +153,12 @@ fn uncommitted_work_is_never_destroyed_by_an_apply() {
     let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
 
     assert!(message.contains("reset --hard"), "{message}");
-    assert!(message.contains("Commit or stash"), "{message}");
+    assert!(message.contains("commit or stash them"), "{message}");
+    assert!(
+        message.contains("not there when you rehearsed"),
+        "the rehearsal carried nothing, so this edit appeared afterwards and is nobody's \
+         business but the user's: {message}"
+    );
     assert_eq!(
         std::fs::read_to_string(fixture.repo().join("file.txt")).expect("real worktree"),
         "work in progress\n",
@@ -163,7 +168,10 @@ fn uncommitted_work_is_never_destroyed_by_an_apply() {
 }
 
 #[test]
-fn the_undo_record_is_written_and_actually_restores_the_repository() {
+fn the_undo_record_is_written_with_both_sides_of_every_move() {
+    // Both sides, because undo has to state the value it expects to replace or
+    // it cannot have the guarantee apply has — see `undo.rs`, which owns the
+    // format and proves the restore itself works.
     let fixture = Fixture::new();
     fixture.commit_file("other.txt", "other\n", "four");
     let before = fixture.git(&["rev-parse", "main"]);
@@ -172,20 +180,21 @@ fn the_undo_record_is_written_and_actually_restores_the_repository() {
     let applied = apply::run(&sandbox, NOW).expect("apply succeeds");
 
     let record = std::fs::read_to_string(&applied.undo).expect("the undo file exists");
+    let after = fixture.git(&["rev-parse", "main"]);
     assert!(
-        record.contains(&format!("{before} refs/heads/main")),
+        record.contains(&format!("refs/heads/main {before} {after}")),
         "{record}"
     );
     assert!(record.contains(sandbox.id()), "{record}");
+    assert!(record.contains("version 1"), "{record}");
     assert!(
         record.contains("git update-ref"),
         "the record should say how to use it: {record}"
     );
 
-    // The point of writing it down: it works.
-    assert_ne!(fixture.git(&["rev-parse", "main"]), before);
-    fixture.git(&["update-ref", "refs/heads/main", &before]);
-    assert_eq!(fixture.git(&["rev-parse", "main"]), before);
+    // Written before anything moved, so a crash between here and there still
+    // leaves the way back on disk.
+    assert_ne!(after, before);
 }
 
 #[test]

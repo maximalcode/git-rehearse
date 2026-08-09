@@ -33,7 +33,7 @@ fn a_real_merge_renders_a_report_with_a_before_and_after_graph() {
     let outcome = execute::run(&worktree, &plan.command, None).expect("git runs");
     let analysis = analyze::run(&worktree, &plan.pre_state, &plan.command, &outcome)
         .expect("the sandbox can be read");
-    let graphs = report::graphs(&worktree, &analysis).expect("graphs render");
+    let graphs = report::graphs(&worktree, &analysis, report::Detail::Full).expect("graphs render");
     let text = report::render(sandbox.meta(), &analysis, &outcome, &graphs);
 
     assert!(
@@ -71,7 +71,7 @@ fn the_graph_covers_the_affected_subgraph_and_not_the_whole_history() {
     let outcome = execute::run(&worktree, &plan.command, None).expect("git runs");
     let analysis = analyze::run(&worktree, &plan.pre_state, &plan.command, &outcome)
         .expect("the sandbox can be read");
-    let graphs = report::graphs(&worktree, &analysis).expect("graphs render");
+    let graphs = report::graphs(&worktree, &analysis, report::Detail::Full).expect("graphs render");
 
     let drawn = graphs
         .iter()
@@ -85,6 +85,36 @@ fn the_graph_covers_the_affected_subgraph_and_not_the_whole_history() {
         !graphs.iter().any(|graph| graph.reference == "HEAD"),
         "HEAD moves with its branch; drawing it twice says nothing new"
     );
+}
+
+#[test]
+fn stat_only_leaves_out_the_graphs_and_nothing_else_the_report_says() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let plan = plan_of(&fixture, &["merge", "--no-edit", "feature"]);
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox");
+    let worktree = sandbox.worktree();
+
+    let outcome = execute::run(&worktree, &plan.command, None).expect("git runs");
+    let analysis = analyze::run(&worktree, &plan.pre_state, &plan.command, &outcome)
+        .expect("the sandbox can be read");
+
+    let full = report::graphs(&worktree, &analysis, report::Detail::Full).expect("graphs render");
+    let short =
+        report::graphs(&worktree, &analysis, report::Detail::StatOnly).expect("nothing renders");
+
+    assert!(!full.is_empty(), "there is a graph to leave out");
+    assert!(short.is_empty(), "{short:?}");
+
+    let text = report::render(sandbox.meta(), &analysis, &outcome, &short);
+    assert!(!text.contains("graph  "), "{text}");
+    // The analysis behind the report is untouched, so everything it produced
+    // is still here — the ref moves the reader came for above all.
+    assert!(
+        text.contains("rehearsed  git merge --no-edit feature"),
+        "{text}"
+    );
+    assert!(text.contains("refs/heads/main"), "{text}");
 }
 
 #[test]
@@ -105,7 +135,7 @@ fn a_rebase_whose_resolution_changed_the_content_reports_the_warning() {
     let outcome = execute::Outcome::Clean;
     let analysis = analyze::run(&worktree, &plan.pre_state, &plan.command, &outcome)
         .expect("the sandbox can be read");
-    let graphs = report::graphs(&worktree, &analysis).expect("graphs render");
+    let graphs = report::graphs(&worktree, &analysis, report::Detail::Full).expect("graphs render");
     let text = report::render(sandbox.meta(), &analysis, &outcome, &graphs);
 
     assert!(

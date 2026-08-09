@@ -14,6 +14,7 @@
 pub mod analyze;
 pub mod apply;
 pub mod cache;
+pub mod carry;
 pub mod cli;
 pub mod error;
 pub mod execute;
@@ -22,6 +23,7 @@ pub mod json;
 pub mod preflight;
 pub mod report;
 pub mod sandbox;
+pub mod undo;
 
 pub use error::{Error, Result};
 

@@ -30,8 +30,8 @@ Three releases, one arc:
    autonomously and people are visibly afraid of that; no tool occupies this. The CLI in
    v1 exists partly to prove the mechanics and partly because the author will use it —
    but the growth story is agents.
-3. **v3.x — surfaces.** Conflict-resolution flow polish, `undo`, dirty-worktree
-   snapshots, and (optionally) a visual before/after graph panel inside
+3. **v3.x — surfaces.** Conflict-resolution flow polish and (optionally) a
+   visual before/after graph panel inside
    [git-city](https://github.com/maximalcode/git-city), which already renders repos and
    ships a git client.
 
@@ -84,7 +84,11 @@ git to pick it up as a subcommand anyway.
    The tool itself never phones anywhere; CI is GitHub Actions free tier.
 5. **Refuse loudly rather than guess.** Dirty worktree in v1.0 → refuse with a clear
    message (git itself refuses rebase on a dirty tree, so this matches expectations).
-   Refs moved between rehearse and apply → refuse (race detection, see below).
+   *Superseded by v1.x item 2 (#59): the changes are carried through the rehearsal
+   instead. The principle is intact and the refusals that replaced the flat one are
+   narrower and later — a worktree that no longer holds what was carried, and a replay
+   that will not go back on. Only the thing being refused moved.* Refs moved between
+   rehearse and apply → refuse (race detection, see below).
 
 ## Mechanics — how a rehearsal works
 
@@ -126,7 +130,8 @@ Step details a builder needs:
   someone committed meanwhile), then a single `git update-ref --stdin` transaction. If
   the checked-out branch was rewritten: verify worktree is still clean, then
   `git reset --hard` to the new tip. Write the pre-state SHAs to
-  `.git/rehearse-undo` and print them (manual recovery in v1; `undo` command in v1.x).
+  `.git/rehearse-undo` and print them. Recovery by hand still works — that is what the
+  file's format is for — and `git rehearse undo` does it for you (v1.x item 1).
 
 ## v1.0 — exact scope
 
@@ -183,10 +188,12 @@ clean rebase, conflicting rebase, `--onto`, octopus merge, cherry-pick range, re
 checked-out branch, ref race on apply, dirty-tree refusal, evil-merge drift detection.
 
 **Explicitly OUT of v1.0** (someone will be tempted; resist):
-- Dirty-worktree snapshotting (v1.x)
+- Dirty-worktree snapshotting (v1.x — built after v1.1.0, see v1.x item 2; a dirty
+  worktree was refused outright until then)
 - Conflict resolution *inside* the sandbox + resume (v1.x — the resume half,
   `git rehearse continue`, shipped after v0.1.0; see v1.x item 3)
-- `undo` command (v1.x — pre-state file + printed SHAs cover recovery meanwhile)
+- `undo` command (v1.x — built after v1.1.0, see v1.x item 1; the pre-state file and the
+  printed SHAs covered recovery meanwhile)
 - JSON output, MCP, any agent affordance beyond `--todo` and exit codes (v2)
 - Any GUI (v3)
 - `push`/`pull` rehearsal — push mutates remote state and cannot be truly rehearsed;
@@ -198,9 +205,46 @@ interactive rebase to a real repo with zero surprises.
 
 ## v1.x — quality-of-life (order by annoyance, ship as patch releases)
 
-1. `git rehearse undo` — restore pre-state refs from the undo file, same race checks.
-2. Dirty worktree: snapshot via `git stash create` (no stash-list pollution), replicate
-   into sandbox, unstash on apply.
+1. **`git rehearse undo`: BUILT** (#58, post-v1.1.0). The pre-state refs go back in one
+   `update-ref` transaction, with the same race checks apply makes, pointed the other way.
+   Four things this line did not anticipate, all decided while building it. The record had
+   to grow the **post-apply** values: apply's guarantee comes from stating every expected
+   old value, so git itself refuses the batch if anything moved, and the pre-state alone
+   gives undo nothing to state — an unconditional restore would silently clobber whatever
+   was committed after the apply. (Re-deriving those values from the sandbox was the
+   alternative and is worse: the sandbox is prunable and usually gone.) It gained a
+   **version marker**, which `meta.json` has had since the first commit and this file never
+   did. It is **one level deep** and now says so — a fixed filename cannot hold a history,
+   so a second apply overwrites the record and a successful undo *consumes* it, which is
+   what makes the second `undo` a clean "there is nothing to undo" rather than an unsafe
+   repeat of the first. And `HEAD` is deliberately **not** in the file: every other line in
+   it is a complete `git update-ref` argument list, and `git update-ref HEAD …` would
+   detach the HEAD of the person who used the file exactly as it invites.
+2. **Dirty worktree: BUILT** (#59, post-v1.1.0). Snapshot via `git stash create` (no
+   stash-list pollution), replicate into the sandbox, put back on apply. Untracked files
+   stay out, which is where the old refusal drew the line too. Five things this line did
+   not anticipate, all decided while building it. The **replay happens in the sandbox,
+   after the command** — the line above said "unstash on apply", which would have been a
+   merge run for the first time in the one place that must not have first times; instead
+   the sandbox replays the stash onto the rehearsed history, the report states whether it
+   came back clean, and apply *checks that result out* over the reset worktree. That is
+   principle 2 applied to the worktree rather than only to the refs, and it turns the
+   feature into an answer to the question people actually have: not "does my rebase work"
+   but "does my rebase work **and do I get my uncommitted work back**". The **transfer is
+   a push, not a fetch**: a local clone copies what is reachable and an unreferenced stash
+   commit is not, and `git fetch` will not ask for a bare object id unless the far side
+   sets `uploadpack.allowAnySHA1InWant`, while a push takes any SHA-1 expression and needs
+   no configuration anywhere (`--no-verify`, because a push runs the *source* repo's
+   `pre-push` hook and a rehearsal fires none of the user's hooks). A **conflicting replay
+   is a stopped rehearsal**, not a new state — same shape as a stopped rebase, so exit 2,
+   keep the sandbox, print where it is, resolve there and `continue`, which captures the
+   resolution rather than re-merging over it. **Apply verifies the worktree still holds
+   exactly what was carried**, by tree rather than by commit id (`stash create` stamps a
+   time and never repeats an id); anything edited since was never rehearsed and is refused
+   like a moved ref. And a rehearsal that **would not move your worktree** — another
+   branch, a detached HEAD, a command that walked the sandbox somewhere else — replays
+   nothing and says so, because replaying there would answer a question nobody asked.
+   `meta.json` went to schema 2 to hold the record.
 3. Resolve-in-sandbox. **`git rehearse continue` is built** (post-v0.1.0, issue #38): the
    conflict report prints the sandbox path and the exact command, you resolve there with
    whatever tools you already use, and `continue` runs the matching `--continue`,
@@ -209,7 +253,25 @@ interactive rebase to a real repo with zero surprises.
    Still unbuilt and now optional: the `[r]esolve` prompt that drops into `$SHELL` inside
    the sandbox, which printing the path makes largely redundant. (Resolutions carry over
    on apply automatically — principle 2 gives us this for free.)
-4. `--stat-only` fast mode; report paging; color config.
+4. **`--stat-only`: BUILT** (#60, post-v1.1.0). The report without the before/after
+   graphs — two `git log --graph --oneline --decorate --boundary` processes per moved
+   ref, plus a `git log -3` fallback whenever the bounded range comes back empty, which
+   is the slowest part of printing a report and the only part it removes. Three things
+   this line did not anticipate, all decided while building it. It skips **rendering and
+   not analysis**, which is the question the phrase "fast mode" hides: skipping
+   `range-diff` would be the larger win on a big rehearsal and it is a trap, because
+   drift detection is what catches a rebase quietly changing what a commit does, the
+   drift stat is *in* the short output so the analysis has to run to produce it anyway,
+   and `--stat-only --json` would otherwise emit a document with fields the schema has no
+   way to mark missing. The flag is called `stat-only`, not `unchecked`. It applies to
+   **`show` and `continue`**, not only to a fresh rehearsal — re-reading a kept report is
+   the case somebody wants the short form most, and `continue` ends on the same report a
+   rehearsal does, the same reason `--keep` reaches it. And with **`--json` it is a
+   no-op** rather than an error, said in `--help`: that document never carried the graphs,
+   so there is nothing to leave out, and refusing a harmless combination is noise in the
+   one place a program is reading. Enforced in a single guard inside `report::graphs`, so
+   no caller can spawn the walks by forgetting. Report paging and colour config are still
+   unbuilt.
 
 ## v2.0 — agent mode (the strategic release)
 
@@ -243,11 +305,16 @@ codes and `--todo` stable.
   rehearse. The README section for this *is* the marketing.
   **`reset --hard` was dropped from the intercept list on purpose**, and the boundary is
   documented rather than left to be discovered: what makes it dangerous is *uncommitted*
-  work — committed history it appears to destroy is reflog-reachable for weeks — and
-  preflight refuses a dirty worktree. So on exactly the input where `reset --hard` is
-  dangerous there is nothing to rehearse, and where rehearsing works the command was not
-  very dangerous. Routing it here would *block* it, which is
-  `destructive_command_guard`'s product, not ours.
+  work — committed history it appears to destroy is reflog-reachable for weeks. The
+  original reason was that preflight refused a dirty worktree, so on exactly the input
+  where `reset --hard` is dangerous there was nothing to rehearse. **#59 changed the
+  fact and not the conclusion.** A dirty worktree is now carried, and carrying it is
+  precisely what makes `reset --hard` the wrong thing to route here: the rehearsal would
+  *preserve* the uncommitted work the command exists to destroy, so it would answer a
+  kinder question than the one asked. The report says on its own line what it carried and
+  that it comes back, so nothing about that is silent — but an intercept that quietly
+  makes a destructive command non-destructive is a different product from a rehearsal,
+  and blocking it is `destructive_command_guard`'s product, not ours.
 - **Launch narrative:** "your agent can rehearse a rebase before it touches your repo" —
   aimed at the audience that gave destructive_command_guard 5.7k stars in seven months
   for *blocking* these commands. Rehearsal is the constructive version of blocking.
