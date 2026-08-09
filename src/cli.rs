@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use crate::execute::{Outcome, SEQUENCE_EDITOR_ARG, Todo};
 use crate::report::Choice;
-use crate::sandbox::{DEFAULT_TTL_SECS, Sandbox};
+use crate::sandbox::{DEFAULT_TTL_SECS, Sandbox, Status};
 use crate::{
     Error, Result, analyze, apply, cache, execute, git, now_unix, preflight, report, sandbox,
 };
@@ -53,6 +53,7 @@ usage:
   git rehearse [options] -- <any git command>
   git rehearse list
   git rehearse show [<id>]
+  git rehearse continue [<id>]
   git rehearse apply [<id>]
   git rehearse discard [<id>|--all]
 
@@ -103,6 +104,13 @@ pub enum Command {
     /// Print a rehearsal's report again.
     Show {
         id: Option<String>,
+    },
+    /// Carry on a rehearsal that stopped, once its conflicts are resolved.
+    Continue {
+        id: Option<String>,
+        /// What to do with the result — the same decision a rehearsal ends on,
+        /// because continuing one ends in exactly the same place.
+        decision: Decision,
     },
     /// Apply a rehearsal.
     Apply {
@@ -184,6 +192,12 @@ pub fn parse(args: &[String]) -> Result<Command> {
             }
             "list" => return Ok(Command::List),
             "show" => return Ok(Command::Show { id: id_from(rest) }),
+            "continue" => {
+                return Ok(Command::Continue {
+                    id: id_from(rest),
+                    decision,
+                });
+            }
             "apply" => return Ok(Command::Apply { id: id_from(rest) }),
             "discard" => {
                 let arguments: Vec<&String> = rest.collect();
@@ -251,6 +265,7 @@ pub fn run<W: Write>(command: Command, cwd: &Path, output: &mut W) -> Result<u8>
         } => rehearse(&command, todo, decision, cwd, output),
         Command::List => list(cwd, output),
         Command::Show { id } => show(id.as_deref(), cwd, output),
+        Command::Continue { id, decision } => resume(id.as_deref(), decision, cwd, output),
         Command::Apply { id } => apply_kept(id.as_deref(), cwd, output),
         Command::Discard { id, all } => discard(id.as_deref(), all, cwd, output),
     }
@@ -282,34 +297,109 @@ fn rehearse<W: Write>(
     let outcome = execute::run(&sandbox.worktree(), &plan.command, todo.as_ref())?;
     sandbox.record(&outcome)?;
 
-    let analysis = analyze::run(
-        &sandbox.worktree(),
-        &plan.pre_state,
-        &plan.command,
-        &outcome,
-    )?;
-    let graphs = report::graphs(&sandbox.worktree(), &analysis)?;
+    let code = code_for_outcome(&outcome);
+    report_and_decide(sandbox, &outcome, decision, output)?;
+    Ok(code)
+}
+
+/// Carries on a rehearsal that stopped, then reports on where it got to.
+///
+/// The resolution itself happens in the sandbox, by whatever means the user
+/// likes — an editor, a merge tool, a shell. This is the step that tells git
+/// the resolution is ready, which is what `git rebase --continue` means
+/// anywhere else. Principle 2 then gives the rest away for free: the
+/// resolution is baked into the sandbox's commits, and applying transplants
+/// those commits, so what gets applied is what was resolved.
+fn resume<W: Write>(
+    id: Option<&str>,
+    decision: Decision,
+    cwd: &Path,
+    output: &mut W,
+) -> Result<u8> {
+    let mut sandbox = find(id, cwd)?;
+    let outcome = execute::resume(&sandbox.worktree())?;
+    sandbox.record(&outcome)?;
+
+    let code = code_for_outcome(&outcome);
+    report_and_decide(sandbox, &outcome, decision, output)?;
+    Ok(code)
+}
+
+/// Reports on a finished rehearsal, asks what to do with it, and does that.
+///
+/// Shared by the two routes that arrive here: one has just run a command, the
+/// other has just carried one on. From this point they are the same rehearsal
+/// with the same decision to make, and the pre-state and command come out of
+/// `meta.json` either way — which is also what makes `continue` work in a
+/// later process than the rehearsal it continues.
+fn report_and_decide<W: Write>(
+    sandbox: Sandbox,
+    outcome: &Outcome,
+    decision: Decision,
+    output: &mut W,
+) -> Result<()> {
+    let worktree = sandbox.worktree();
+    let meta = sandbox.meta();
+    let analysis = analyze::run(&worktree, &meta.pre_state, &meta.command, outcome)?;
+    let graphs = report::graphs(&worktree, &analysis)?;
     // A blank line first: git has just finished writing its own output to the
     // same terminal.
     writeln!(output).map_err(Error::Spawn)?;
     write!(
         output,
         "{}",
-        report::render(sandbox.meta(), &analysis, &outcome, &graphs)
+        report::render(meta, &analysis, outcome, &graphs)
     )
     .map_err(Error::Spawn)?;
 
-    let can_apply = report::can_apply(&analysis, &outcome);
-    let choice = choose(decision, can_apply, output)?;
-    act(choice, sandbox, output)?;
+    if matches!(outcome, Outcome::Stopped { .. }) {
+        write_next_steps(&sandbox, &worktree, decision, output)?;
+    }
 
-    // The exit code describes the rehearsal, not what was done with it: a
-    // conflict is still a conflict whether or not the user kept the sandbox.
-    Ok(match outcome {
+    let can_apply = report::can_apply(&analysis, outcome);
+    let choice = choose(decision, can_apply, output)?;
+    act(choice, sandbox, output)
+}
+
+/// Says where the stopped rehearsal is and how to carry it on.
+///
+/// The report names the unmerged files, which is of no use without the one
+/// thing the report cannot know: where they are. Until this was printed, a
+/// rehearsal that stopped on a conflict — the case somebody reaches for this
+/// tool *for* — ended by describing a problem and pointing nowhere.
+fn write_next_steps<W: Write>(
+    sandbox: &Sandbox,
+    worktree: &Path,
+    decision: Decision,
+    output: &mut W,
+) -> Result<()> {
+    writeln!(output).map_err(Error::Spawn)?;
+    writeln!(output, "to work on it:").map_err(Error::Spawn)?;
+    // A fresh rehearsal is discarded at the end of this run unless it is kept,
+    // and the sandbox goes with it — so saying "cd there" without saying that
+    // first would be sending the user to a directory about to be deleted.
+    //
+    // Only when there is still a question to answer, though: with --keep
+    // already given, or on a rehearsal that is kept already, telling somebody
+    // to answer a prompt they will never see is worse than saying nothing.
+    if sandbox.meta().status == Status::Fresh && decision == Decision::Ask {
+        writeln!(output, "  answer [k]eep below, then").map_err(Error::Spawn)?;
+    }
+    writeln!(output, "  cd {}", worktree.display()).map_err(Error::Spawn)?;
+    writeln!(output, "  # resolve the conflict, then `git add` the files").map_err(Error::Spawn)?;
+    writeln!(output, "  git rehearse continue {}", sandbox.id()).map_err(Error::Spawn)
+}
+
+/// The exit code that describes an outcome.
+///
+/// The code describes the rehearsal, not what was done with it: a conflict is
+/// still a conflict whether or not the user kept the sandbox.
+fn code_for_outcome(outcome: &Outcome) -> u8 {
+    match outcome {
         Outcome::Clean => exit::CLEAN,
         Outcome::Stopped { .. } => exit::STOPPED,
         Outcome::Failed { .. } => exit::FAILED,
-    })
+    }
 }
 
 /// Asks, or decides without asking.
@@ -608,6 +698,35 @@ mod tests {
             Command::Discard {
                 id: Some("1786".to_owned()),
                 all: false
+            }
+        );
+    }
+
+    #[test]
+    fn continue_takes_an_optional_id_and_honours_the_decision_flags() {
+        assert_eq!(
+            parse(&args(&["continue"])).expect("parses"),
+            Command::Continue {
+                id: None,
+                decision: Decision::Ask
+            }
+        );
+        // The flags have to reach `continue`: carrying a rehearsal on ends in
+        // exactly the same apply/keep/discard question a rehearsal ends on, so
+        // a scripted continue that ignored --keep would silently discard the
+        // work it had just advanced.
+        assert_eq!(
+            parse(&args(&["--keep", "continue", "1786"])).expect("parses"),
+            Command::Continue {
+                id: Some("1786".to_owned()),
+                decision: Decision::Keep
+            }
+        );
+        assert_eq!(
+            parse(&args(&["--apply", "continue"])).expect("parses"),
+            Command::Continue {
+                id: None,
+                decision: Decision::Apply
             }
         );
     }

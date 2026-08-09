@@ -197,6 +197,12 @@ impl Fixture {
             .current_dir(&self.repo)
             .args(args)
             .env("GIT_REHEARSE_CACHE_DIR", &self.cache)
+            // `git rebase --continue` opens an editor on the commit message it
+            // proposes, which is right for a person and fatal for a test. This
+            // is the same thing `run_git` does with `core.editor=true`, done
+            // through the environment because the binary under test spawns git
+            // itself and must not have its config rewritten from out here.
+            .env("GIT_EDITOR", "true")
             .stdin(std::process::Stdio::null())
             .output()
             .expect("git-rehearse runs");

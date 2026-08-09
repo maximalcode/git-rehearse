@@ -156,13 +156,143 @@ pub fn write_todo(todo: &Path, target: &Path) -> Result<()> {
     fs::write(target, contents).map_err(Error::io(target))
 }
 
+/// An operation git has left half-finished in a sandbox.
+///
+/// Named separately from the rehearsed command because the two are not the
+/// same question. `git rehearse rebase main` and `git rehearse -- rebase main`
+/// leave identical state, a `--` rehearsal may have no first word worth
+/// trusting, and a rebase that stopped is a rebase regardless of how it was
+/// spelled. So this is read off the sequencer's own files — the same ones
+/// `git status` reads — rather than inferred from what the user typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    Rebase,
+    CherryPick,
+    Revert,
+    Merge,
+    /// A bisect in progress. Listed because it *is* an operation in progress,
+    /// and left un-resumable on purpose: `git bisect` has no `--continue`, and
+    /// inventing one out of `git bisect good|bad` would be guessing at an
+    /// answer only the user has.
+    Bisect,
+}
+
+impl Operation {
+    /// The git subcommand that carries this operation on.
+    fn subcommand(self) -> Option<&'static str> {
+        match self {
+            Self::Rebase => Some("rebase"),
+            Self::CherryPick => Some("cherry-pick"),
+            Self::Revert => Some("revert"),
+            Self::Merge => Some("merge"),
+            Self::Bisect => None,
+        }
+    }
+}
+
+/// What git left half-finished in the sandbox, if anything.
+///
+/// Rebase is checked first because it is the one that overlaps: while a rebase
+/// replays commits it may also leave `CHERRY_PICK_HEAD` behind, and answering
+/// "cherry-pick" for a stopped rebase would send `git cherry-pick --continue`
+/// at a sequencer that wanted `git rebase --continue`.
+///
+/// # Errors
+///
+/// [`Error::Git`] if the sandbox's git directory cannot be located.
+pub fn in_progress(worktree: &Path) -> Result<Option<Operation>> {
+    let git_dir = PathBuf::from(git::run(worktree, ["rev-parse", "--absolute-git-dir"])?);
+    let exists = |marker: &str| git_dir.join(marker).exists();
+
+    Ok(if exists("rebase-merge") || exists("rebase-apply") {
+        Some(Operation::Rebase)
+    } else if exists("CHERRY_PICK_HEAD") {
+        Some(Operation::CherryPick)
+    } else if exists("REVERT_HEAD") {
+        Some(Operation::Revert)
+    } else if exists("MERGE_HEAD") {
+        Some(Operation::Merge)
+    } else if exists("BISECT_LOG") {
+        Some(Operation::Bisect)
+    } else {
+        None
+    })
+}
+
+/// Every path git still considers unmerged in the sandbox.
+///
+/// # Errors
+///
+/// [`Error::Git`] if the index cannot be read.
+pub fn unmerged(worktree: &Path) -> Result<Vec<String>> {
+    let listing = git::run(worktree, ["diff", "--name-only", "--diff-filter=U", "-z"])?;
+    Ok(listing
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Carries on the operation the sandbox stopped in the middle of.
+///
+/// Runs `git <operation> --continue` through the same terminal and editor as
+/// the original command, for the same reason [`run`] does: the commit message
+/// git proposes for a resolved conflict is the user's to approve, and
+/// capturing or suppressing that would be this crate deciding something it has
+/// no business deciding.
+///
+/// Nothing here resolves anything. The resolution happens in the sandbox, by
+/// whatever means the user likes, and this is the step that tells git the
+/// resolution is ready — which is exactly what `git rebase --continue` means
+/// in a repository that is not a sandbox.
+///
+/// # Errors
+///
+/// [`Error::Refused`] if there is nothing to continue, if paths are still
+/// unmerged, or for a bisect, which cannot be continued mechanically.
+/// [`Error::Spawn`] if git cannot be started.
+pub fn resume(worktree: &Path) -> Result<Outcome> {
+    let Some(operation) = in_progress(worktree)? else {
+        return Err(Error::Refused(
+            "this rehearsal has nothing in progress — there is nothing to continue.\n\
+             `git rehearse show` prints the report again; `apply` transplants it."
+                .to_owned(),
+        ));
+    };
+    let Some(subcommand) = operation.subcommand() else {
+        return Err(Error::Refused(
+            "this rehearsal stopped in a bisect, which cannot be continued for you.\n\
+             A bisect advances on your answer — mark the commit yourself inside the \
+             sandbox with `git bisect good|bad`."
+                .to_owned(),
+        ));
+    };
+
+    // Refused before git is even started: `--continue` on an unresolved
+    // conflict fails with git's own message about staging, which is correct
+    // but arrives after the user has been told the rehearsal is resuming.
+    // Naming the files that still need attention is the more useful answer.
+    let unmerged = unmerged(worktree)?;
+    if !unmerged.is_empty() {
+        return Err(Error::Refused(format!(
+            "{} path(s) are still unmerged in the sandbox:\n  {}\n\
+             Resolve them and `git add` them there, then continue.",
+            unmerged.len(),
+            unmerged.join("\n  ")
+        )));
+    }
+
+    let status = git::spawn(worktree, [subcommand, "--continue"], &[])?;
+    classify(worktree, status)
+}
+
 /// Turns git's exit status plus the state it left behind into an [`Outcome`].
 fn classify(worktree: &Path, status: ExitStatus) -> Result<Outcome> {
     // Exit status alone is not enough in either direction: an interactive
     // rebase that stops at `edit` or `break` exits 0 with work outstanding,
     // and a rebase that stops on a conflict exits non-zero with a sandbox
     // worth inspecting rather than a failure to report.
-    if operation_in_progress(worktree)? {
+    if in_progress(worktree)?.is_some() {
         return Ok(Outcome::Stopped {
             conflicts: !git::run(worktree, ["ls-files", "--unmerged"])?.is_empty(),
         });
@@ -174,22 +304,6 @@ fn classify(worktree: &Path, status: ExitStatus) -> Result<Outcome> {
             code: status.code(),
         })
     }
-}
-
-/// Whether git left an operation half-finished in the sandbox.
-fn operation_in_progress(worktree: &Path) -> Result<bool> {
-    let git_dir = PathBuf::from(git::run(worktree, ["rev-parse", "--absolute-git-dir"])?);
-    // The states `git status` itself reports as an operation in progress.
-    Ok([
-        "rebase-merge",
-        "rebase-apply",
-        "MERGE_HEAD",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-        "BISECT_LOG",
-    ]
-    .iter()
-    .any(|marker| git_dir.join(marker).exists()))
 }
 
 /// Quotes a path for the shell git runs the sequence editor through.
@@ -217,6 +331,20 @@ mod tests {
             file: PathBuf::from("Cargo.toml"),
             editor: PathBuf::from("/usr/local/bin/git-rehearse"),
         }
+    }
+
+    #[test]
+    fn every_resumable_operation_knows_the_subcommand_that_carries_it_on() {
+        use super::Operation;
+        assert_eq!(Operation::Rebase.subcommand(), Some("rebase"));
+        assert_eq!(Operation::CherryPick.subcommand(), Some("cherry-pick"));
+        assert_eq!(Operation::Revert.subcommand(), Some("revert"));
+        assert_eq!(Operation::Merge.subcommand(), Some("merge"));
+        assert_eq!(
+            Operation::Bisect.subcommand(),
+            None,
+            "a bisect advances on an answer only the user has, so there is nothing to run"
+        );
     }
 
     #[test]
