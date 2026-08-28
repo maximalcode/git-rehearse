@@ -1,2 +1,9 @@
 /target
 .DS_Store
+
+# maxi-quality agent guard — per-checkout state, never committed
+.claude/agent-guard-receipt.json
+
+# maxi-quality agent guard — per-checkout state, never committed
+.claude/agent-guard-receipt.json
+.claude/agent-guard/__pycache__/

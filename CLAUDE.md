@@ -92,3 +92,41 @@ prevent.
   directories.
 - Exit codes are API from v0.1 on (0 clean / 2 conflicts / 3 failed /
   4 refused / 1 internal). Don't burn them on other meanings.
+
+<!-- BEGIN maxi-quality agent-guard sha256:1f0a94506e51e28d -->
+
+## The gate, and how a session ends
+
+This repo's quality baseline is enforced by two hooks and one deny rule in
+`.claude/settings.json`. They are not advice — they refuse.
+
+**Run the gate through the recorder, not directly:**
+
+```bash
+python3 .claude/agent-guard/record-gate.py --gate
+```
+
+`--gate` runs the command this repo declares in `.claude/agent-guard.json`,
+whole and through one shell, so a gate written as `a && b` is recorded as a
+gate rather than as its first half. It passes the gate's exit code straight
+through. (`-- <command>` still works for an ad-hoc run, and is what you want
+when the thing you are running is not the declared gate.)
+
+A session cannot end while the working tree holds changes the gate has not
+seen. If it refuses, the message says which of the four cases you are in: never
+ran, ran and failed, ran something that was not this repo's gate, or ran against
+different content.
+
+**Do not write `.claude/agent-guard-receipt.json` by hand.** The `Edit` tool is
+refused on it — that is a deny rule in `.claude/settings.json`, not advice. A
+shell command still reaches the file, and nothing downstream can tell: it is
+the gate's own input, so a hand-written one passes. It is the single action
+here that turns a guard into a lie.
+
+**Do not pass `--no-verify` to `git commit` or `git push`.** That is refused
+too. It switches off this repo's commit hook, which is the last check before
+content the gate has not seen becomes a commit. If the hook is failing for a
+reason that is not your change, say so — do not route around it.
+
+
+<!-- END maxi-quality agent-guard -->
