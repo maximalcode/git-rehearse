@@ -2,14 +2,14 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PROJECT_DIR}/.claude/agent-guard/no-verify-guard.py\"",
+            "command": "if [ -x \"$HOME/.local/bin/quality-runtime\" ]; then \"$HOME/.local/bin/quality-runtime\" no-verify-guard --root \"${CLAUDE_PROJECT_DIR}\"; else python3 -c 'import json,re,sys; n=sys.argv[1]; m='\"'\"'quality-runtime launcher is unavailable; install it and prepare the pinned cache'\"'\"'; d=json.loads(sys.stdin.read() or '\"'\"'{}'\"'\"') if n=='\"'\"'no-verify-guard'\"'\"' else {}; c=(d.get('\"'\"'tool_input'\"'\"') or {}).get('\"'\"'command'\"'\"','\"'\"''\"'\"'); deny=n=='\"'\"'no-verify-guard'\"'\"' and isinstance(c,str) and re.search(r'\"'\"'\\bgit\\s+(?:[^;&|]+\\s+)?(?:commit|push)\\b'\"'\"',c); o=({'\"'\"'decision'\"'\"':'\"'\"'block'\"'\"','\"'\"'reason'\"'\"':m} if n=='\"'\"'stop-gate'\"'\"' else ({'\"'\"'hookSpecificOutput'\"'\"':{'\"'\"'hookEventName'\"'\"':'\"'\"'PreToolUse'\"'\"','\"'\"'permissionDecision'\"'\"':'\"'\"'deny'\"'\"','\"'\"'permissionDecisionReason'\"'\"':m}} if deny else None)); json.dump(o,sys.stdout) if o else print('\"'\"'quality-runtime: '\"'\"'+m,file=sys.stderr); print() if o else None' no-verify-guard; fi",
             "timeout": 15
           }
-        ]
+        ],
+        "matcher": "Bash"
       }
     ],
     "Stop": [
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PROJECT_DIR}/.claude/agent-guard/stop-gate.py\"",
+            "command": "if [ -x \"$HOME/.local/bin/quality-runtime\" ]; then \"$HOME/.local/bin/quality-runtime\" stop-gate --root \"${CLAUDE_PROJECT_DIR}\"; else python3 -c 'import json,re,sys; n=sys.argv[1]; m='\"'\"'quality-runtime launcher is unavailable; install it and prepare the pinned cache'\"'\"'; d=json.loads(sys.stdin.read() or '\"'\"'{}'\"'\"') if n=='\"'\"'no-verify-guard'\"'\"' else {}; c=(d.get('\"'\"'tool_input'\"'\"') or {}).get('\"'\"'command'\"'\"','\"'\"''\"'\"'); deny=n=='\"'\"'no-verify-guard'\"'\"' and isinstance(c,str) and re.search(r'\"'\"'\\bgit\\s+(?:[^;&|]+\\s+)?(?:commit|push)\\b'\"'\"',c); o=({'\"'\"'decision'\"'\"':'\"'\"'block'\"'\"','\"'\"'reason'\"'\"':m} if n=='\"'\"'stop-gate'\"'\"' else ({'\"'\"'hookSpecificOutput'\"'\"':{'\"'\"'hookEventName'\"'\"':'\"'\"'PreToolUse'\"'\"','\"'\"'permissionDecision'\"'\"':'\"'\"'deny'\"'\"','\"'\"'permissionDecisionReason'\"'\"':m}} if deny else None)); json.dump(o,sys.stdout) if o else print('\"'\"'quality-runtime: '\"'\"'+m,file=sys.stderr); print() if o else None' stop-gate; fi",
             "timeout": 60
           }
         ]
