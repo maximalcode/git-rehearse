@@ -109,7 +109,7 @@ Use the default labels: `needs-triage`, `needs-info`, `ready-for-agent`,
 Single-context layout: root `CONTEXT.md` and `docs/adr/`. See
 `docs/agents/domain.md`.
 
-<!-- BEGIN maxi-quality agent-guard sha256:1f0a94506e51e28d -->
+<!-- BEGIN maxi-quality agent-guard sha256:41659a1def91ce97 -->
 
 ## The gate, and how a session ends
 
@@ -119,7 +119,7 @@ This repo's quality baseline is enforced by two hooks and one deny rule in
 **Run the gate through the recorder, not directly:**
 
 ```bash
-python3 .claude/agent-guard/record-gate.py --gate
+"$HOME/.local/bin/quality-runtime" record-gate --root "${CLAUDE_PROJECT_DIR}" --gate
 ```
 
 `--gate` runs the command this repo declares in `.claude/agent-guard.json`,
