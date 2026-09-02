@@ -375,3 +375,118 @@ fn a_non_colliding_untracked_file_survives_apply() {
         "feature content\n"
     );
 }
+
+#[test]
+fn an_untracked_nested_repository_that_would_become_tracked_is_not_overwritten() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "nested-feature", "main"]);
+    fixture.commit_file(
+        "vendor/important.txt",
+        "feature content\n",
+        "add nested file",
+    );
+    fixture.git(&["checkout", "-q", "main"]);
+
+    let vendor = fixture.repo().join("vendor");
+    std::fs::create_dir_all(&vendor).expect("nested repository directory");
+    fixture.git_in(&vendor, &["init", "-q"]);
+    fixture.git_in(&vendor, &["config", "user.name", "Fixture"]);
+    fixture.git_in(
+        &vendor,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    std::fs::write(vendor.join("important.txt"), "user content\n").expect("untracked nested file");
+
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "nested-feature"]);
+    let before_refs = fixture.refs();
+    let undo = std::path::PathBuf::from(fixture.git(&["rev-parse", "--absolute-git-dir"]))
+        .join(git_rehearse::undo::UNDO_FILE);
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(fixture.refs(), before_refs, "nothing moved");
+    assert_eq!(
+        std::fs::read_to_string(vendor.join("important.txt")).expect("nested file"),
+        "user content\n"
+    );
+    assert!(!undo.exists(), "a refused apply has no undo record");
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn distinct_non_utf8_untracked_names_do_not_collide() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::process::Command;
+
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "non-utf8-feature", "main"]);
+    let tracked = OsString::from_vec(b"tracked-\x80.txt".to_vec());
+    std::fs::write(fixture.repo().join(&tracked), "feature content\n").expect("tracked file");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(fixture.repo())
+        .args(["add", "--"])
+        .arg(&tracked)
+        .status()
+        .expect("git add runs");
+    assert!(status.success(), "git add failed");
+    fixture.git(&["commit", "-m", "add non-UTF-8 file"]);
+    fixture.git(&["checkout", "-q", "main"]);
+
+    let untracked = OsString::from_vec(b"tracked-\x81.txt".to_vec());
+    std::fs::write(fixture.repo().join(&untracked), "user content\n").expect("untracked file");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "non-utf8-feature"]);
+
+    apply::run(&sandbox, NOW).expect("distinct names do not collide");
+
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join(&untracked)).expect("untracked file"),
+        "user content\n"
+    );
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn case_equivalent_untracked_names_are_not_overwritten() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "case-feature", "main"]);
+    fixture.commit_file("Collision.txt", "feature content\n", "add collision");
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("collision.txt", "user content\n");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "case-feature"]);
+    let before_refs = fixture.refs();
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(fixture.refs(), before_refs, "nothing moved");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("collision.txt")).expect("untracked file"),
+        "user content\n"
+    );
+}
+
+#[test]
+fn an_ignored_untracked_file_that_would_become_tracked_is_not_overwritten() {
+    let fixture = Fixture::new();
+    fixture.commit_file(".gitignore", "ignored.txt\n", "ignore a generated file");
+    fixture.git(&["checkout", "-q", "-b", "ignored-feature", "main"]);
+    fixture.write("ignored.txt", "feature content\n");
+    fixture.git(&["add", "-f", "ignored.txt"]);
+    fixture.git(&["commit", "-m", "add ignored file"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("ignored.txt", "user content\n");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "ignored-feature"]);
+    let before_refs = fixture.refs();
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(fixture.refs(), before_refs, "nothing moved");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("ignored.txt")).expect("ignored file"),
+        "user content\n"
+    );
+}

@@ -48,6 +48,46 @@ fn id_of(report: &str) -> String {
 }
 
 #[test]
+fn an_untracked_file_colliding_with_a_carried_result_is_not_overwritten() {
+    let fixture = scenario();
+    fixture.write("notes.txt", "gamma\n");
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "rebase", "main"]);
+    assert_eq!(code, STOPPED, "{err}\n{out}");
+    let id = id_of(&out);
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the rehearsal was kept");
+    std::fs::write(sandbox.worktree().join("notes.txt"), "resolved\n").expect("resolve");
+    fixture.git_in(&sandbox.worktree(), &["add", "notes.txt"]);
+    std::fs::write(
+        sandbox.worktree().join("added-by-resolution.txt"),
+        "resolution\n",
+    )
+    .expect("add a resolved path");
+    fixture.git_in(&sandbox.worktree(), &["add", "added-by-resolution.txt"]);
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "continue", &id]);
+    assert_eq!(code, CLEAN, "{err}\n{out}");
+
+    // This untracked path was not part of the snapshot, but the carried result
+    // now contains it because the user added it while resolving the replay.
+    fixture.write("added-by-resolution.txt", "user content\n");
+    let before = fixture.refs();
+    let (code, _, err) = fixture.rehearse(&["apply", &id]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(err.contains("untracked"), "{err}");
+    assert_eq!(fixture.refs(), before, "nothing moved");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("added-by-resolution.txt"))
+            .expect("untracked file"),
+        "user content\n"
+    );
+}
+
+#[test]
 fn work_in_progress_is_carried_through_a_rebase_and_comes_back() {
     let fixture = scenario();
     fixture.write("file.txt", "topic\nwork in progress\n");

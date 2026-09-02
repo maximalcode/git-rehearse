@@ -36,7 +36,7 @@ use crate::carry::Carry;
 use crate::preflight::HEAD_KEY;
 use crate::sandbox::{Checkout, Sandbox};
 use crate::undo::{self, Record};
-use crate::{Error, Result, carry, git};
+use crate::{Error, Result, carry, collision, git};
 
 /// What an apply did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,11 +154,15 @@ fn check_worktree<'a>(
 ) -> Result<Option<Carried<'a>>> {
     let Some(carry) = carry.filter(|carry| carry.promises_the_worktree()) else {
         check_clean(repo, carry.is_some())?;
-        check_untracked(repo, rehearsed, branch)?;
+        collision::check(repo, rehearsed, &format!("refs/heads/{branch}^{{commit}}"))?;
         return Ok(None);
     };
     carry::check_unchanged(repo, carry, id)?;
-    check_untracked(repo, rehearsed, branch)?;
+    let target = carry::result_of(carry).map_or_else(
+        || format!("refs/heads/{branch}^{{commit}}"),
+        ToOwned::to_owned,
+    );
+    collision::check(repo, rehearsed, &target)?;
     Ok(carry::result_of(carry).map(|result| Carried {
         result,
         paths: &carry.paths,
@@ -268,61 +272,6 @@ fn check_clean(repo: &Path, carried: bool) -> Result<()> {
     Err(Error::Refused(format!(
         "applying this rehearsal rewrites the branch you have checked out, and your worktree \
          has uncommitted changes that `git reset --hard` would destroy.\n{why}"
-    )))
-}
-
-/// Refuses to reset a worktree over an untracked path that the rehearsed
-/// checkout would need to write.
-///
-/// Git status deliberately leaves untracked files out of the ordinary clean
-/// check above, because a hard reset normally leaves them alone. A reset does
-/// replace one, however, when the target tree tracks the same path (or when a
-/// file and directory exchange means one path contains the other). Compare
-/// every other file — including ignored files — with the target branch's tree
-/// before fetching anything or moving any refs.
-fn check_untracked(repo: &Path, rehearsed: &Path, branch: &str) -> Result<()> {
-    let untracked_output = git::run(repo, ["ls-files", "--others", "--no-empty-directory", "-z"])?;
-    let untracked = untracked_output
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if untracked.is_empty() {
-        return Ok(());
-    }
-
-    let target = format!("refs/heads/{branch}");
-    let tracked_output = git::run(rehearsed, ["ls-tree", "-r", "--name-only", "-z", &target])?;
-    let tracked = tracked_output
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let collisions = untracked
-        .iter()
-        .filter(|untracked| {
-            tracked.iter().any(|tracked| {
-                untracked.as_str() == tracked.as_str()
-                    || tracked
-                        .as_str()
-                        .strip_prefix(untracked.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
-                    || untracked
-                        .as_str()
-                        .strip_prefix(tracked.as_str())
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if collisions.is_empty() {
-        return Ok(());
-    }
-
-    Err(Error::Refused(format!(
-        "applying this rehearsal would overwrite untracked file(s):\n  {}\n\
-         Keep them elsewhere or rehearse again from here.",
-        collisions.join("\n  ")
     )))
 }
 

@@ -37,6 +37,18 @@ where
     run_with_stdin(dir, args, None)
 }
 
+/// Runs [`run`] with additional environment variables for git.
+///
+/// This is used by disposable probes that need a temporary worktree or an
+/// object alternate; the real repository's refs and index remain untouched.
+pub fn run_with_env<I, S>(dir: &Path, args: I, env: &[(&str, OsString)]) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_with_stdin_and_env(dir, args, None, env)
+}
+
 /// [`run`], with `input` fed to git's stdin.
 ///
 /// Used for `update-ref --stdin`, where the alternative is one process per
@@ -52,6 +64,19 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_with_stdin_and_env(dir, args, input, &[])
+}
+
+fn run_with_stdin_and_env<I, S>(
+    dir: &Path,
+    args: I,
+    input: Option<&str>,
+    env: &[(&str, OsString)],
+) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let args: Vec<OsString> = args
         .into_iter()
         .map(|a| a.as_ref().to_os_string())
@@ -61,6 +86,7 @@ where
         .arg("-C")
         .arg(dir)
         .args(&args)
+        .envs(env.iter().map(|(key, value)| (*key, value)))
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
