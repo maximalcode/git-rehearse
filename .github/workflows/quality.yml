@@ -14,9 +14,7 @@ permissions:
 
 jobs:
   quality:
-    uses: maximalcode/maxi-quality/.github/workflows/quality.yml@v1
-
-  # Rust Layer 1 (maxi-quality). Toolchain and cargo-deny are PINNED: with
+    uses: maximalcode/maxi-quality/.github/workflows/quality.yml@9d29bc6b9a498d2f863746158b4b4d891fd2f9a0 # v1.2.0
   # warnings promoted to errors, an analyzer upgrade that adds lints is a
   # breaking change — bump both deliberately, never via a floating 'stable'.
   rust:
