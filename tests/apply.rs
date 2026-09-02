@@ -326,3 +326,52 @@ fn applying_twice_is_refused_rather_than_repeated() {
     assert!(message.contains("has changed since rehearsal"), "{message}");
     assert_eq!(fixture.refs(), after_first);
 }
+
+#[test]
+fn an_untracked_file_that_would_become_tracked_is_not_overwritten() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "collision-feature", "main"]);
+    fixture.commit_file("collision.txt", "feature content\n", "add collision");
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("collision.txt", "user content\n");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "collision-feature"]);
+    let before_refs = fixture.refs();
+    let undo = std::path::PathBuf::from(fixture.git(&["rev-parse", "--absolute-git-dir"]))
+        .join(git_rehearse::undo::UNDO_FILE);
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(
+        fixture.refs(),
+        before_refs,
+        "no refs or fetch anchors moved"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("collision.txt")).expect("untracked file"),
+        "user content\n"
+    );
+    assert!(!undo.exists(), "a refused apply has no undo record");
+}
+
+#[test]
+fn a_non_colliding_untracked_file_survives_apply() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "feature-file", "main"]);
+    fixture.commit_file("tracked-by-rehearsal.txt", "feature content\n", "add file");
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("scratch.txt", "user content\n");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "feature-file"]);
+
+    apply::run(&sandbox, NOW).expect("apply succeeds");
+
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("scratch.txt")).expect("untracked file"),
+        "user content\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("tracked-by-rehearsal.txt"))
+            .expect("rehearsed file"),
+        "feature content\n"
+    );
+}
