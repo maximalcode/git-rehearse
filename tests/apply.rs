@@ -8,7 +8,7 @@
 mod support;
 
 use git_rehearse::sandbox::{Plan, Sandbox};
-use git_rehearse::{Error, apply, execute, preflight, sandbox};
+use git_rehearse::{Error, apply, carry, execute, preflight, sandbox};
 use support::Fixture;
 
 const NOW: u64 = 1_786_248_000;
@@ -488,5 +488,184 @@ fn an_ignored_untracked_file_that_would_become_tracked_is_not_overwritten() {
     assert_eq!(
         std::fs::read_to_string(fixture.repo().join("ignored.txt")).expect("ignored file"),
         "user content\n"
+    );
+}
+
+#[test]
+fn an_untracked_gitignore_that_would_become_tracked_is_not_overwritten() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "gitignore-feature", "main"]);
+    fixture.commit_file(".gitignore", "ignored.txt\n", "add ignore rules");
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write(".gitignore", "user-pattern\n");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "gitignore-feature"]);
+    let before_refs = fixture.refs();
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(fixture.refs(), before_refs, "nothing moved");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join(".gitignore")).expect("ignore file"),
+        "user-pattern\n"
+    );
+}
+
+#[test]
+fn sparse_checkout_preserves_an_untracked_path_outside_the_sparse_cone() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "sparse-feature", "main"]);
+    fixture.commit_file(
+        "outside/tracked.txt",
+        "feature content\n",
+        "add outside sparse cone",
+    );
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.git(&["sparse-checkout", "init", "--cone"]);
+    fixture.git(&["sparse-checkout", "set", "--skip-checks", "file.txt"]);
+    fixture.write("outside/untracked.txt", "user content\n");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "sparse-feature"]);
+
+    apply::run(&sandbox, NOW).expect("sparse-excluded untracked path is preserved");
+
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("outside/untracked.txt"))
+            .expect("untracked file"),
+        "user content\n"
+    );
+}
+
+#[test]
+fn a_carried_result_cannot_hide_a_collision_during_the_intermediate_reset() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "carried-feature", "main"]);
+    fixture.commit_file(
+        "collision.txt",
+        "feature content\n",
+        "add collision during reset",
+    );
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("file.txt", "carried work\n");
+    fixture.write("collision.txt", "user content\n");
+    let mut sandbox = rehearse(&fixture, &["merge", "--no-edit", "carried-feature"]);
+
+    // Simulate a carried conflict resolution that removes the path introduced
+    // by the branch. The real apply still resets through that branch first.
+    fixture.git_in(&sandbox.worktree(), &["rm", "-q", "collision.txt"]);
+    let result = fixture.git_in(&sandbox.worktree(), &["stash", "create"]);
+    fixture.git_in(
+        &sandbox.worktree(),
+        &["update-ref", "refs/rehearse/replayed", &result],
+    );
+    sandbox
+        .record_replay(carry::Replay::Restored {
+            result: Some(result),
+        })
+        .expect("metadata is writable");
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("collision.txt")).expect("untracked file"),
+        "user content\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn collision_preflight_does_not_run_inherited_template_hooks() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "hook-feature", "main"]);
+    fixture.commit_file("new.txt", "feature content\n", "add file");
+    fixture.git(&["checkout", "-q", "main"]);
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "hook-feature"]);
+
+    let template = fixture.scratch("hostile-template");
+    let hooks = template.join("hooks");
+    std::fs::create_dir_all(&hooks).expect("template hooks directory");
+    let marker = fixture.base().join("template-hook-ran");
+    let hook = hooks.join("post-checkout");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\nprintf hook > '{}'\n", marker.display()),
+    )
+    .expect("template hook");
+    let mut permissions = std::fs::metadata(&hook)
+        .expect("hook metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).expect("hook executable");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+        .current_dir(fixture.repo())
+        .env("GIT_TEMPLATE_DIR", &template)
+        .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
+        .args(["apply", sandbox.id()])
+        .output()
+        .expect("git-rehearse apply runs");
+    assert!(
+        output.status.success(),
+        "apply failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!marker.exists(), "the inherited template hook ran");
+}
+
+#[test]
+fn collision_preflight_resolves_a_separate_git_directory() {
+    let fixture = Fixture::new();
+    let separate = fixture.scratch("separate-git");
+    let git_dir = fixture.repo().join(".git");
+    std::fs::rename(&git_dir, &separate).expect("move git directory");
+    std::fs::write(&git_dir, format!("gitdir: {}\n", separate.display())).expect("gitdir file");
+    fixture.git(&["checkout", "-q", "-b", "separate-feature", "main"]);
+    fixture.commit_file("new.txt", "feature content\n", "add file");
+    fixture.git(&["checkout", "-q", "main"]);
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "separate-feature"]);
+
+    apply::run(&sandbox, NOW).expect("separate git directory is supported");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("new.txt")).expect("rehearsed file"),
+        "feature content\n"
+    );
+}
+
+#[test]
+fn collision_preflight_matches_a_sha256_repository() {
+    let fixture = Fixture::new();
+    let repo = fixture.scratch("sha256-repo");
+    fixture.git_in(
+        &repo,
+        &["init", "-q", "-b", "main", "--object-format=sha256"],
+    );
+    fixture.git_in(&repo, &["config", "user.name", "Fixture"]);
+    fixture.git_in(&repo, &["config", "user.email", "fixture@example.invalid"]);
+    std::fs::write(repo.join("base.txt"), "base\n").expect("base file");
+    fixture.git_in(&repo, &["add", "base.txt"]);
+    fixture.git_in(&repo, &["commit", "-q", "-m", "base"]);
+    fixture.git_in(&repo, &["checkout", "-q", "-b", "sha256-feature"]);
+    std::fs::write(repo.join("new.txt"), "feature content\n").expect("feature file");
+    fixture.git_in(&repo, &["add", "new.txt"]);
+    fixture.git_in(&repo, &["commit", "-q", "-m", "feature"]);
+    fixture.git_in(&repo, &["checkout", "-q", "main"]);
+
+    let plan = preflight::run(&repo)
+        .expect("sha256 repository passes preflight")
+        .into_plan(vec![
+            "merge".to_owned(),
+            "--no-edit".to_owned(),
+            "sha256-feature".to_owned(),
+        ]);
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
+    execute::run(&sandbox.worktree(), &plan.command, None).expect("the command runs");
+
+    apply::run(&sandbox, NOW).expect("sha256 repository applies");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("new.txt")).expect("rehearsed file"),
+        "feature content\n"
     );
 }

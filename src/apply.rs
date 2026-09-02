@@ -158,11 +158,14 @@ fn check_worktree<'a>(
         return Ok(None);
     };
     carry::check_unchanged(repo, carry, id)?;
-    let target = carry::result_of(carry).map_or_else(
-        || format!("refs/heads/{branch}^{{commit}}"),
-        ToOwned::to_owned,
-    );
-    collision::check(repo, rehearsed, &target)?;
+    let branch_target = format!("refs/heads/{branch}^{{commit}}");
+    // Apply first resets to the rehearsed branch, then checks out the carried
+    // result. Both Git operations can replace an untracked path, even when the
+    // carried result later removes a path introduced by the branch reset.
+    collision::check(repo, rehearsed, &branch_target)?;
+    if let Some(result) = carry::result_of(carry) {
+        collision::check(repo, rehearsed, result)?;
+    }
     Ok(carry::result_of(carry).map(|result| Carried {
         result,
         paths: &carry.paths,
