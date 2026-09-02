@@ -154,17 +154,18 @@ fn check_worktree<'a>(
 ) -> Result<Option<Carried<'a>>> {
     let Some(carry) = carry.filter(|carry| carry.promises_the_worktree()) else {
         check_clean(repo, carry.is_some())?;
-        collision::check(repo, rehearsed, &format!("refs/heads/{branch}^{{commit}}"))?;
+        collision::check_reset(repo, rehearsed, &format!("refs/heads/{branch}^{{commit}}"))?;
         return Ok(None);
     };
     carry::check_unchanged(repo, carry, id)?;
     let branch_target = format!("refs/heads/{branch}^{{commit}}");
-    // Apply first resets to the rehearsed branch, then checks out the carried
-    // result. Both Git operations can replace an untracked path, even when the
-    // carried result later removes a path introduced by the branch reset.
-    collision::check(repo, rehearsed, &branch_target)?;
+    // Apply first resets to the rehearsed branch, then reads the carried result
+    // tree into the worktree. Both Git operations can replace an untracked
+    // path, even when the carried result later removes a path introduced by
+    // the branch reset.
+    collision::check_reset(repo, rehearsed, &branch_target)?;
     if let Some(result) = carry::result_of(carry) {
-        collision::check(repo, rehearsed, result)?;
+        collision::check_restore(repo, rehearsed, result)?;
     }
     Ok(carry::result_of(carry).map(|result| Carried {
         result,

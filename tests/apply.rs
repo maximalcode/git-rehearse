@@ -512,6 +512,75 @@ fn an_untracked_gitignore_that_would_become_tracked_is_not_overwritten() {
 }
 
 #[test]
+fn an_empty_untracked_directory_that_would_become_a_file_is_not_replaced() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "empty-dir-feature", "main"]);
+    fixture.commit_file("empty-dir", "feature content\n", "replace empty directory");
+    fixture.git(&["checkout", "-q", "main"]);
+    std::fs::create_dir(fixture.repo().join("empty-dir")).expect("empty untracked directory");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "empty-dir-feature"]);
+    let before_refs = fixture.refs();
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(fixture.refs(), before_refs, "nothing moved");
+    assert!(fixture.repo().join("empty-dir").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn collision_probe_ignores_command_scoped_hooks_and_excludes_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "config-feature", "main"]);
+    fixture.commit_file("collision.txt", "feature content\n", "add collision");
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("collision.txt", "user content\n");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "config-feature"]);
+
+    let hooks = fixture.scratch("command-hooks");
+    let marker = fixture.base().join("command-hook-ran");
+    let hook = hooks.join("post-checkout");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\nprintf hook > '{}'\n", marker.display()),
+    )
+    .expect("hook");
+    let mut permissions = std::fs::metadata(&hook)
+        .expect("hook metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).expect("hook executable");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+        .current_dir(fixture.repo())
+        .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", &hooks)
+        .env("GIT_CONFIG_KEY_1", "core.excludesFile")
+        .env("GIT_CONFIG_VALUE_1", fixture.repo().join("collision.txt"))
+        .args(["apply", sandbox.id()])
+        .output()
+        .expect("apply runs");
+
+    assert!(
+        !output.status.success(),
+        "stdout={} stderr={} file={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read(fixture.repo().join("collision.txt"))
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("untracked"));
+    assert!(!marker.exists(), "probe ran a command-scoped hook");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("collision.txt")).expect("untracked file"),
+        "user content\n"
+    );
+}
+
+#[test]
 fn sparse_checkout_preserves_an_untracked_path_outside_the_sparse_cone() {
     let fixture = Fixture::new();
     fixture.git(&["checkout", "-q", "-b", "sparse-feature", "main"]);
@@ -532,6 +601,21 @@ fn sparse_checkout_preserves_an_untracked_path_outside_the_sparse_cone() {
         std::fs::read_to_string(fixture.repo().join("outside/untracked.txt"))
             .expect("untracked file"),
         "user content\n"
+    );
+}
+
+#[test]
+fn collision_probe_supports_split_indexes() {
+    let fixture = Fixture::new();
+    fixture.git(&["config", "core.splitIndex", "true"]);
+    fixture.git(&["update-index", "--split-index"]);
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "feature"]);
+
+    apply::run(&sandbox, NOW).expect("split index is supported");
+
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("file.txt")).expect("carried file"),
+        "three\n"
     );
 }
 

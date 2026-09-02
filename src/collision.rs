@@ -3,22 +3,43 @@
 //! There is no portable Rust predicate for this: Git's answer depends on its
 //! index, ignore rules, sparse-checkout settings and the filesystem's path
 //! semantics. This module therefore creates a disposable Git repository,
-//! copies the current worktree into it, and asks `git checkout` to perform the
-//! same prospective checkout. The repository is the adapter; collision policy
-//! remains Git's policy.
+//! copies the current worktree into it, and asks Git to perform the same
+//! prospective worktree operation. The repository is the adapter; collision
+//! policy remains Git's policy.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::{Error, Result, git};
 
-/// Refuses if Git would overwrite an untracked path while checking out `target`.
+/// Checks the exact `git reset --hard <target>` operation used by apply.
 ///
-/// `target` is a commit name resolvable in `rehearsed`; it may be the rehearsed
-/// branch tip or the separate carried-result commit. No object or ref is
+/// `target` is a commit name resolvable in `rehearsed`; no object or ref is
 /// written to `repo`.
-pub fn check(repo: &Path, rehearsed: &Path, target: &str) -> Result<()> {
+pub fn check_reset(repo: &Path, rehearsed: &Path, target: &str) -> Result<()> {
+    check_operation(repo, rehearsed, target, Operation::Reset)
+}
+
+/// Checks the exact `git read-tree -u --reset <target>^{tree}` operation used
+/// to restore a carried result.
+pub fn check_restore(repo: &Path, rehearsed: &Path, target: &str) -> Result<()> {
+    check_operation(repo, rehearsed, target, Operation::Restore)
+}
+
+#[derive(Clone, Copy)]
+enum Operation {
+    Reset,
+    Restore,
+}
+
+fn check_operation(
+    repo: &Path,
+    rehearsed: &Path,
+    target: &str,
+    operation: Operation,
+) -> Result<()> {
     let parent = repo.parent().unwrap_or(repo);
     let temp = tempfile::Builder::new()
         .prefix(".git-rehearse-apply-")
@@ -33,19 +54,15 @@ pub fn check(repo: &Path, rehearsed: &Path, target: &str) -> Result<()> {
     let object_format = git::run(repo, ["rev-parse", "--show-object-format"])?;
     let template = probe.join("template");
     fs::create_dir(&template).map_err(Error::io(&template))?;
-    git::run(
-        probe,
-        [
-            OsString::from("init"),
-            OsString::from("--quiet"),
-            git::flag_with_path("--template=", &template),
-            OsString::from(format!("--object-format={object_format}")),
-        ],
-    )?;
     let alternates = std::env::join_paths([repo_objects, rehearsed_objects])
         .map_err(|error| Error::Sandbox(format!("cannot configure collision probe: {error}")))?;
     let env = [
         ("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternates),
+        // Command-scoped configuration is supplied through an unbounded set
+        // of environment variables, so git::run_with_clean_env removes all
+        // of it before layering these values back in. In particular, hooks and
+        // caller-provided excludes must not change the probe's answer.
+        ("GIT_CONFIG_COUNT", OsString::from("0")),
         // `--template` controls init; this also prevents any inherited
         // template setting from being consulted by later git commands in the
         // probe.
@@ -59,26 +76,62 @@ pub fn check(repo: &Path, rehearsed: &Path, target: &str) -> Result<()> {
             temp.path().join("no-system-config").into_os_string(),
         ),
     ];
+    git::run_with_clean_env(
+        probe,
+        [
+            OsString::from("init"),
+            OsString::from("--quiet"),
+            git::flag_with_path("--template=", &template),
+            OsString::from(format!("--object-format={object_format}")),
+        ],
+        &env,
+    )?;
     // Both commits are visible through object alternates, so no object is
     // fetched into the real repository.
-    git::run_with_env(probe, ["checkout", "--quiet", "--detach", &head], &env)?;
-    let probe_index = git_path(probe, "index")?;
-    fs::copy(&source_index, &probe_index).map_err(Error::io(&probe_index))?;
-    copy_sparse_config(repo, probe)?;
+    git::run_with_clean_env(probe, ["checkout", "--quiet", "--detach", &head], &env)?;
+    let probe_index = git_path_with_env(probe, "index", &env)?;
+    copy_index(&source_index, &probe_index)?;
+    copy_sparse_config(repo, probe, &env)?;
     clear_worktree(probe).map_err(Error::io(probe))?;
     copy_worktree(repo, probe, true).map_err(Error::io(repo))?;
-    // Carried changes are expected to be replaced by the reset before their
-    // separately rehearsed result is restored. Restore tracked paths to the
-    // clean probe index, retaining only the untracked filesystem state.
-    git::run_with_env(probe, ["checkout", "--quiet", "--", "."], &env)?;
     // Ignored files are still overwritten by `reset --hard`. Remove ignore
-    // files from the disposable copy so checkout asks about those paths too;
-    // the target checkout restores any tracked ignore files in the probe.
+    // files from the disposable copy so the reset asks about those paths too;
+    // the target reset restores any tracked ignore files in the probe.
     remove_ignore_files(probe, Path::new(""), repo, rehearsed, &target)?;
+    let empty_directories = empty_directories(probe).map_err(Error::io(probe))?;
+    let before = worktree_files(probe).map_err(Error::io(probe))?;
+    let tracked = tracked_paths(probe, &env)?;
 
-    // This checkout updates only the disposable probe's HEAD and refs while
-    // using Git's untracked-overwrite checks for every target path.
-    match git::run_with_env(probe, ["checkout", "--quiet", "--detach", &target], &env) {
+    // This updates only the disposable probe while using Git's real worktree
+    // transition for the operation apply will perform.
+    let result = match operation {
+        Operation::Reset => {
+            git::run_with_clean_env(probe, ["reset", "--hard", "--quiet", &target], &env)
+        }
+        Operation::Restore => {
+            let tree = format!("{target}^{{tree}}");
+            git::run_with_clean_env(probe, ["read-tree", "-u", "--reset", &tree], &env)
+        }
+    };
+    match result {
+        Ok(_) if empty_directories.iter().any(|path| !path.is_dir()) => Err(Error::Refused(
+            "applying this rehearsal would replace an empty untracked directory\n\
+                 Keep it elsewhere or rehearse again from here."
+                .to_owned(),
+        )),
+        Ok(_)
+            if before.iter().any(|(path, state)| {
+                let relative = path.strip_prefix(probe).unwrap_or(path);
+                !tracked.iter().any(|tracked| tracked == relative)
+                    && worktree_file(path).is_none_or(|after| after != *state)
+            }) =>
+        {
+            Err(Error::Refused(
+                "applying this rehearsal would overwrite untracked file(s)\n\
+             Keep them elsewhere or rehearse again from here."
+                    .to_owned(),
+            ))
+        }
         Ok(_) => Ok(()),
         Err(Error::Git { stderr, .. }) => Err(Error::Refused(format!(
             "applying this rehearsal would overwrite untracked file(s):\n{stderr}\n\
@@ -86,6 +139,117 @@ pub fn check(repo: &Path, rehearsed: &Path, target: &str) -> Result<()> {
         ))),
         Err(other) => Err(other),
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FileState {
+    File(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+fn worktree_files(root: &Path) -> std::io::Result<BTreeMap<PathBuf, FileState>> {
+    let mut files = BTreeMap::new();
+    collect_worktree_files(root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_worktree_files(
+    root: &Path,
+    files: &mut BTreeMap<PathBuf, FileState>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            collect_worktree_files(&path, files)?;
+        } else if metadata.file_type().is_symlink() {
+            files.insert(path.clone(), FileState::Symlink(fs::read_link(path)?));
+        } else {
+            files.insert(path.clone(), FileState::File(fs::read(path)?));
+        }
+    }
+    Ok(())
+}
+
+fn worktree_file(path: &Path) -> Option<FileState> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return None;
+    }
+    if metadata.file_type().is_symlink() {
+        Some(FileState::Symlink(fs::read_link(path).ok()?))
+    } else {
+        Some(FileState::File(fs::read(path).ok()?))
+    }
+}
+
+fn tracked_paths(probe: &Path, env: &[(&str, OsString)]) -> Result<Vec<PathBuf>> {
+    let output = git::run_bytes_with_clean_env(probe, ["ls-files", "-z", "--cached"], env)?;
+    Ok(output
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(path_from_git_name)
+        .collect())
+}
+
+fn path_from_git_name(name: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(name.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(name).into_owned())
+    }
+}
+
+fn copy_index(source: &Path, destination: &Path) -> Result<()> {
+    fs::copy(source, destination).map_err(Error::io(destination))?;
+    let Some(source_parent) = source.parent() else {
+        return Ok(());
+    };
+    let Some(destination_parent) = destination.parent() else {
+        return Ok(());
+    };
+    for entry in fs::read_dir(source_parent).map_err(Error::io(source_parent))? {
+        let entry = entry.map_err(Error::io(source_parent))?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("sharedindex.")
+        {
+            let target = destination_parent.join(entry.file_name());
+            fs::copy(entry.path(), target.clone()).map_err(Error::io(&target))?;
+        }
+    }
+    Ok(())
+}
+
+fn empty_directories(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut result = Vec::new();
+    collect_empty_directories(root, &mut result)?;
+    Ok(result)
+}
+
+fn collect_empty_directories(root: &Path, result: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if fs::read_dir(&path)?.next().transpose()?.is_none() {
+                result.push(path);
+            } else if entry.file_name() != ".git" {
+                collect_empty_directories(&path, result)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn clear_worktree(root: &Path) -> std::io::Result<()> {
@@ -105,7 +269,18 @@ fn clear_worktree(root: &Path) -> std::io::Result<()> {
 }
 
 fn git_path(repo: &Path, name: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(git::run(repo, ["rev-parse", "--git-path", name])?);
+    git_path_with(repo, name, |args| git::run(repo, args))
+}
+
+fn git_path_with_env(repo: &Path, name: &str, env: &[(&str, OsString)]) -> Result<PathBuf> {
+    git_path_with(repo, name, |args| git::run_with_clean_env(repo, args, env))
+}
+
+fn git_path_with<F>(repo: &Path, name: &str, run: F) -> Result<PathBuf>
+where
+    F: FnOnce([&str; 3]) -> Result<String>,
+{
+    let path = PathBuf::from(run(["rev-parse", "--git-path", name])?);
     Ok(if path.is_absolute() {
         path
     } else {
@@ -113,7 +288,7 @@ fn git_path(repo: &Path, name: &str) -> Result<PathBuf> {
     })
 }
 
-fn copy_sparse_config(repo: &Path, probe: &Path) -> Result<()> {
+fn copy_sparse_config(repo: &Path, probe: &Path, env: &[(&str, OsString)]) -> Result<()> {
     let sparse = git::run(
         repo,
         [
@@ -127,16 +302,16 @@ fn copy_sparse_config(repo: &Path, probe: &Path) -> Result<()> {
     if !matches!(sparse.as_deref(), Ok("true")) {
         return Ok(());
     }
-    git::run(probe, ["config", "core.sparseCheckout", "true"])?;
+    git::run_with_clean_env(probe, ["config", "core.sparseCheckout", "true"], env)?;
     let source = git_path(repo, "info/sparse-checkout")?;
-    let destination = git_path(probe, "info/sparse-checkout")?;
+    let destination = git_path_with_env(probe, "info/sparse-checkout", env)?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(Error::io(parent))?;
     }
     fs::copy(source, destination.clone()).map_err(Error::io(&destination))?;
     for key in ["core.sparseCheckoutCone", "index.sparse"] {
         if let Ok(value) = git::run(repo, ["config", "--local", "--bool", "--get", key]) {
-            git::run(probe, ["config", key, &value])?;
+            git::run_with_clean_env(probe, ["config", key, &value], env)?;
         }
     }
     Ok(())
