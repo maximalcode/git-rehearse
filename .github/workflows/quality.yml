@@ -14,7 +14,12 @@ permissions:
 
 jobs:
   quality:
-    uses: maximalcode/maxi-quality/.github/workflows/quality.yml@v1
+    # Pinned by commit-SHA, not by tag — the v1 tag couples this workflow and
+    # its inner actions/layer2 reference (also SHA-pinned, as of maxi-quality#188)
+    # so that a moved tag cannot silently change what runs. The comment records
+    # the release lineage; bump the SHA deliberately alongside maxi-quality
+    # releases, not automatically.
+    uses: maximalcode/maxi-quality/.github/workflows/quality.yml@940a38d2806bbd05e9a52f5902434a7d67c17f27 # v1
 
   # Rust Layer 1 (maxi-quality). Toolchain and cargo-deny are PINNED: with
   # warnings promoted to errors, an analyzer upgrade that adds lints is a
@@ -51,6 +56,72 @@ jobs:
       # against the allowlist set in deny.toml (policy decided in #1).
       - run: cargo deny check advisories bans licenses
       - run: cargo test --locked
+
+  # Every third-party action must be pinned to a full commit SHA.
+  #
+  # This is the same guard maxi-quality runs on itself (its ci.yml,
+  # workflow-lint job), adapted here so git-rehearse does not depend on
+  # maxi-quality to catch its own unpinned actions — a consumer that
+  # adds a tag-pinned action sees it fail in CI, not weeks later when
+  # Scorecard re-scans.
+  pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # Third-party actions must be pinned to a full commit SHA, never a tag.
+      # A tag is mutable: whoever controls it can point it at new code, and
+      # that code then runs in CI with this repo's GITHUB_TOKEN.
+      #
+      # `maximalcode/*@<ref>` is exempt: our own repos, our own tags to move
+      # (and the reusable workflow reference to maxi-quality is itself
+      # SHA-pinned as of #45). The trailing `# vN` comment keeps Dependabot
+      # working and lets a reviewer see at a glance which release lineage a
+      # SHA belongs to.
+      - name: Third-party actions must be SHA-pinned
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bad=$(grep -rhoE 'uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[A-Za-z0-9._-]+' \
+                  .github/workflows/ \
+                | grep -vE '@[0-9a-f]{40}' \
+                | grep -vE '^uses: maximalcode/' \
+                | sort -u || true)
+          if [[ -n "$bad" ]]; then
+            echo '::error::these actions are pinned to a MUTABLE tag — use the full commit SHA:'
+            echo "$bad"
+            echo 'Resolve with: gh api repos/OWNER/REPO/git/ref/tags/TAG --jq .object.sha'
+            echo 'Keep the tag as a trailing comment so Dependabot can still bump it.'
+            exit 1
+          fi
+          echo 'OK: every third-party action is pinned to a commit SHA'
+
+      # No `curl | sh`, no `<(curl ...)`, no fetch-then-run without a
+      # checksum. The same guard maxi-quality runs on itself; adopted here
+      # because a workflow step that fetches and executes remote code without
+      # pinning is an action by another name.
+      - name: No unpinned remote code execution
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PATTERN='(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba)?sh'
+          PATTERN+='|<\([[:space:]]*(curl|wget)'
+          PATTERN+='|eval[^;]*(curl|wget)'
+          PATTERN+='|(curl|wget)[^;&]*(&&|;)[[:space:]]*(sudo[[:space:]]+)?(ba)?sh([[:space:]]|$)'
+          PATTERN+='|(curl|wget)[^;&]*(&&|;)[^;&]*chmod[[:space:]]+[^;&]*\+x'
+          SCAN=(.github/workflows)
+          # Exclude comments so this guard does not fail on its own explanation.
+          bad=$(grep -rnE "$PATTERN" "${SCAN[@]}" \
+                | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)
+          if [[ -n "$bad" ]]; then
+            echo '::error::remote code is fetched and executed without a version pin and a checksum:'
+            echo "$bad"
+            echo 'Use a SHA-pinned action, or download a pinned release and verify it with sha256sum -c.'
+            exit 1
+          fi
+          echo 'OK: no unpinned remote code execution'
 
   # The tests, on the platforms the release ships to. Only the tests: fmt,
   # clippy and cargo-deny read the same source and the same lockfile
