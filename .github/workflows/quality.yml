@@ -19,7 +19,7 @@ jobs:
     # so that a moved tag cannot silently change what runs. The comment records
     # the release lineage; bump the SHA deliberately alongside maxi-quality
     # releases, not automatically.
-    uses: maximalcode/maxi-quality/.github/workflows/quality.yml@940a38d2806bbd05e9a52f5902434a7d67c17f27 # v1
+    uses: maximalcode/maxi-quality/.github/workflows/quality.yml@9d29bc6b9a498d2f863746158b4b4d891fd2f9a0 # v1.2.0
 
   # Rust Layer 1 (maxi-quality). Toolchain and cargo-deny are PINNED: with
   # warnings promoted to errors, an analyzer upgrade that adds lints is a
