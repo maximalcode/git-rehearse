@@ -93,6 +93,22 @@ prevent.
 - Exit codes are API from v0.1 on (0 clean / 2 conflicts / 3 failed /
   4 refused / 1 internal). Don't burn them on other meanings.
 
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues via `gh`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default labels: `needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout: root `CONTEXT.md` and `docs/adr/`. See
+`docs/agents/domain.md`.
+
 <!-- BEGIN maxi-quality agent-guard sha256:1f0a94506e51e28d -->
 
 ## The gate, and how a session ends
