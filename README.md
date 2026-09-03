@@ -511,6 +511,11 @@ Each sandbox is made **inert** at creation: remotes stripped, so an accidental
 `push` inside it has nowhere to go, and `core.hooksPath` pointed at an empty
 directory, so your `pre-commit` does not fire for a rehearsal.
 
+Repository-local `merge.*` settings are carried alongside tracked
+`.gitattributes`, so custom merge drivers run as they do in the real repository.
+Branch and pull workflow settings remain excluded because they describe
+upstream/remotes, which the sandbox deliberately removes.
+
 ## Why
 
 Git has no dry run for the operations that scare people: no `git merge
