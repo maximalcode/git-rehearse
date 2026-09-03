@@ -877,6 +877,8 @@ fn collision_preflight_matches_a_sha256_repository() {
     );
     fixture.git_in(&repo, &["config", "user.name", "Fixture"]);
     fixture.git_in(&repo, &["config", "user.email", "fixture@example.invalid"]);
+    // Like the shared fixtures, keep byte assertions independent of host Git defaults.
+    fixture.git_in(&repo, &["config", "core.autocrlf", "false"]);
     std::fs::write(repo.join("base.txt"), "base\n").expect("base file");
     fixture.git_in(&repo, &["add", "base.txt"]);
     fixture.git_in(&repo, &["commit", "-q", "-m", "base"]);
