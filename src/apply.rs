@@ -36,7 +36,7 @@ use crate::carry::Carry;
 use crate::preflight::HEAD_KEY;
 use crate::sandbox::{Checkout, Sandbox};
 use crate::undo::{self, Record};
-use crate::{Error, Result, carry, git};
+use crate::{Error, Result, carry, collision, git};
 
 /// What an apply did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,8 +89,8 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
     // Only the reset path cares about the worktree at all: if the checked-out
     // branch was not rewritten, nothing below touches a single file, and what
     // is in the worktree is no more this apply's business than the weather.
-    let carried = if reset.is_some() {
-        check_worktree(repo, meta.carry.as_ref(), &meta.id)?
+    let carried = if let Some(branch) = reset.as_ref() {
+        check_worktree(repo, &worktree, branch, meta.carry.as_ref(), &meta.id)?
     } else {
         None
     };
@@ -147,14 +147,26 @@ struct Carried<'a> {
 /// but made no claim about putting it back — so it falls under the first rule.
 fn check_worktree<'a>(
     repo: &Path,
+    rehearsed: &Path,
+    branch: &str,
     carry: Option<&'a Carry>,
     id: &str,
 ) -> Result<Option<Carried<'a>>> {
     let Some(carry) = carry.filter(|carry| carry.promises_the_worktree()) else {
         check_clean(repo, carry.is_some())?;
+        collision::check_reset(repo, rehearsed, &format!("refs/heads/{branch}^{{commit}}"))?;
         return Ok(None);
     };
     carry::check_unchanged(repo, carry, id)?;
+    let branch_target = format!("refs/heads/{branch}^{{commit}}");
+    // Apply first resets to the rehearsed branch, then reads the carried result
+    // tree into the worktree. Both Git operations can replace an untracked
+    // path, even when the carried result later removes a path introduced by
+    // the branch reset.
+    collision::check_reset(repo, rehearsed, &branch_target)?;
+    if let Some(result) = carry::result_of(carry) {
+        collision::check_restore(repo, rehearsed, result)?;
+    }
     Ok(carry::result_of(carry).map(|result| Carried {
         result,
         paths: &carry.paths,

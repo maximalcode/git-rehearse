@@ -37,6 +37,69 @@ where
     run_with_stdin(dir, args, None)
 }
 
+/// Runs [`run`] with additional environment variables for git.
+///
+/// This is used by disposable probes that need a temporary worktree or an
+/// object alternate; the real repository's refs and index remain untouched.
+pub fn run_with_env<I, S>(dir: &Path, args: I, env: &[(&str, OsString)]) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_with_stdin_and_env(dir, args, None, env)
+}
+
+/// Runs git with the environment controls that can redirect or alter a
+/// disposable probe removed first. The caller's PATH, HOME and repository
+/// configuration remain available, but command-scoped config, alternate
+/// indexes, object stores and worktrees cannot leak into the probe.
+pub fn run_with_clean_env<I, S>(dir: &Path, args: I, env: &[(&str, OsString)]) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_with_stdin_and_env_clean(dir, args, None, env)
+}
+
+/// As [`run_with_clean_env`], retaining stdout bytes for Git's NUL-delimited
+/// path protocols.
+pub fn run_bytes_with_clean_env<I, S>(
+    dir: &Path,
+    args: I,
+    env: &[(&str, OsString)],
+) -> Result<Vec<u8>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(&args);
+    for (key, _) in std::env::vars_os() {
+        if probe_environment_key(&key) {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .envs(env.iter().map(|(key, value)| (*key, value)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(Error::Spawn)?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    Err(Error::Git {
+        args: describe(&args),
+        code: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
+}
+
 /// [`run`], with `input` fed to git's stdin.
 ///
 /// Used for `update-ref --stdin`, where the alternative is one process per
@@ -52,15 +115,62 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_with_stdin_and_env(dir, args, input, &[])
+}
+
+fn run_with_stdin_and_env<I, S>(
+    dir: &Path,
+    args: I,
+    input: Option<&str>,
+    env: &[(&str, OsString)],
+) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_with_stdin_and_env_impl(dir, args, input, env, false)
+}
+
+fn run_with_stdin_and_env_clean<I, S>(
+    dir: &Path,
+    args: I,
+    input: Option<&str>,
+    env: &[(&str, OsString)],
+) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_with_stdin_and_env_impl(dir, args, input, env, true)
+}
+
+fn run_with_stdin_and_env_impl<I, S>(
+    dir: &Path,
+    args: I,
+    input: Option<&str>,
+    env: &[(&str, OsString)],
+    clean_git_environment: bool,
+) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let args: Vec<OsString> = args
         .into_iter()
         .map(|a| a.as_ref().to_os_string())
         .collect();
 
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(&args)
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(&args);
+    if clean_git_environment {
+        for (key, _) in std::env::vars_os() {
+            if probe_environment_key(&key) {
+                command.env_remove(key);
+            }
+        }
+    }
+    let mut child = command
+        .envs(env.iter().map(|(key, value)| (*key, value)))
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -92,6 +202,29 @@ where
         code: output.status.code(),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     })
+}
+
+fn probe_environment_key(key: &OsStr) -> bool {
+    let key = key.to_string_lossy();
+    [
+        "GIT_CONFIG_",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_GRAFT_FILE",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_TEMPLATE_DIR",
+        "GIT_ATTR_",
+    ]
+    .iter()
+    .any(|prefix| key == *prefix || key.starts_with(prefix))
 }
 
 /// Runs git in `dir` with the parent's stdin, stdout and stderr, and returns
