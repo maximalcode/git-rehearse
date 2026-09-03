@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 
 use crate::analyze::{RefMove, ref_moves};
 use crate::carry::Carry;
+use crate::execute::Outcome;
 use crate::preflight::HEAD_KEY;
 use crate::sandbox::{Checkout, Sandbox};
 use crate::undo::{self, Record};
@@ -69,6 +70,7 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
     let repo = meta.repo_path.as_path();
     let worktree = sandbox.worktree();
 
+    check_outcome(meta)?;
     let rehearsed = state_of(&worktree)?;
     let moved = ref_moves(&meta.pre_state, &rehearsed);
     if moved.is_empty() {
@@ -121,6 +123,35 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         anchor,
         carried: carried.map(|carried| carried.paths.to_vec()),
     })
+}
+
+/// Refuses to transplant a rehearsal whose command did not finish cleanly.
+///
+/// The report's `can_apply` decision is enforced at every apply boundary,
+/// including `git rehearse apply` in a later process and the public apply API.
+/// This check deliberately happens before reading the sandbox refs so a
+/// stopped or failed rehearsal cannot reach fetch, undo-record, or discard
+/// code through a caller that bypasses the report flow.
+fn check_outcome(meta: &crate::sandbox::Meta) -> Result<()> {
+    match meta.result.as_ref() {
+        Some(Outcome::Clean) => Ok(()),
+        Some(Outcome::Stopped { .. }) => Err(Error::Refused(format!(
+            "rehearsal {} stopped part-way, so it has nothing that can be applied.\n\
+             The sandbox is still available — `git rehearse continue {}` to carry it on, \
+             or `git rehearse discard {}` to throw it away.",
+            meta.id, meta.id, meta.id
+        ))),
+        Some(Outcome::Failed { .. }) => Err(Error::Refused(format!(
+            "rehearsal {} failed, so it has nothing that can be applied.\n\
+             The sandbox is still available — `git rehearse discard {}` to throw it away.",
+            meta.id, meta.id
+        ))),
+        None => Err(Error::Refused(format!(
+            "rehearsal {} has no recorded outcome, so it has nothing that can be applied.\n\
+             Discard it with `git rehearse discard {}`.",
+            meta.id, meta.id
+        ))),
+    }
 }
 
 /// The uncommitted work this apply has to put back over the reset worktree.
@@ -363,9 +394,56 @@ fn transplant(repo: &Path, moved: &[RefMove], id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{branch_to_reset, check_unchanged};
+    use crate::Error;
     use crate::analyze::RefMove;
-    use crate::sandbox::Checkout;
+    use crate::execute::Outcome;
+    use crate::sandbox::{Checkout, META_SCHEMA, Meta, Status};
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn meta(result: Option<Outcome>) -> Meta {
+        Meta {
+            schema: META_SCHEMA,
+            id: "1786248000-00".to_owned(),
+            repo_id: "repo-0123456789abcdef".to_owned(),
+            repo_path: PathBuf::from("/repos/example"),
+            command: vec!["merge".to_owned(), "feature".to_owned()],
+            checkout: Checkout::Branch("main".to_owned()),
+            pre_state: BTreeMap::new(),
+            carry: None,
+            created_unix: 1_786_248_000,
+            status: Status::Kept,
+            result,
+        }
+    }
+
+    fn assert_refused(result: Outcome, classification: &str) {
+        let error = super::check_outcome(&meta(Some(result))).expect_err("outcome is refused");
+        assert!(matches!(error, Error::Refused(_)), "{error}");
+        assert!(error.to_string().contains(classification), "{error}");
+    }
+
+    #[test]
+    fn a_clean_outcome_is_allowed_to_apply() {
+        assert!(super::check_outcome(&meta(Some(Outcome::Clean))).is_ok());
+    }
+
+    #[test]
+    fn a_stopped_outcome_is_refused() {
+        assert_refused(Outcome::Stopped { conflicts: true }, "stopped part-way");
+    }
+
+    #[test]
+    fn a_failed_outcome_is_refused() {
+        assert_refused(Outcome::Failed { code: Some(128) }, "failed");
+    }
+
+    #[test]
+    fn a_missing_outcome_is_refused() {
+        let error = super::check_outcome(&meta(None)).expect_err("missing outcome is refused");
+        assert!(matches!(error, Error::Refused(_)), "{error}");
+        assert!(error.to_string().contains("no recorded outcome"), "{error}");
+    }
 
     fn state(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries

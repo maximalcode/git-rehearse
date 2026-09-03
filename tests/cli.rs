@@ -154,6 +154,83 @@ fn applying_something_that_stopped_is_refused_rather_than_half_done() {
 }
 
 #[test]
+fn applying_a_kept_stopped_cherry_pick_is_refused_and_keeps_its_sandbox() {
+    let fixture = Fixture::new();
+    // The first source commit applies to main; the second changes the same
+    // line as a commit made on main, so cherry-pick stops with main partially
+    // advanced in the sandbox.
+    fixture.git(&["checkout", "-q", "-b", "pick-source"]);
+    fixture.commit_file("first.txt", "first\n", "first pick");
+    let first = fixture.git(&["rev-parse", "HEAD"]);
+    fixture.commit("source conflict", "source\n");
+    let second = fixture.git(&["rev-parse", "HEAD"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.commit("main conflict", "main\n");
+    let before = fixture.refs();
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "cherry-pick", &first, &second]);
+    assert_eq!(code, STOPPED, "{out}\n{err}");
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .into_iter()
+        .find(|sandbox| sandbox.id() == id)
+        .expect("the kept sandbox exists");
+    let sandbox_root = sandbox.root().to_owned();
+
+    let (code, _, err) = fixture.rehearse(&["apply", &id]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(err.contains("nothing that can be applied"), "{err}");
+    assert_eq!(fixture.refs(), before, "the real repository is unchanged");
+    assert!(
+        !fixture.repo().join(".git/rehearse-undo").exists(),
+        "a refused apply does not write an undo record"
+    );
+    assert!(
+        sandbox_root.exists(),
+        "the stopped sandbox remains available"
+    );
+}
+
+#[test]
+fn applying_a_kept_failed_rehearsal_is_refused_and_keeps_its_sandbox() {
+    let fixture = Fixture::new();
+    let before = fixture.refs();
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "merge", "no-such-branch"]);
+    assert_eq!(code, FAILED, "{out}\n{err}");
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .into_iter()
+        .find(|sandbox| sandbox.id() == id)
+        .expect("the kept sandbox exists");
+    let sandbox_root = sandbox.root().to_owned();
+
+    let (code, _, err) = fixture.rehearse(&["apply", &id]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(
+        err.contains("failed") && err.contains("nothing that can be applied"),
+        "{err}"
+    );
+    assert_eq!(fixture.refs(), before, "the real repository is unchanged");
+    assert!(
+        sandbox_root.exists(),
+        "the failed sandbox remains available"
+    );
+}
+
+#[test]
 fn a_kept_rehearsal_can_be_listed_shown_and_applied_later() {
     let fixture = Fixture::new();
     fixture.commit_file("other.txt", "other\n", "four");
