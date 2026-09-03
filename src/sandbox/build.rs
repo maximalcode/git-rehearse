@@ -263,8 +263,16 @@ fn disable_hooks(worktree: &Path, hooks: &Path) -> Result<()> {
 /// right way round: a loud exit 3 is recoverable, a quiet signature downgrade
 /// is not.
 ///
-/// (`.gitattributes` needs no carrying — it is tracked content, so the clone
-/// already has it.)
+/// - the `merge.*` group: `.gitattributes` names a driver in tracked content,
+///   but the driver's command and options live in local config, so every local
+///   `merge.*` entry is carried as well. Git's NUL-delimited output keeps a
+///   driver command containing whitespace or newlines intact.
+///
+/// Branch and pull workflow settings are deliberately absent. They describe
+/// upstream/remotes rather than a merge driver's behavior, and carrying them
+/// would reintroduce assumptions about remotes that the sandbox strips.
+/// (`.gitattributes` itself needs no carrying — it is tracked content, so the
+/// clone already has it.)
 const CARRIED_CONFIG: &[&str] = &[
     "user.name",
     "user.email",
@@ -300,6 +308,32 @@ fn carry_config(repo: &Path, worktree: &Path) -> Result<()> {
         {
             git::run(worktree, ["config", key, &value])?;
         }
+    }
+    carry_merge_config(repo, worktree)?;
+    Ok(())
+}
+
+/// Carries repository-local merge drivers and merge behavior settings.
+///
+/// A merge driver is split between tracked `.gitattributes` and the local
+/// `merge.<name>.*` config section. The clone supplies the former but not the
+/// latter. `--null` makes each `key\nvalue` record unambiguous even when a
+/// driver command contains whitespace or a literal newline.
+fn carry_merge_config(repo: &Path, worktree: &Path) -> Result<()> {
+    let Ok(config) = git::run(
+        repo,
+        ["config", "--local", "--null", "--get-regexp", r"^merge\."],
+    ) else {
+        return Ok(());
+    };
+
+    for record in config.split('\0').filter(|record| !record.is_empty()) {
+        let Some((key, value)) = record.split_once('\n') else {
+            return Err(Error::Sandbox(format!(
+                "repository-local merge config has no value for {record:?}"
+            )));
+        };
+        git::run(worktree, ["config", "--add", key, value])?;
     }
     Ok(())
 }

@@ -32,6 +32,44 @@ fn a_clean_rehearsal_prints_a_report_and_exits_zero() {
 }
 
 #[test]
+fn a_rehearsed_merge_uses_repository_local_merge_drivers() {
+    let fixture = Fixture::new();
+
+    // The driver keeps our version of the file. Both branches make
+    // deliberately divergent edits so the driver, rather than Git's default
+    // merge machinery, decides whether the merge succeeds.
+    fixture.write("config.txt", "base\n");
+    fixture.write(".gitattributes", "config.txt merge=keep\n");
+    fixture.git(&["add", "config.txt", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "add merge-driver fixture"]);
+    fixture.git(&["config", "merge.keep.driver", "true"]);
+
+    fixture.git(&["checkout", "-q", "-b", "driver-feature"]);
+    fixture.write("config.txt", "feature\n");
+    fixture.git(&["commit", "-am", "feature config"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("config.txt", "main\n");
+    fixture.git(&["commit", "-am", "main config"]);
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "driver-feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept sandbox exists");
+    let rehearsed_content =
+        std::fs::read_to_string(sandbox.worktree().join("config.txt")).expect("sandbox file");
+
+    // Real Git is the independent oracle for the outcome. The sandbox must
+    // agree with it byte-for-byte while leaving the real repository untouched
+    // until the explicit merge below.
+    fixture.git(&["merge", "--no-edit", "driver-feature"]);
+    let real_content =
+        std::fs::read_to_string(fixture.repo().join("config.txt")).expect("real repository file");
+    assert_eq!(rehearsed_content, real_content);
+}
+
+#[test]
 fn a_rehearsal_that_stops_on_a_conflict_exits_two() {
     let fixture = Fixture::new();
     fixture.commit("four", "four\n");
