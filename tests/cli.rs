@@ -69,6 +69,49 @@ fn a_rehearsed_merge_uses_repository_local_merge_drivers() {
     assert_eq!(rehearsed_content, real_content);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_rehearsed_merge_preserves_non_utf8_merge_driver_commands() {
+    let fixture = Fixture::new();
+
+    fixture.write("config.txt", "base\n");
+    fixture.write(".gitattributes", "config.txt merge=raw\n");
+    fixture.git(&["add", "config.txt", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "add raw merge-driver fixture"]);
+
+    // The driver's command contains a literal byte that is not valid UTF-8.
+    // Git passes it to the shell unchanged, and the driver writes that byte
+    // into the result file. This is the independent byte-for-byte oracle.
+    let config_path = fixture.repo().join(".git/config");
+    let mut config = std::fs::read(&config_path).expect("local config");
+    config.extend_from_slice(b"[merge \"raw\"]\n\tdriver = printf '");
+    config.push(0xff);
+    config.extend_from_slice(b"' > %A\n");
+    std::fs::write(config_path, config).expect("write non-UTF-8 merge driver");
+
+    fixture.git(&["checkout", "-q", "-b", "raw-feature"]);
+    fixture.write("config.txt", "feature\n");
+    fixture.git(&["commit", "-am", "feature config"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("config.txt", "main\n");
+    fixture.git(&["commit", "-am", "main config"]);
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "raw-feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept sandbox exists");
+    let rehearsed_content =
+        std::fs::read(sandbox.worktree().join("config.txt")).expect("sandbox file");
+
+    fixture.git(&["merge", "--no-edit", "raw-feature"]);
+    let real_content =
+        std::fs::read(fixture.repo().join("config.txt")).expect("real repository file");
+    assert_eq!(rehearsed_content, real_content);
+    assert_eq!(real_content, [0xff]);
+}
+
 #[test]
 fn a_rehearsed_merge_preserves_valueless_local_merge_settings() {
     let fixture = Fixture::new();

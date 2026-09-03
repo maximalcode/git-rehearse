@@ -30,6 +30,7 @@
 //! `sandbox::Meta` and the rest are spelled exactly as they were.
 
 mod build;
+mod merge_config;
 mod meta;
 mod store;
 

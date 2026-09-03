@@ -61,6 +61,39 @@ where
     run_with_stdin_and_env_clean(dir, args, None, env)
 }
 
+/// Runs `git -C <dir> <args...>` and returns stdout without decoding it.
+///
+/// Git's NUL-delimited config and path protocols are byte protocols. Callers
+/// that need to preserve those values must not pass through [`String`], whose
+/// UTF-8 conversion would replace invalid bytes.
+pub fn run_bytes<I, S>(dir: &Path, args: I) -> Result<Vec<u8>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(Error::Spawn)?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    Err(Error::Git {
+        args: describe(&args),
+        code: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
+}
+
 /// As [`run_with_clean_env`], retaining stdout bytes for Git's NUL-delimited
 /// path protocols.
 pub fn run_bytes_with_clean_env<I, S>(
