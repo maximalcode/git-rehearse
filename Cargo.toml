@@ -1,6 +1,6 @@
 [package]
 name = "git-rehearse"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Rehearse dangerous git commands in a shadow clone of your real repo — see exactly what would happen, then apply or discard."
