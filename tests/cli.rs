@@ -70,6 +70,82 @@ fn a_rehearsed_merge_uses_repository_local_merge_drivers() {
 }
 
 #[test]
+fn a_rehearsed_merge_preserves_valueless_local_merge_settings() {
+    let fixture = Fixture::new();
+
+    fixture.write("config.txt", "base\n");
+    fixture.write(".gitattributes", "config.txt merge=keep\n");
+    fixture.git(&["add", "config.txt", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "add merge-driver fixture"]);
+    fixture.git(&["config", "merge.keep.driver", "true"]);
+
+    // A valueless boolean is valid Git config and means true. This is the
+    // spelling Git emits without a key/value separator in NUL mode.
+    let config_path = fixture.repo().join(".git/config");
+    let mut config = std::fs::read_to_string(&config_path).expect("local config");
+    config.push_str("[merge]\n\trenormalize\n");
+    std::fs::write(config_path, config).expect("write valueless merge setting");
+
+    fixture.git(&["checkout", "-q", "-b", "valueless-feature"]);
+    fixture.write("config.txt", "feature\n");
+    fixture.git(&["commit", "-am", "feature config"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("config.txt", "main\n");
+    fixture.git(&["commit", "-am", "main config"]);
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "valueless-feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept sandbox exists");
+    let rehearsed_content =
+        std::fs::read_to_string(sandbox.worktree().join("config.txt")).expect("sandbox file");
+
+    fixture.git(&["merge", "--no-edit", "valueless-feature"]);
+    let real_content =
+        std::fs::read_to_string(fixture.repo().join("config.txt")).expect("real repository file");
+    assert_eq!(rehearsed_content, real_content);
+}
+
+#[test]
+fn a_rehearsed_merge_expands_repository_local_includes_for_merge_drivers() {
+    let fixture = Fixture::new();
+
+    fixture.write("config.txt", "base\n");
+    fixture.write(".gitattributes", "config.txt merge=keep\n");
+    fixture.git(&["add", "config.txt", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "add merge-driver fixture"]);
+
+    let included = fixture.base().join("merge-driver.config");
+    std::fs::write(&included, "[merge \"keep\"]\n\tdriver = true\n")
+        .expect("write included merge config");
+    let included = included.to_str().expect("included config path is UTF-8");
+    fixture.git(&["config", "--local", "include.path", included]);
+
+    fixture.git(&["checkout", "-q", "-b", "included-feature"]);
+    fixture.write("config.txt", "feature\n");
+    fixture.git(&["commit", "-am", "feature config"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("config.txt", "main\n");
+    fixture.git(&["commit", "-am", "main config"]);
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "included-feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept sandbox exists");
+    let rehearsed_content =
+        std::fs::read_to_string(sandbox.worktree().join("config.txt")).expect("sandbox file");
+
+    fixture.git(&["merge", "--no-edit", "included-feature"]);
+    let real_content =
+        std::fs::read_to_string(fixture.repo().join("config.txt")).expect("real repository file");
+    assert_eq!(rehearsed_content, real_content);
+}
+
+#[test]
 fn a_rehearsal_that_stops_on_a_conflict_exits_two() {
     let fixture = Fixture::new();
     fixture.commit("four", "four\n");

@@ -317,22 +317,32 @@ fn carry_config(repo: &Path, worktree: &Path) -> Result<()> {
 ///
 /// A merge driver is split between tracked `.gitattributes` and the local
 /// `merge.<name>.*` config section. The clone supplies the former but not the
-/// latter. `--null` makes each `key\nvalue` record unambiguous even when a
-/// driver command contains whitespace or a literal newline.
+/// latter. `--includes` is explicit because `--local` otherwise leaves
+/// include.path expansion disabled. `--null` makes each `key\nvalue` record
+/// unambiguous even when a driver command contains whitespace or a literal
+/// newline.
 fn carry_merge_config(repo: &Path, worktree: &Path) -> Result<()> {
     let Ok(config) = git::run(
         repo,
-        ["config", "--local", "--null", "--get-regexp", r"^merge\."],
+        [
+            "config",
+            "--local",
+            "--includes",
+            "--null",
+            "--get-regexp",
+            r"^merge\.",
+        ],
     ) else {
         return Ok(());
     };
 
     for record in config.split('\0').filter(|record| !record.is_empty()) {
-        let Some((key, value)) = record.split_once('\n') else {
-            return Err(Error::Sandbox(format!(
-                "repository-local merge config has no value for {record:?}"
-            )));
-        };
+        // Git permits a valueless entry and interprets it as true for boolean
+        // settings such as merge.renormalize. In NUL mode it emits only the
+        // key, so carry that implicit value rather than rejecting valid config.
+        let (key, value) = record
+            .split_once('\n')
+            .map_or((record, "true"), |(key, value)| (key, value));
         git::run(worktree, ["config", "--add", key, value])?;
     }
     Ok(())
