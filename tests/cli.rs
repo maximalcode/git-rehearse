@@ -109,6 +109,36 @@ fn a_rehearsed_merge_preserves_valueless_local_merge_settings() {
 }
 
 #[test]
+fn a_valueless_local_merge_driver_keeps_git_missing_value_failure() {
+    let fixture = Fixture::new();
+
+    fixture.write("config.txt", "base\n");
+    fixture.write(".gitattributes", "config.txt merge=keep\n");
+    fixture.git(&["add", "config.txt", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "add merge-driver fixture"]);
+
+    // A valueless driver is not a boolean setting: Git must reject the merge
+    // because it has no command to execute. The sandbox must preserve that
+    // failure instead of coercing the entry into `driver = true`.
+    let config_path = fixture.repo().join(".git/config");
+    let mut config = std::fs::read_to_string(&config_path).expect("local config");
+    config.push_str("[merge \"keep\"]\n\tdriver\n");
+    std::fs::write(config_path, config).expect("write valueless merge driver");
+
+    fixture.git(&["checkout", "-q", "-b", "valueless-driver-feature"]);
+    fixture.write("config.txt", "feature\n");
+    fixture.git(&["commit", "-am", "feature config"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("config.txt", "main\n");
+    fixture.git(&["commit", "-am", "main config"]);
+
+    let (code, out, err) =
+        fixture.rehearse(&["--keep", "merge", "--no-edit", "valueless-driver-feature"]);
+    assert_eq!(code, FAILED, "{out}\n{err}");
+    assert!(err.contains("missing value"), "{out}\n{err}");
+}
+
+#[test]
 fn a_rehearsed_merge_expands_repository_local_includes_for_merge_drivers() {
     let fixture = Fixture::new();
 

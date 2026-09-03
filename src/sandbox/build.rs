@@ -318,9 +318,10 @@ fn carry_config(repo: &Path, worktree: &Path) -> Result<()> {
 /// A merge driver is split between tracked `.gitattributes` and the local
 /// `merge.<name>.*` config section. The clone supplies the former but not the
 /// latter. `--includes` is explicit because `--local` otherwise leaves
-/// include.path expansion disabled. `--null` makes each `key\nvalue` record
-/// unambiguous even when a driver command contains whitespace or a literal
-/// newline.
+/// include.path expansion disabled. `--show-origin --null` makes each
+/// `origin\0key\nvalue\0` record unambiguous even when a driver command
+/// contains whitespace or a literal newline, and leaves a valueless key as
+/// `origin\0key\0` rather than making it look like a boolean.
 fn carry_merge_config(repo: &Path, worktree: &Path) -> Result<()> {
     let Ok(config) = git::run(
         repo,
@@ -329,6 +330,7 @@ fn carry_merge_config(repo: &Path, worktree: &Path) -> Result<()> {
             "--local",
             "--includes",
             "--null",
+            "--show-origin",
             "--get-regexp",
             r"^merge\.",
         ],
@@ -336,15 +338,92 @@ fn carry_merge_config(repo: &Path, worktree: &Path) -> Result<()> {
         return Ok(());
     };
 
-    for record in config.split('\0').filter(|record| !record.is_empty()) {
-        // Git permits a valueless entry and interprets it as true for boolean
-        // settings such as merge.renormalize. In NUL mode it emits only the
-        // key, so carry that implicit value rather than rejecting valid config.
-        let (key, value) = record
-            .split_once('\n')
-            .map_or((record, "true"), |(key, value)| (key, value));
+    let mut fields = config.split('\0');
+    while let Some(origin) = fields.next() {
+        if origin.is_empty() {
+            continue;
+        }
+        let Some(record) = fields.next() else {
+            return Err(Error::Sandbox(format!(
+                "repository-local merge config from {origin:?} was truncated"
+            )));
+        };
+        let Some((key, value)) = record.split_once('\n') else {
+            // `git config` cannot create a valueless key, so first create the
+            // equivalent empty entry and then remove its separator in the
+            // destination file. Empty and missing values are different Git
+            // semantics for a merge driver: the former tries to execute an
+            // empty command, while the latter is a malformed config value.
+            carry_valueless_merge_entry(worktree, record)?;
+            continue;
+        };
         git::run(worktree, ["config", "--add", key, value])?;
     }
+    Ok(())
+}
+
+/// Adds a merge config key with no value, preserving Git's raw representation.
+fn carry_valueless_merge_entry(worktree: &Path, key: &str) -> Result<()> {
+    git::run(worktree, ["config", "--local", "--add", key, ""])?;
+
+    let config = git::run(worktree, ["rev-parse", "--git-path", "config"])?;
+    let config_path = worktree.join(config);
+    let mut contents = fs::read_to_string(&config_path).map_err(Error::io(&config_path))?;
+    let Some((section, variable)) = key.rsplit_once('.') else {
+        return Err(Error::Sandbox(format!(
+            "repository-local merge config key has no variable: {key:?}"
+        )));
+    };
+    let header = if section == "merge" {
+        "[merge]".to_owned()
+    } else {
+        let Some(driver) = section.strip_prefix("merge.") else {
+            return Err(Error::Sandbox(format!(
+                "repository-local merge config key is not a merge setting: {key:?}"
+            )));
+        };
+        let escaped_driver = driver.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("[merge \"{escaped_driver}\"]")
+    };
+    let target = format!("{variable} =");
+    let mut in_target_section = false;
+    let mut line_start = 0;
+    let mut value_line = None;
+
+    for line in contents.split_inclusive('\n') {
+        let without_newline = line.trim_end_matches(['\n', '\r']);
+        if without_newline.starts_with('[') {
+            in_target_section = without_newline == header;
+        } else if in_target_section && without_newline.trim() == target {
+            value_line = Some((line_start, line.len()));
+        }
+        line_start += line.len();
+    }
+
+    let Some((line_start, line_len)) = value_line else {
+        return Err(Error::Sandbox(format!(
+            "could not locate valueless merge config key {key:?} in {}",
+            config_path.display()
+        )));
+    };
+    let line = &contents[line_start..line_start + line_len];
+    let newline_len = line
+        .ends_with("\r\n")
+        .then_some(2)
+        .or_else(|| line.ends_with('\n').then_some(1));
+    let Some(newline_len) = newline_len else {
+        return Err(Error::Sandbox(format!(
+            "merge config key {key:?} has no line ending in {}",
+            config_path.display()
+        )));
+    };
+    let newline = &line[line.len() - newline_len..];
+    let value_start = line[..line.len() - newline_len]
+        .rfind(" =")
+        .ok_or_else(|| Error::Sandbox(format!("merge config key {key:?} is not empty")))?;
+    let replacement = format!("{}{}", &line[..value_start], newline);
+    contents.replace_range(line_start..line_start + line_len, &replacement);
+    fs::write(&config_path, contents).map_err(Error::io(&config_path))?;
     Ok(())
 }
 
