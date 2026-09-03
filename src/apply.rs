@@ -394,9 +394,56 @@ fn transplant(repo: &Path, moved: &[RefMove], id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{branch_to_reset, check_unchanged};
+    use crate::Error;
     use crate::analyze::RefMove;
-    use crate::sandbox::Checkout;
+    use crate::execute::Outcome;
+    use crate::sandbox::{Checkout, META_SCHEMA, Meta, Status};
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn meta(result: Option<Outcome>) -> Meta {
+        Meta {
+            schema: META_SCHEMA,
+            id: "1786248000-00".to_owned(),
+            repo_id: "repo-0123456789abcdef".to_owned(),
+            repo_path: PathBuf::from("/repos/example"),
+            command: vec!["merge".to_owned(), "feature".to_owned()],
+            checkout: Checkout::Branch("main".to_owned()),
+            pre_state: BTreeMap::new(),
+            carry: None,
+            created_unix: 1_786_248_000,
+            status: Status::Kept,
+            result,
+        }
+    }
+
+    fn assert_refused(result: Outcome, classification: &str) {
+        let error = super::check_outcome(&meta(Some(result))).expect_err("outcome is refused");
+        assert!(matches!(error, Error::Refused(_)), "{error}");
+        assert!(error.to_string().contains(classification), "{error}");
+    }
+
+    #[test]
+    fn a_clean_outcome_is_allowed_to_apply() {
+        assert!(super::check_outcome(&meta(Some(Outcome::Clean))).is_ok());
+    }
+
+    #[test]
+    fn a_stopped_outcome_is_refused() {
+        assert_refused(Outcome::Stopped { conflicts: true }, "stopped part-way");
+    }
+
+    #[test]
+    fn a_failed_outcome_is_refused() {
+        assert_refused(Outcome::Failed { code: Some(128) }, "failed");
+    }
+
+    #[test]
+    fn a_missing_outcome_is_refused() {
+        let error = super::check_outcome(&meta(None)).expect_err("missing outcome is refused");
+        assert!(matches!(error, Error::Refused(_)), "{error}");
+        assert!(error.to_string().contains("no recorded outcome"), "{error}");
+    }
 
     fn state(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries
