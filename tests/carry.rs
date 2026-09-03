@@ -49,6 +49,15 @@ fn id_of(report: &str) -> String {
 
 #[test]
 fn an_untracked_file_colliding_with_a_carried_result_is_not_overwritten() {
+    assert_carried_collision_is_refused("user content\n");
+}
+
+#[test]
+fn identical_contents_do_not_allow_a_carried_result_to_replace_an_untracked_file() {
+    assert_carried_collision_is_refused("resolution\n");
+}
+
+fn assert_carried_collision_is_refused(untracked_content: &str) {
     let fixture = scenario();
     fixture.write("notes.txt", "gamma\n");
 
@@ -73,8 +82,11 @@ fn an_untracked_file_colliding_with_a_carried_result_is_not_overwritten() {
 
     // This untracked path was not part of the snapshot, but the carried result
     // now contains it because the user added it while resolving the replay.
-    fixture.write("added-by-resolution.txt", "user content\n");
+    fixture.write("added-by-resolution.txt", untracked_content);
     let before = fixture.refs();
+    let undo = std::path::PathBuf::from(fixture.git(&["rev-parse", "--absolute-git-dir"]))
+        .join(git_rehearse::undo::UNDO_FILE);
+    std::fs::write(&undo, "previous undo record\n").expect("existing undo record");
     let (code, _, err) = fixture.rehearse(&["apply", &id]);
 
     assert_eq!(code, REFUSED, "{err}");
@@ -83,8 +95,13 @@ fn an_untracked_file_colliding_with_a_carried_result_is_not_overwritten() {
     assert_eq!(
         std::fs::read_to_string(fixture.repo().join("added-by-resolution.txt"))
             .expect("untracked file"),
-        "user content\n"
+        untracked_content
     );
+    assert_eq!(
+        std::fs::read_to_string(undo).expect("undo"),
+        "previous undo record\n"
+    );
+    assert!(sandbox.worktree().is_dir(), "refusal retains the sandbox");
 }
 
 #[test]

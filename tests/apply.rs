@@ -355,6 +355,38 @@ fn an_untracked_file_that_would_become_tracked_is_not_overwritten() {
 }
 
 #[test]
+fn identical_contents_do_not_allow_an_untracked_file_to_become_tracked() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "identical-feature", "main"]);
+    fixture.commit_file("collision.txt", "same contents\n", "add identical file");
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("collision.txt", "same contents\n");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "identical-feature"]);
+    let before_refs = fixture.refs();
+    let undo = std::path::PathBuf::from(fixture.git(&["rev-parse", "--absolute-git-dir"]))
+        .join(git_rehearse::undo::UNDO_FILE);
+    std::fs::write(&undo, "previous undo record\n").expect("existing undo record");
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(
+        fixture.refs(),
+        before_refs,
+        "refs and fetch anchors are unchanged"
+    );
+    assert_eq!(fixture.git(&["ls-files", "--", "collision.txt"]), "");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("collision.txt")).expect("untracked file"),
+        "same contents\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(undo).expect("undo"),
+        "previous undo record\n"
+    );
+}
+
+#[test]
 fn a_non_colliding_untracked_file_survives_apply() {
     let fixture = Fixture::new();
     fixture.git(&["checkout", "-q", "-b", "feature-file", "main"]);
@@ -373,6 +405,59 @@ fn a_non_colliding_untracked_file_survives_apply() {
         std::fs::read_to_string(fixture.repo().join("tracked-by-rehearsal.txt"))
             .expect("rehearsed file"),
         "feature content\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn identical_targets_do_not_allow_an_untracked_symlink_to_become_tracked() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "identical-link-feature", "main"]);
+    let path = fixture.repo().join("collision-link");
+    std::os::unix::fs::symlink("file.txt", &path).expect("target symlink");
+    fixture.git(&["add", "collision-link"]);
+    fixture.git(&["commit", "-m", "add identical symlink"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    std::os::unix::fs::symlink("file.txt", &path).expect("untracked symlink");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "identical-link-feature"]);
+    let before_refs = fixture.refs();
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(fixture.refs(), before_refs, "nothing moved");
+    assert_eq!(
+        std::fs::read_link(path).expect("symlink"),
+        std::path::Path::new("file.txt")
+    );
+    assert_eq!(fixture.git(&["ls-files", "--", "collision-link"]), "");
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn identical_contents_do_not_allow_a_case_equivalent_untracked_file_to_become_tracked() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "identical-case-feature", "main"]);
+    fixture.commit_file(
+        "Collision.txt",
+        "same contents\n",
+        "add case-equivalent file",
+    );
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("collision.txt", "same contents\n");
+    if !fixture.repo().join("Collision.txt").exists() {
+        return; // No filesystem alias on a case-sensitive volume.
+    }
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "identical-case-feature"]);
+    let before_refs = fixture.refs();
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(fixture.refs(), before_refs, "nothing moved");
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("collision.txt")).expect("untracked file"),
+        "same contents\n"
     );
 }
 
@@ -530,6 +615,43 @@ fn an_empty_untracked_directory_that_would_become_a_file_is_not_replaced() {
 
 #[cfg(unix)]
 #[test]
+fn an_empty_untracked_directory_is_not_replaced_by_a_symlink_to_a_directory() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "directory-link-feature", "main"]);
+    let path = fixture.repo().join("empty-dir");
+    std::os::unix::fs::symlink(".", &path).expect("target symlink");
+    fixture.git(&["add", "empty-dir"]);
+    fixture.git(&["commit", "-m", "add directory symlink"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    std::fs::create_dir(&path).expect("empty untracked directory");
+    let sandbox = rehearse(&fixture, &["merge", "--no-edit", "directory-link-feature"]);
+    let before_refs = fixture.refs();
+    let undo = std::path::PathBuf::from(fixture.git(&["rev-parse", "--absolute-git-dir"]))
+        .join(git_rehearse::undo::UNDO_FILE);
+    std::fs::write(&undo, "previous undo record\n").expect("existing undo record");
+
+    let message = refusal(apply::run(&sandbox, NOW).expect_err("refused"));
+
+    assert!(message.contains("untracked"), "{message}");
+    assert_eq!(
+        fixture.refs(),
+        before_refs,
+        "refs and fetch anchors are unchanged"
+    );
+    let metadata = std::fs::symlink_metadata(&path).expect("original directory");
+    assert!(
+        metadata.file_type().is_dir(),
+        "must remain a directory, not a symlink"
+    );
+    assert_eq!(std::fs::read_dir(path).expect("directory").count(), 0);
+    assert_eq!(
+        std::fs::read_to_string(undo).expect("undo"),
+        "previous undo record\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn collision_probe_ignores_command_scoped_hooks_and_excludes_config() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -616,6 +738,33 @@ fn collision_probe_supports_split_indexes() {
     assert_eq!(
         std::fs::read_to_string(fixture.repo().join("file.txt")).expect("carried file"),
         "three\n"
+    );
+}
+
+#[test]
+fn a_sparse_reset_leaves_an_identical_untracked_file_at_a_skipped_target_path_alone() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "sparse-identical-feature", "main"]);
+    fixture.commit_file(
+        "outside/collision.txt",
+        "same contents\n",
+        "add excluded file",
+    );
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.git(&["sparse-checkout", "init", "--cone"]);
+    fixture.git(&["sparse-checkout", "set", "--skip-checks", "inside"]);
+    fixture.write("outside/collision.txt", "same contents\n");
+    let sandbox = rehearse(
+        &fixture,
+        &["merge", "--no-edit", "sparse-identical-feature"],
+    );
+
+    apply::run(&sandbox, NOW).expect("a skipped path is not checked out");
+
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("outside/collision.txt"))
+            .expect("original file"),
+        "same contents\n"
     );
 }
 

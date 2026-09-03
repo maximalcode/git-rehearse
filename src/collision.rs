@@ -113,12 +113,33 @@ fn check_operation(
             git::run_with_clean_env(probe, ["read-tree", "-u", "--reset", &tree], &env)
         }
     };
+    if result.is_ok() {
+        // In the disposable probe only, erase newly materialized index entries
+        // before checking the original untracked paths. Matching bytes do not
+        // make a checkout safe. Removing the entry also exposes filesystem
+        // aliases (case/normalization) without guessing how names compare, and
+        // does not follow a symlink's destination. Sparse-skipped entries stay.
+        for relative in checked_out_paths(probe, &env)? {
+            if !tracked.contains(&relative) {
+                let path = probe.join(relative);
+                fs::remove_file(&path).map_err(Error::io(&path))?;
+            }
+        }
+    }
     match result {
-        Ok(_) if empty_directories.iter().any(|path| !path.is_dir()) => Err(Error::Refused(
-            "applying this rehearsal would replace an empty untracked directory\n\
+        Ok(_)
+            if empty_directories.iter().any(|path| {
+                // Inspect the entry, not its destination: a symlink to a directory
+                // is still a replacement of the user's original directory.
+                !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+            }) =>
+        {
+            Err(Error::Refused(
+                "applying this rehearsal would replace an empty untracked directory\n\
                  Keep it elsewhere or rehearse again from here."
-                .to_owned(),
-        )),
+                    .to_owned(),
+            ))
+        }
         Ok(_)
             if before.iter().any(|(path, state)| {
                 let relative = path.strip_prefix(probe).unwrap_or(path);
@@ -192,6 +213,32 @@ fn tracked_paths(probe: &Path, env: &[(&str, OsString)]) -> Result<Vec<PathBuf>>
     Ok(output
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
+        .map(path_from_git_name)
+        .collect())
+}
+
+/// The operation's resulting index is evidence of a checkout even when the
+/// replacement has identical bytes or the same symlink target. Skip-worktree
+/// entries are excluded: a sparse reset can track a path without writing it.
+fn checked_out_paths(probe: &Path, env: &[(&str, OsString)]) -> Result<Vec<PathBuf>> {
+    // Read the flags the operation wrote. A sparse-aware ls-files can clear
+    // skip-worktree in memory merely because the preserved file is present.
+    let output = git::run_bytes_with_clean_env(
+        probe,
+        [
+            "-c",
+            "core.sparseCheckout=false",
+            "ls-files",
+            "-t",
+            "-z",
+            "--cached",
+        ],
+        env,
+    )?;
+    Ok(output
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.starts_with(b"S "))
+        .filter_map(|entry| entry.get(2..))
         .map(path_from_git_name)
         .collect())
 }
@@ -289,16 +336,9 @@ where
 }
 
 fn copy_sparse_config(repo: &Path, probe: &Path, env: &[(&str, OsString)]) -> Result<()> {
-    let sparse = git::run(
-        repo,
-        [
-            "config",
-            "--local",
-            "--bool",
-            "--get",
-            "core.sparseCheckout",
-        ],
-    );
+    // `git sparse-checkout` stores these in config.worktree when worktree
+    // configuration is enabled. Read the effective values, not just --local.
+    let sparse = git::run(repo, ["config", "--bool", "--get", "core.sparseCheckout"]);
     if !matches!(sparse.as_deref(), Ok("true")) {
         return Ok(());
     }
@@ -310,7 +350,7 @@ fn copy_sparse_config(repo: &Path, probe: &Path, env: &[(&str, OsString)]) -> Re
     }
     fs::copy(source, destination.clone()).map_err(Error::io(&destination))?;
     for key in ["core.sparseCheckoutCone", "index.sparse"] {
-        if let Ok(value) = git::run(repo, ["config", "--local", "--bool", "--get", key]) {
+        if let Ok(value) = git::run(repo, ["config", "--bool", "--get", key]) {
             git::run_with_clean_env(probe, ["config", key, &value], env)?;
         }
     }
