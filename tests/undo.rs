@@ -24,8 +24,9 @@ fn plan_of(fixture: &Fixture, command: &[&str]) -> Plan {
 /// Rehearses `command` and hands back the sandbox, ready to apply.
 fn rehearse(fixture: &Fixture, command: &[&str]) -> Sandbox {
     let plan = plan_of(fixture, command);
-    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
-    execute::run(&sandbox.worktree(), &plan.command, None).expect("the command runs");
+    let mut sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
+    let outcome = execute::run(&sandbox.worktree(), &plan.command, None).expect("the command runs");
+    sandbox.record(&outcome).expect("the outcome is recorded");
     sandbox
 }
 
@@ -93,11 +94,14 @@ fn the_worktree_follows_the_branch_it_is_standing_on() {
     let fixture = Fixture::new();
     fixture.commit("four", "four\n");
     fixture.git(&["checkout", "feature"]);
-    let sandbox = rehearse(&fixture, &["rebase", "main"]);
+    let mut sandbox = rehearse(&fixture, &["rebase", "main"]);
     let worktree = sandbox.worktree();
     std::fs::write(worktree.join("file.txt"), "resolved\n").expect("resolve");
     fixture.git_in(&worktree, &["add", "file.txt"]);
     fixture.git_in(&worktree, &["rebase", "--continue"]);
+    sandbox
+        .record(&execute::Outcome::Clean)
+        .expect("the completed outcome is recorded");
     apply::run(&sandbox, NOW).expect("apply succeeds");
 
     let undone = undo::run(fixture.repo(), None).expect("undo succeeds");
@@ -120,11 +124,14 @@ fn uncommitted_work_is_never_destroyed_by_an_undo() {
     let fixture = Fixture::new();
     fixture.commit("four", "four\n");
     fixture.git(&["checkout", "feature"]);
-    let sandbox = rehearse(&fixture, &["rebase", "main"]);
+    let mut sandbox = rehearse(&fixture, &["rebase", "main"]);
     let worktree = sandbox.worktree();
     std::fs::write(worktree.join("file.txt"), "resolved\n").expect("resolve");
     fixture.git_in(&worktree, &["add", "file.txt"]);
     fixture.git_in(&worktree, &["rebase", "--continue"]);
+    sandbox
+        .record(&execute::Outcome::Clean)
+        .expect("the completed outcome is recorded");
     apply::run(&sandbox, NOW).expect("apply succeeds");
     // Second thoughts arrive after the editing has started.
     fixture.write("file.txt", "work in progress\n");

@@ -22,8 +22,9 @@ fn plan_of(fixture: &Fixture, command: &[&str]) -> Plan {
 /// Rehearses `command` and hands back the sandbox, ready to apply.
 fn rehearse(fixture: &Fixture, command: &[&str]) -> Sandbox {
     let plan = plan_of(fixture, command);
-    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
-    execute::run(&sandbox.worktree(), &plan.command, None).expect("the command runs");
+    let mut sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
+    let outcome = execute::run(&sandbox.worktree(), &plan.command, None).expect("the command runs");
+    sandbox.record(&outcome).expect("the outcome is recorded");
     sandbox
 }
 
@@ -81,12 +82,15 @@ fn the_worktree_is_brought_to_the_rehearsed_content() {
     let fixture = Fixture::new();
     fixture.commit("four", "four\n");
     fixture.git(&["checkout", "feature"]);
-    let sandbox = rehearse(&fixture, &["rebase", "main"]);
+    let mut sandbox = rehearse(&fixture, &["rebase", "main"]);
     let worktree = sandbox.worktree();
     // Finish the rebase the fixture's conflict stopped.
     std::fs::write(worktree.join("file.txt"), "resolved\n").expect("resolve");
     fixture.git_in(&worktree, &["add", "file.txt"]);
     fixture.git_in(&worktree, &["rebase", "--continue"]);
+    sandbox
+        .record(&execute::Outcome::Clean)
+        .expect("the completed outcome is recorded");
 
     let applied = apply::run(&sandbox, NOW).expect("apply succeeds");
 
@@ -141,11 +145,14 @@ fn uncommitted_work_is_never_destroyed_by_an_apply() {
     let fixture = Fixture::new();
     fixture.commit("four", "four\n");
     fixture.git(&["checkout", "feature"]);
-    let sandbox = rehearse(&fixture, &["rebase", "main"]);
+    let mut sandbox = rehearse(&fixture, &["rebase", "main"]);
     let worktree = sandbox.worktree();
     std::fs::write(worktree.join("file.txt"), "resolved\n").expect("resolve");
     fixture.git_in(&worktree, &["add", "file.txt"]);
     fixture.git_in(&worktree, &["rebase", "--continue"]);
+    sandbox
+        .record(&execute::Outcome::Clean)
+        .expect("the completed outcome is recorded");
     // The user starts editing while reading the report.
     fixture.write("file.txt", "work in progress\n");
     let before = fixture.refs();
@@ -895,8 +902,9 @@ fn collision_preflight_matches_a_sha256_repository() {
             "--no-edit".to_owned(),
             "sha256-feature".to_owned(),
         ]);
-    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
-    execute::run(&sandbox.worktree(), &plan.command, None).expect("the command runs");
+    let mut sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox is created");
+    let outcome = execute::run(&sandbox.worktree(), &plan.command, None).expect("the command runs");
+    sandbox.record(&outcome).expect("the outcome is recorded");
 
     apply::run(&sandbox, NOW).expect("sha256 repository applies");
     assert_eq!(

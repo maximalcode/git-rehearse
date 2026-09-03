@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 
 use crate::analyze::{RefMove, ref_moves};
 use crate::carry::Carry;
+use crate::execute::Outcome;
 use crate::preflight::HEAD_KEY;
 use crate::sandbox::{Checkout, Sandbox};
 use crate::undo::{self, Record};
@@ -69,6 +70,7 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
     let repo = meta.repo_path.as_path();
     let worktree = sandbox.worktree();
 
+    check_outcome(meta)?;
     let rehearsed = state_of(&worktree)?;
     let moved = ref_moves(&meta.pre_state, &rehearsed);
     if moved.is_empty() {
@@ -121,6 +123,35 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         anchor,
         carried: carried.map(|carried| carried.paths.to_vec()),
     })
+}
+
+/// Refuses to transplant a rehearsal whose command did not finish cleanly.
+///
+/// The report's `can_apply` decision is enforced at every apply boundary,
+/// including `git rehearse apply` in a later process and the public apply API.
+/// This check deliberately happens before reading the sandbox refs so a
+/// stopped or failed rehearsal cannot reach fetch, undo-record, or discard
+/// code through a caller that bypasses the report flow.
+fn check_outcome(meta: &crate::sandbox::Meta) -> Result<()> {
+    match meta.result.as_ref() {
+        Some(Outcome::Clean) => Ok(()),
+        Some(Outcome::Stopped { .. }) => Err(Error::Refused(format!(
+            "rehearsal {} stopped part-way, so it has nothing that can be applied.\n\
+             The sandbox is still available — `git rehearse continue {}` to carry it on, \
+             or `git rehearse discard {}` to throw it away.",
+            meta.id, meta.id, meta.id
+        ))),
+        Some(Outcome::Failed { .. }) => Err(Error::Refused(format!(
+            "rehearsal {} failed, so it has nothing that can be applied.\n\
+             The sandbox is still available — `git rehearse discard {}` to throw it away.",
+            meta.id, meta.id
+        ))),
+        None => Err(Error::Refused(format!(
+            "rehearsal {} has no recorded outcome, so it has nothing that can be applied.\n\
+             Discard it with `git rehearse discard {}`.",
+            meta.id, meta.id
+        ))),
+    }
 }
 
 /// The uncommitted work this apply has to put back over the reset worktree.

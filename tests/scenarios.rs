@@ -48,6 +48,7 @@ fn rehearse(fixture: &Fixture, command: &[&str]) -> Rehearsal {
     // uncommitted work back — in the sandbox, before anybody is asked
     // anything.
     let outcome = carry::after_command(&mut sandbox, outcome).expect("the replay runs");
+    sandbox.record(&outcome).expect("the outcome is recorded");
     let analysis = analyze::run(
         &sandbox.worktree(),
         &plan.pre_state,
