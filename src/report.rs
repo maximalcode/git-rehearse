@@ -14,9 +14,10 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use crate::analyze::{Analysis, RefMove};
+use crate::carry::{Carry, Replay};
 use crate::execute::Outcome;
 use crate::sandbox::Meta;
-use crate::{Result, git};
+use crate::{Result, carry, git};
 
 /// How many characters of a commit id the report shows.
 const SHORT: usize = 8;
@@ -30,6 +31,43 @@ pub struct Graph {
     pub before: String,
     /// The same, for the new tip.
     pub after: String,
+}
+
+/// How much of the report gets drawn.
+///
+/// **This skips rendering, never analysis — and that is the whole design.**
+/// [`graphs`] is the only thing `StatOnly` switches off: two
+/// `git log --graph` processes per moved ref, plus a fallback walk whenever the
+/// bounded range comes back empty. Everything [`crate::analyze::run`] does still
+/// runs in full, `git range-diff` drift detection included.
+///
+/// The temptation to go further is obvious — `range-diff` is the larger cost on
+/// a big rehearsal — and it is a trap. Drift detection is what catches a rebase
+/// quietly changing what a commit does, so a fast mode that turned it off would
+/// be trading away the one check that justifies the tool for a shorter wait. The
+/// flag is called `stat-only`, not `unchecked`; the drift stat is *in* the fast
+/// output, so the analysis has to run to produce it either way. Skipping it
+/// would also mean `--stat-only --json` emitting a document with fields missing,
+/// which the schema has no way to express.
+///
+/// So: if you are here to make `--stat-only` faster, the answer is not to
+/// analyse less. It is to make the analysis cheaper for both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Detail {
+    /// The whole report, before/after graphs included.
+    #[default]
+    Full,
+    /// Everything that says *what happened*, nothing that draws *where you
+    /// were*: header, ref moves, carried work, conflicts, drift.
+    StatOnly,
+}
+
+impl Detail {
+    /// Whether the before/after graphs are worth the processes they cost.
+    #[must_use]
+    pub fn wants_graphs(self) -> bool {
+        self == Self::Full
+    }
 }
 
 /// What the user decided to do with a rehearsal.
@@ -55,10 +93,18 @@ pub enum Choice {
 /// ancestor of the old and new tip, plus the boundary commit for context.
 /// Rendering the whole history would bury the three commits that changed.
 ///
+/// This is also the one place [`Detail`] is honoured, deliberately: the graphs
+/// are the entire cost `--stat-only` avoids, and a single guard here means no
+/// caller can spawn them by forgetting. [`render`] draws no graph section for an
+/// empty slice, so the rest of the report needs to know nothing about the flag.
+///
 /// # Errors
 ///
 /// [`Error::Git`](crate::Error::Git) if the sandbox cannot be read.
-pub fn graphs(worktree: &Path, analysis: &Analysis) -> Result<Vec<Graph>> {
+pub fn graphs(worktree: &Path, analysis: &Analysis, detail: Detail) -> Result<Vec<Graph>> {
+    if !detail.wants_graphs() {
+        return Ok(Vec::new());
+    }
     let mut graphs = Vec::new();
     for moved in &analysis.ref_moves {
         // HEAD moves with its branch; drawing it twice says nothing new.
@@ -128,6 +174,16 @@ pub fn render(meta: &Meta, analysis: &Analysis, outcome: &Outcome, graphs: &[Gra
 
     match outcome {
         Outcome::Clean => {}
+        // The command finished; it is putting the uncommitted work back that
+        // stopped. Saying "the command stopped" here would send someone
+        // looking for a half-finished rebase that is not there.
+        Outcome::Stopped { .. } if carry::stopped_on_replay(meta) => {
+            let _ = writeln!(
+                out,
+                "the command ran, but your uncommitted changes did not go back on"
+            );
+            let _ = writeln!(out);
+        }
         Outcome::Stopped { conflicts } => {
             let _ = writeln!(
                 out,
@@ -151,11 +207,66 @@ pub fn render(meta: &Meta, analysis: &Analysis, outcome: &Outcome, graphs: &[Gra
     }
 
     render_refs(&mut out, &analysis.ref_moves);
+    render_carried(&mut out, meta.carry.as_ref());
     render_conflicts(&mut out, analysis);
     render_graphs(&mut out, graphs);
     render_drift(&mut out, analysis);
 
     out
+}
+
+/// What was carried through the rehearsal, and whether it came back.
+///
+/// The second half of the question, and the reason this feature exists: a
+/// report that says the rebase is fine and nothing about the work in your
+/// worktree has answered the easy half.
+fn render_carried(out: &mut String, carry: Option<&Carry>) {
+    let Some(carry) = carry else {
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "carried  {} uncommitted path(s): {}",
+        carry.paths.len(),
+        carry::describe(&carry.paths)
+    );
+    match &carry.replay {
+        None => {
+            let _ = writeln!(
+                out,
+                "  not put back — the command did not finish, so there was nothing to put them on"
+            );
+        }
+        Some(Replay::Restored { result: Some(_) }) => {
+            let _ = writeln!(out, "  they come back clean on the rehearsed history");
+        }
+        Some(Replay::Restored { result: None }) => {
+            let _ = writeln!(
+                out,
+                "  nothing comes back — the rehearsed history already contains these changes"
+            );
+        }
+        Some(Replay::Conflicted { paths }) => {
+            let _ = writeln!(
+                out,
+                "  they do NOT come back clean — {} path(s) conflict in the sandbox:",
+                paths.len()
+            );
+            for path in paths {
+                let _ = writeln!(out, "    {path}");
+            }
+        }
+        Some(Replay::Refused { reason }) => {
+            let _ = writeln!(out, "  they could not be put back: {reason}");
+        }
+        Some(Replay::NotNeeded) => {
+            let _ = writeln!(
+                out,
+                "  they stay where they are — this rehearsal does not move your worktree"
+            );
+        }
+    }
+    let _ = writeln!(out);
 }
 
 fn render_refs(out: &mut String, moves: &[RefMove]) {
@@ -383,13 +494,18 @@ fn parse(answer: &str, can_apply: bool) -> Option<Choice> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Choice, Graph, ask, can_apply, non_interactive, parse, render, short};
+    use super::{
+        Choice, Detail, Graph, ask, can_apply, graphs, non_interactive, parse, render, short,
+    };
     use crate::analyze::{Analysis, Commit, Conflict, Drift, FileChange, RefMove, Replay};
+    // Two different replays meet in this file: what happened to the *commits*
+    // (above) and what happened to the *carried changes* (below).
+    use crate::carry::{Carry, Replay as Carried};
     use crate::execute::Outcome;
     use crate::sandbox::{Checkout, META_SCHEMA, Meta, Status};
     use std::collections::BTreeMap;
     use std::io::Cursor;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn meta(command: &[&str]) -> Meta {
         Meta {
@@ -400,9 +516,22 @@ mod tests {
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
             checkout: Checkout::Branch("feature".to_owned()),
             pre_state: BTreeMap::new(),
+            carry: None,
             created_unix: 1_786_248_000,
             status: Status::Fresh,
             result: None,
+        }
+    }
+
+    /// The same, with uncommitted work carried through it.
+    fn meta_carrying(command: &[&str], replay: Option<Carried>) -> Meta {
+        Meta {
+            carry: Some(Carry {
+                snapshot: "5ea51a5h".to_owned(),
+                paths: vec!["notes.txt".to_owned(), "src/main.rs".to_owned()],
+                replay,
+            }),
+            ..meta(command)
         }
     }
 
@@ -600,6 +729,111 @@ mod tests {
     }
 
     #[test]
+    fn carried_work_that_comes_back_clean_says_so_in_one_line() {
+        let report = render(
+            &meta_carrying(
+                &["rebase", "main"],
+                Some(Carried::Restored {
+                    result: Some("re914yed".to_owned()),
+                }),
+            ),
+            &analysis(),
+            &Outcome::Clean,
+            &[],
+        );
+        assert!(
+            report.contains("carried  2 uncommitted path(s): notes.txt, src/main.rs"),
+            "{report}"
+        );
+        assert!(report.contains("come back clean"), "{report}");
+    }
+
+    #[test]
+    fn carried_work_the_new_history_already_contains_is_not_silently_dropped() {
+        // The changes are gone from the worktree after an apply, and the
+        // reason is that they are in the commits now. Saying nothing here
+        // would look exactly like losing them.
+        let report = render(
+            &meta_carrying(
+                &["rebase", "main"],
+                Some(Carried::Restored { result: None }),
+            ),
+            &analysis(),
+            &Outcome::Clean,
+            &[],
+        );
+        assert!(report.contains("nothing comes back"), "{report}");
+        assert!(report.contains("already contains"), "{report}");
+    }
+
+    #[test]
+    fn a_replay_that_conflicts_is_reported_as_the_command_having_run() {
+        // The rebase worked. What stopped is putting the uncommitted work
+        // back, and a report that said "the command stopped part-way" would
+        // send someone looking for a half-finished rebase that is not there.
+        let report = render(
+            &meta_carrying(
+                &["rebase", "main"],
+                Some(Carried::Conflicted {
+                    paths: vec!["notes.txt".to_owned()],
+                }),
+            ),
+            &analysis(),
+            &Outcome::Stopped { conflicts: true },
+            &[],
+        );
+        assert!(
+            report.contains("the command ran, but your uncommitted changes did not go back on"),
+            "{report}"
+        );
+        assert!(!report.contains("the command stopped part-way"), "{report}");
+        assert!(report.contains("do NOT come back clean"), "{report}");
+        assert!(report.contains("    notes.txt"), "{report}");
+    }
+
+    #[test]
+    fn a_replay_that_never_happened_says_why_rather_than_nothing() {
+        let stopped = render(
+            &meta_carrying(&["rebase", "main"], None),
+            &analysis(),
+            &Outcome::Stopped { conflicts: true },
+            &[],
+        );
+        assert!(stopped.contains("not put back"), "{stopped}");
+        // And the ordinary stopped-command wording is back, because this time
+        // it is the command that stopped.
+        assert!(
+            stopped.contains("the command stopped part-way"),
+            "{stopped}"
+        );
+
+        let blocked = render(
+            &meta_carrying(
+                &["--", "checkout", "-p"],
+                Some(Carried::Refused {
+                    reason: "error: your local changes would be overwritten".to_owned(),
+                }),
+            ),
+            &analysis(),
+            &Outcome::Stopped { conflicts: false },
+            &[],
+        );
+        assert!(blocked.contains("could not be put back"), "{blocked}");
+        assert!(blocked.contains("would be overwritten"), "{blocked}");
+    }
+
+    #[test]
+    fn a_rehearsal_that_carried_nothing_has_no_carried_section_at_all() {
+        let report = render(
+            &meta(&["rebase", "main"]),
+            &analysis(),
+            &Outcome::Clean,
+            &[],
+        );
+        assert!(!report.contains("carried"), "{report}");
+    }
+
+    #[test]
     fn a_stopped_command_names_the_commit_and_counts_the_hunks() {
         let mut analysis = analysis();
         analysis.stopped_at = Some(Commit {
@@ -686,6 +920,52 @@ mod tests {
             report.contains("  after\n    * bbbbbbb new tip"),
             "{report}"
         );
+    }
+
+    #[test]
+    fn stat_only_asks_for_no_graphs_and_full_asks_for_them() {
+        assert!(Detail::Full.wants_graphs());
+        assert!(!Detail::StatOnly.wants_graphs());
+        // The default is the whole report: a flag adds terseness, its absence
+        // never removes anything.
+        assert_eq!(Detail::default(), Detail::Full);
+    }
+
+    #[test]
+    fn stat_only_spawns_nothing_rather_than_spawning_and_discarding() {
+        // The path is not a repository and does not exist, so any `git log`
+        // against it fails. Coming back Ok is therefore proof that no process
+        // ran at all — which is the point of the flag. A test that only
+        // compared the two outputs would pass just as happily on an
+        // implementation that drew the graphs and then threw them away.
+        let nowhere = Path::new("/git-rehearse/no/such/worktree");
+
+        let skipped = graphs(nowhere, &analysis(), Detail::StatOnly).expect("nothing is spawned");
+        assert!(skipped.is_empty());
+
+        graphs(nowhere, &analysis(), Detail::Full)
+            .expect_err("the full report really does have to read the repository");
+    }
+
+    #[test]
+    fn a_report_without_graphs_still_says_everything_that_happened() {
+        // What `--stat-only` costs, stated as a test: the graph section, and
+        // nothing else. The drift line in particular survives — it is a result
+        // of the analysis, which the flag never touches.
+        let mut analysis = analysis();
+        analysis.drift = vec![drift(Replay {
+            changed: vec!["teach the parser about tabs".to_owned()],
+            compared: true,
+            ..Replay::default()
+        })];
+        let report = render(&meta(&["rebase", "main"]), &analysis, &Outcome::Clean, &[]);
+
+        assert!(!report.contains("graph  "), "{report}");
+        assert!(
+            report.contains("refs/heads/feature  aaaaaaaa -> bbbbbbbb"),
+            "{report}"
+        );
+        assert!(report.contains("warning: content drift"), "{report}");
     }
 
     #[test]

@@ -93,28 +93,53 @@ fn the_snapshot_becomes_the_plan_the_sandbox_is_built_from() {
 }
 
 #[test]
-fn uncommitted_changes_are_refused_and_the_files_are_named() {
+fn uncommitted_changes_are_snapshotted_rather_than_refused() {
     let fixture = Fixture::new();
     fixture.write("file.txt", "edited\n");
 
-    let message = refusal(preflight::run(fixture.repo()).expect_err("dirty is refused"));
+    let preflight =
+        preflight::run(fixture.repo()).expect("a dirty worktree is carried, not refused");
 
-    assert!(message.contains("file.txt"), "{message}");
-    assert!(message.contains("commit or stash"), "{message}");
-    assert!(
-        message.contains("v1.x"),
-        "the user should know it is coming: {message}"
+    let carry = preflight.carry.expect("the changes were snapshotted");
+    assert_eq!(carry.paths, vec!["file.txt".to_owned()]);
+    // A real commit object, holding the edit — and nothing about the worktree
+    // or the stash list has changed to make it.
+    assert_eq!(
+        fixture.git(&["show", &format!("{}:file.txt", carry.snapshot)]),
+        "edited"
+    );
+    assert_eq!(
+        fixture.git(&["stash", "list"]),
+        "",
+        "the stash list is the user's"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo().join("file.txt")).expect("worktree"),
+        "edited\n"
     );
 }
 
 #[test]
-fn untracked_files_are_not_a_refusal() {
+fn a_clean_worktree_carries_nothing() {
+    let fixture = Fixture::new();
+
+    let preflight = preflight::run(fixture.repo()).expect("a clean repository passes");
+
+    assert!(preflight.carry.is_none());
+}
+
+#[test]
+fn untracked_files_are_neither_refused_nor_carried() {
     let fixture = Fixture::new();
     fixture.write("scratch.txt", "not tracked\n");
 
     // `git rebase` runs happily with untracked files present. Refusing here
-    // would be stricter than git, which is its own kind of surprise.
-    preflight::run(fixture.repo()).expect("untracked files are not in the way");
+    // would be stricter than git, which is its own kind of surprise — and
+    // carrying them would widen what an apply has to put back, for files git
+    // was never going to touch.
+    let preflight = preflight::run(fixture.repo()).expect("untracked files are not in the way");
+
+    assert!(preflight.carry.is_none(), "{:?}", preflight.carry);
 }
 
 #[test]
@@ -233,7 +258,7 @@ fn a_repository_with_no_commits_is_refused() {
 }
 
 #[test]
-fn structural_refusals_come_before_the_dirty_worktree_one() {
+fn a_dirty_worktree_does_not_get_a_structural_refusal_out_of_the_way() {
     let fixture = Fixture::new();
     let sibling = fixture.sibling("dependency");
     fixture.git(&[
@@ -248,7 +273,8 @@ fn structural_refusals_come_before_the_dirty_worktree_one() {
 
     let message = refusal(preflight::run(fixture.repo()).expect_err("refused"));
 
-    // Being told to commit your changes, and only then being told submodules
-    // are unsupported anyway, wastes someone's afternoon.
+    // A structural refusal still comes first, and now for a second reason as
+    // well as the original one: there is no point writing a snapshot of the
+    // user's work into the object store for a rehearsal that cannot happen.
     assert!(message.contains("submodules"), "{message}");
 }

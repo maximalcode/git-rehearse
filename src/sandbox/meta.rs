@@ -16,13 +16,19 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::carry::Carry;
 use crate::execute::Outcome;
 use crate::{Error, Result};
 
 /// Version of the `meta.json` document. Bump on any incompatible change; a
 /// build that meets an unfamiliar schema refuses the rehearsal rather than
 /// half-reading it.
-pub const META_SCHEMA: u32 = 1;
+///
+/// `2` added [`Meta::carry`] (#59). Deliberately a bump rather than a quiet
+/// optional field: a rehearsal written by an older build carries no record of
+/// the uncommitted work it did *not* carry, and applying it with a build that
+/// now expects one would restore nothing while the report said otherwise.
+pub const META_SCHEMA: u32 = 2;
 
 const META_FILE: &str = "meta.json";
 const META_TMP: &str = "meta.json.tmp";
@@ -68,6 +74,13 @@ pub struct Meta {
     pub checkout: Checkout,
     /// The real repository's refs at snapshot time.
     pub pre_state: BTreeMap<String, String>,
+    /// The uncommitted work this rehearsal carries, and what became of it.
+    ///
+    /// Self-describing for the same reason everything else here is: `apply`
+    /// tomorrow has to know which changes were promised back, and prove that
+    /// they are still the ones in the worktree, without the process that
+    /// rehearsed them.
+    pub carry: Option<Carry>,
     /// Creation time, seconds since the Unix epoch (see [`crate::now_unix`]).
     pub created_unix: u64,
     /// Fresh or kept.
@@ -117,6 +130,7 @@ impl Meta {
 #[cfg(test)]
 mod tests {
     use super::{Checkout, META_SCHEMA, Meta, Status};
+    use crate::carry::{Carry, Replay};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -129,6 +143,7 @@ mod tests {
             command: vec!["rebase".to_owned(), "-i".to_owned(), "main".to_owned()],
             checkout: Checkout::Branch("feature".to_owned()),
             pre_state: BTreeMap::from([("refs/heads/main".to_owned(), "abc123".to_owned())]),
+            carry: None,
             created_unix: 1_786_248_000,
             status: Status::Fresh,
             result: None,
@@ -148,7 +163,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).expect("serialises");
         // Apply reads pre_state out of this file; the field names are part of
         // the on-disk contract that META_SCHEMA versions.
-        assert!(json.contains(r#""schema":1"#), "{json}");
+        assert!(json.contains(r#""schema":2"#), "{json}");
         assert!(
             json.contains(r#""pre_state":{"refs/heads/main":"abc123"}"#),
             "{json}"
@@ -158,6 +173,24 @@ mod tests {
             "{json}"
         );
         assert!(json.contains(r#""status":"fresh""#), "{json}");
+    }
+
+    #[test]
+    fn the_carried_work_and_its_replay_survive_the_file() {
+        // `apply` in a later process reads both out of here: which changes
+        // were promised back, and the commit that holds the rehearsed result.
+        let mut meta = sample();
+        meta.carry = Some(Carry {
+            snapshot: "5ea51a5h".to_owned(),
+            paths: vec!["src/main.rs".to_owned()],
+            replay: Some(Replay::Restored {
+                result: Some("re914yed".to_owned()),
+            }),
+        });
+        let json = serde_json::to_string(&meta).expect("serialises");
+        assert!(json.contains(r#""kind":"restored""#), "{json}");
+        let back: Meta = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(back.carry, meta.carry);
     }
 
     #[test]

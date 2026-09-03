@@ -32,6 +32,193 @@ fn a_clean_rehearsal_prints_a_report_and_exits_zero() {
 }
 
 #[test]
+fn a_rehearsed_merge_uses_repository_local_merge_drivers() {
+    let fixture = Fixture::new();
+
+    // The driver keeps our version of the file. Both branches make
+    // deliberately divergent edits so the driver, rather than Git's default
+    // merge machinery, decides whether the merge succeeds.
+    fixture.write("config.txt", "base\n");
+    fixture.write(".gitattributes", "config.txt merge=keep\n");
+    fixture.git(&["add", "config.txt", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "add merge-driver fixture"]);
+    fixture.git(&["config", "merge.keep.driver", "true"]);
+
+    fixture.git(&["checkout", "-q", "-b", "driver-feature"]);
+    fixture.write("config.txt", "feature\n");
+    fixture.git(&["commit", "-am", "feature config"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("config.txt", "main\n");
+    fixture.git(&["commit", "-am", "main config"]);
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "driver-feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept sandbox exists");
+    let rehearsed_content =
+        std::fs::read_to_string(sandbox.worktree().join("config.txt")).expect("sandbox file");
+
+    // Real Git is the independent oracle for the outcome. The sandbox must
+    // agree with it byte-for-byte while leaving the real repository untouched
+    // until the explicit merge below.
+    fixture.git(&["merge", "--no-edit", "driver-feature"]);
+    let real_content =
+        std::fs::read_to_string(fixture.repo().join("config.txt")).expect("real repository file");
+    assert_eq!(rehearsed_content, real_content);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_rehearsed_merge_preserves_non_utf8_merge_driver_commands() {
+    let fixture = Fixture::new();
+
+    fixture.write("config.txt", "base\n");
+    fixture.write(".gitattributes", "config.txt merge=raw\n");
+    fixture.git(&["add", "config.txt", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "add raw merge-driver fixture"]);
+
+    // The driver's command contains a literal byte that is not valid UTF-8.
+    // Git passes it to the shell unchanged, and the driver writes that byte
+    // into the result file. This is the independent byte-for-byte oracle.
+    let config_path = fixture.repo().join(".git/config");
+    let mut config = std::fs::read(&config_path).expect("local config");
+    config.extend_from_slice(b"[merge \"raw\"]\n\tdriver = printf '");
+    config.push(0xff);
+    config.extend_from_slice(b"' > %A\n");
+    std::fs::write(config_path, config).expect("write non-UTF-8 merge driver");
+
+    fixture.git(&["checkout", "-q", "-b", "raw-feature"]);
+    fixture.write("config.txt", "feature\n");
+    fixture.git(&["commit", "-am", "feature config"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("config.txt", "main\n");
+    fixture.git(&["commit", "-am", "main config"]);
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "raw-feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept sandbox exists");
+    let rehearsed_content =
+        std::fs::read(sandbox.worktree().join("config.txt")).expect("sandbox file");
+
+    fixture.git(&["merge", "--no-edit", "raw-feature"]);
+    let real_content =
+        std::fs::read(fixture.repo().join("config.txt")).expect("real repository file");
+    assert_eq!(rehearsed_content, real_content);
+    assert_eq!(real_content, [0xff]);
+}
+
+#[test]
+fn a_rehearsed_merge_preserves_valueless_local_merge_settings() {
+    let fixture = Fixture::new();
+
+    fixture.write("config.txt", "base\n");
+    fixture.write(".gitattributes", "config.txt merge=keep\n");
+    fixture.git(&["add", "config.txt", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "add merge-driver fixture"]);
+    fixture.git(&["config", "merge.keep.driver", "true"]);
+
+    // A valueless boolean is valid Git config and means true. This is the
+    // spelling Git emits without a key/value separator in NUL mode.
+    let config_path = fixture.repo().join(".git/config");
+    let mut config = std::fs::read_to_string(&config_path).expect("local config");
+    config.push_str("[merge]\n\trenormalize\n");
+    std::fs::write(config_path, config).expect("write valueless merge setting");
+
+    fixture.git(&["checkout", "-q", "-b", "valueless-feature"]);
+    fixture.write("config.txt", "feature\n");
+    fixture.git(&["commit", "-am", "feature config"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("config.txt", "main\n");
+    fixture.git(&["commit", "-am", "main config"]);
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "valueless-feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept sandbox exists");
+    let rehearsed_content =
+        std::fs::read_to_string(sandbox.worktree().join("config.txt")).expect("sandbox file");
+
+    fixture.git(&["merge", "--no-edit", "valueless-feature"]);
+    let real_content =
+        std::fs::read_to_string(fixture.repo().join("config.txt")).expect("real repository file");
+    assert_eq!(rehearsed_content, real_content);
+}
+
+#[test]
+fn a_valueless_local_merge_driver_keeps_git_missing_value_failure() {
+    let fixture = Fixture::new();
+
+    fixture.write("config.txt", "base\n");
+    fixture.write(".gitattributes", "config.txt merge=keep\n");
+    fixture.git(&["add", "config.txt", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "add merge-driver fixture"]);
+
+    // A valueless driver is not a boolean setting: Git must reject the merge
+    // because it has no command to execute. The sandbox must preserve that
+    // failure instead of coercing the entry into `driver = true`.
+    let config_path = fixture.repo().join(".git/config");
+    let mut config = std::fs::read_to_string(&config_path).expect("local config");
+    config.push_str("[merge \"keep\"]\n\tdriver\n");
+    std::fs::write(config_path, config).expect("write valueless merge driver");
+
+    fixture.git(&["checkout", "-q", "-b", "valueless-driver-feature"]);
+    fixture.write("config.txt", "feature\n");
+    fixture.git(&["commit", "-am", "feature config"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("config.txt", "main\n");
+    fixture.git(&["commit", "-am", "main config"]);
+
+    let (code, out, err) =
+        fixture.rehearse(&["--keep", "merge", "--no-edit", "valueless-driver-feature"]);
+    assert_eq!(code, FAILED, "{out}\n{err}");
+    assert!(err.contains("missing value"), "{out}\n{err}");
+}
+
+#[test]
+fn a_rehearsed_merge_expands_repository_local_includes_for_merge_drivers() {
+    let fixture = Fixture::new();
+
+    fixture.write("config.txt", "base\n");
+    fixture.write(".gitattributes", "config.txt merge=keep\n");
+    fixture.git(&["add", "config.txt", ".gitattributes"]);
+    fixture.git(&["commit", "-m", "add merge-driver fixture"]);
+
+    let included = fixture.base().join("merge-driver.config");
+    std::fs::write(&included, "[merge \"keep\"]\n\tdriver = true\n")
+        .expect("write included merge config");
+    let included = included.to_str().expect("included config path is UTF-8");
+    fixture.git(&["config", "--local", "include.path", included]);
+
+    fixture.git(&["checkout", "-q", "-b", "included-feature"]);
+    fixture.write("config.txt", "feature\n");
+    fixture.git(&["commit", "-am", "feature config"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("config.txt", "main\n");
+    fixture.git(&["commit", "-am", "main config"]);
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "included-feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept sandbox exists");
+    let rehearsed_content =
+        std::fs::read_to_string(sandbox.worktree().join("config.txt")).expect("sandbox file");
+
+    fixture.git(&["merge", "--no-edit", "included-feature"]);
+    let real_content =
+        std::fs::read_to_string(fixture.repo().join("config.txt")).expect("real repository file");
+    assert_eq!(rehearsed_content, real_content);
+}
+
+#[test]
 fn a_rehearsal_that_stops_on_a_conflict_exits_two() {
     let fixture = Fixture::new();
     fixture.commit("four", "four\n");
@@ -57,13 +244,17 @@ fn a_command_git_refuses_exits_three() {
 #[test]
 fn our_own_refusal_exits_four_and_explains_itself_on_stderr() {
     let fixture = Fixture::new();
-    fixture.write("file.txt", "uncommitted\n");
+    fixture.commit_file(
+        ".gitattributes",
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        "track binaries with lfs",
+    );
 
     let (code, _, err) = fixture.rehearse(&["merge", "feature"]);
 
     assert_eq!(code, REFUSED);
-    assert!(err.contains("uncommitted changes"), "{err}");
-    assert!(err.contains("commit or stash"), "{err}");
+    assert!(err.contains("Git LFS"), "{err}");
+    assert!(err.contains("not supported in v1"), "{err}");
 }
 
 #[test]
@@ -150,6 +341,83 @@ fn applying_something_that_stopped_is_refused_rather_than_half_done() {
 }
 
 #[test]
+fn applying_a_kept_stopped_cherry_pick_is_refused_and_keeps_its_sandbox() {
+    let fixture = Fixture::new();
+    // The first source commit applies to main; the second changes the same
+    // line as a commit made on main, so cherry-pick stops with main partially
+    // advanced in the sandbox.
+    fixture.git(&["checkout", "-q", "-b", "pick-source"]);
+    fixture.commit_file("first.txt", "first\n", "first pick");
+    let first = fixture.git(&["rev-parse", "HEAD"]);
+    fixture.commit("source conflict", "source\n");
+    let second = fixture.git(&["rev-parse", "HEAD"]);
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.commit("main conflict", "main\n");
+    let before = fixture.refs();
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "cherry-pick", &first, &second]);
+    assert_eq!(code, STOPPED, "{out}\n{err}");
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .into_iter()
+        .find(|sandbox| sandbox.id() == id)
+        .expect("the kept sandbox exists");
+    let sandbox_root = sandbox.root().to_owned();
+
+    let (code, _, err) = fixture.rehearse(&["apply", &id]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(err.contains("nothing that can be applied"), "{err}");
+    assert_eq!(fixture.refs(), before, "the real repository is unchanged");
+    assert!(
+        !fixture.repo().join(".git/rehearse-undo").exists(),
+        "a refused apply does not write an undo record"
+    );
+    assert!(
+        sandbox_root.exists(),
+        "the stopped sandbox remains available"
+    );
+}
+
+#[test]
+fn applying_a_kept_failed_rehearsal_is_refused_and_keeps_its_sandbox() {
+    let fixture = Fixture::new();
+    let before = fixture.refs();
+
+    let (code, out, err) = fixture.rehearse(&["--keep", "merge", "no-such-branch"]);
+    assert_eq!(code, FAILED, "{out}\n{err}");
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .into_iter()
+        .find(|sandbox| sandbox.id() == id)
+        .expect("the kept sandbox exists");
+    let sandbox_root = sandbox.root().to_owned();
+
+    let (code, _, err) = fixture.rehearse(&["apply", &id]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(
+        err.contains("failed") && err.contains("nothing that can be applied"),
+        "{err}"
+    );
+    assert_eq!(fixture.refs(), before, "the real repository is unchanged");
+    assert!(
+        sandbox_root.exists(),
+        "the failed sandbox remains available"
+    );
+}
+
+#[test]
 fn a_kept_rehearsal_can_be_listed_shown_and_applied_later() {
     let fixture = Fixture::new();
     fixture.commit_file("other.txt", "other\n", "four");
@@ -183,6 +451,33 @@ fn a_kept_rehearsal_can_be_listed_shown_and_applied_later() {
 }
 
 #[test]
+fn undo_puts_the_last_apply_back_and_then_has_nothing_left_to_do() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let before = fixture.git(&["rev-parse", "main"]);
+
+    let (code, _, err) = fixture.rehearse(&["--apply", "merge", "--no-edit", "feature"]);
+    assert_eq!(code, CLEAN, "{err}");
+    assert_ne!(fixture.git(&["rev-parse", "main"]), before);
+
+    let (code, out, err) = fixture.rehearse(&["undo"]);
+
+    assert_eq!(code, CLEAN, "{err}");
+    assert!(out.contains("put back:"), "{out}");
+    assert!(out.contains("refs/heads/main"), "{out}");
+    assert!(
+        out.contains("from the apply of rehearsal"),
+        "an undo with no prompt has to say which apply it took back: {out}"
+    );
+    assert_eq!(fixture.git(&["rev-parse", "main"]), before);
+
+    // Consumed, so the second one is a clean nothing rather than a repeat.
+    let (code, _, err) = fixture.rehearse(&["undo"]);
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(err.contains("nothing to undo"), "{err}");
+}
+
+#[test]
 fn discard_all_empties_the_cache_for_this_repository() {
     let fixture = Fixture::new();
     fixture.commit_file("other.txt", "other\n", "four");
@@ -197,6 +492,141 @@ fn discard_all_empties_the_cache_for_this_repository() {
     assert!(listed.contains("no rehearsals"), "{listed}");
 }
 
+/// Every `git log --graph` the run spawned, counted off git's own trace.
+fn graph_walks(trace: &str) -> usize {
+    trace
+        .lines()
+        .filter(|line| line.contains("log --graph"))
+        .count()
+}
+
+#[test]
+fn stat_only_does_not_spawn_the_graph_walks_it_leaves_out() {
+    // The point of the flag is the processes it does not start, not the
+    // shorter output: an implementation that walked the history and then
+    // dropped the result would satisfy every assertion about the report and
+    // none about the wait. So the trace is the assertion.
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+
+    let (code, full, _, full_trace) =
+        fixture.rehearse_traced("trace-full", &["merge", "--no-edit", "feature"]);
+    assert_eq!(code, CLEAN);
+    let (code, short, _, short_trace) = fixture.rehearse_traced(
+        "trace-stat",
+        &["--stat-only", "merge", "--no-edit", "feature"],
+    );
+    assert_eq!(code, CLEAN, "{short}");
+
+    assert!(
+        graph_walks(&full_trace) > 0,
+        "the full report walks the history: {full_trace}"
+    );
+    assert_eq!(
+        graph_walks(&short_trace),
+        0,
+        "and --stat-only walks none of it: {short_trace}"
+    );
+
+    // What is left is everything that says what happened.
+    assert!(!short.contains("graph  "), "{short}");
+    assert!(full.contains("graph  refs/heads/main"), "{full}");
+    assert!(
+        short.contains("rehearsed  git merge --no-edit feature"),
+        "{short}"
+    );
+    assert!(short.contains("refs/heads/main"), "{short}");
+}
+
+#[test]
+fn stat_only_is_a_faster_report_and_never_a_weaker_check() {
+    // The trap this guards against: "optimising" the flag further by skipping
+    // the analysis. The drift check is what catches a rebase quietly changing
+    // what a commit does, and it is exactly what the short report is read for.
+    let fixture = Fixture::new();
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+    let (_, out, _) = fixture.rehearse(&["--keep", "rebase", "main"]);
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+
+    // Resolve to something neither side said: content drift, the loud case.
+    let sandbox = sandbox::list(fixture.cache(), None)
+        .expect("the cache lists")
+        .pop()
+        .expect("the kept rehearsal is there");
+    let worktree = sandbox.worktree();
+    std::fs::write(worktree.join("file.txt"), "resolved\n").expect("resolve");
+    fixture.git_in(&worktree, &["add", "file.txt"]);
+    let (code, _, err) = fixture.rehearse(&["--keep", "--stat-only", "continue", &id]);
+    assert_eq!(code, CLEAN, "{err}");
+
+    let (code, shown, _, trace) =
+        fixture.rehearse_traced("trace-show", &["--stat-only", "show", &id]);
+
+    assert_eq!(code, CLEAN, "{shown}");
+    assert_eq!(graph_walks(&trace), 0, "{trace}");
+    assert!(
+        trace.contains("range-diff"),
+        "the drift check still runs — it is the stat the short report is for: {trace}"
+    );
+    assert!(
+        shown.contains("warning: content drift on refs/heads/feature"),
+        "{shown}"
+    );
+    assert!(shown.contains("M file.txt"), "{shown}");
+    assert!(!shown.contains("graph  "), "{shown}");
+}
+
+#[test]
+fn stat_only_alongside_json_is_a_no_op_rather_than_a_refusal() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+
+    let (code, document, err) =
+        fixture.rehearse(&["--json", "--stat-only", "merge", "--no-edit", "feature"]);
+
+    assert_eq!(code, CLEAN, "{err}");
+    // Still one document, and the same one: the JSON report never carried the
+    // graphs, so there is nothing for the flag to leave out.
+    let (_, plain, _) = fixture.rehearse(&["--json", "merge", "--no-edit", "feature"]);
+    assert_eq!(normalised(&document), normalised(&plain), "{document}");
+
+    // And --help says so, because a flag that silently does nothing is a bug
+    // report waiting to be filed.
+    let (_, help, _) = fixture.rehearse(&["--help"]);
+    assert!(help.contains("--stat-only"), "{help}");
+    assert!(
+        help.contains("with --json it does nothing at all"),
+        "{help}"
+    );
+}
+
+/// One JSON report with everything two separate runs are entitled to disagree
+/// about removed: the rehearsal id, its sandbox path, and the commit the merge
+/// produced (a merge commit carries the wall clock, so no two runs write the
+/// same one). What is left differs only if the flag changed the document.
+fn normalised(text: &str) -> serde_json::Value {
+    let mut value: serde_json::Value = serde_json::from_str(text).expect("one JSON document");
+    let object = value.as_object_mut().expect("the document is an object");
+    object.remove("id");
+    object.remove("sandbox");
+    if let Some(refs) = object
+        .get_mut("refs")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for entry in refs {
+            if let Some(entry) = entry.as_object_mut() {
+                entry.remove("after");
+            }
+        }
+    }
+    value
+}
+
 #[test]
 fn help_and_version_work_and_say_what_the_exit_codes_mean() {
     let fixture = Fixture::new();
@@ -208,6 +638,7 @@ fn help_and_version_work_and_say_what_the_exit_codes_mean() {
         "{help}"
     );
     assert!(help.contains("4 refused"), "{help}");
+    assert!(help.contains("git rehearse undo"), "{help}");
     // The two things about the exit codes that surprise people: 0 does not
     // mean "applied", and a pipe answers the question for you.
     assert!(

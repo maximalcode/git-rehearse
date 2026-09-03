@@ -1,0 +1,3 @@
+{
+  "gate_command": "cargo fmt --check && RUSTFLAGS=\"-Dwarnings\" cargo clippy --all-targets --locked && cargo test --locked"
+}

@@ -17,16 +17,18 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use super::merge_config;
 use super::meta::{META_SCHEMA, Meta};
 use super::{HOOKS_DIR, Plan, Sandbox, WORKTREE_DIR};
-use crate::{Error, Result, cache, git};
+use crate::{Error, Result, cache, carry, git};
 
 /// Builds a sandbox for `plan` under `cache_root`.
 ///
 /// The steps, in order: claim a directory, clone with `--local`, promote every
 /// branch to a local branch, strip the remote, point hooks at nothing, check
-/// out, write `meta.json`. If any step fails the directory is removed again —
-/// a half-built sandbox that still has a remote is worse than no sandbox.
+/// out, park any carried uncommitted work, write `meta.json`. If any step
+/// fails the directory is removed again — a half-built sandbox that still has
+/// a remote is worse than no sandbox.
 ///
 /// `now_unix` is passed in rather than read so the whole lifecycle is testable
 /// without waiting seven days for a prune.
@@ -93,6 +95,13 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
     disable_hooks(&worktree, &hooks)?;
     carry_config(&plan.repo, &worktree)?;
     checkout(&worktree, &plan.checkout)?;
+    // After the hooks are disabled, because this step runs git in the sandbox
+    // and a rehearsal fires none of the user's hooks — and after the checkout,
+    // because the sandbox worktree stays *clean* for the rehearsed command.
+    // The snapshot is parked as an object, not applied. See [`crate::carry`].
+    if let Some(carried) = &plan.carry {
+        carry::park(&plan.repo, &worktree, carried)?;
+    }
 
     let meta = Meta {
         schema: META_SCHEMA,
@@ -102,6 +111,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
         command: plan.command.clone(),
         checkout: plan.checkout.clone(),
         pre_state: plan.pre_state.clone(),
+        carry: plan.carry.clone(),
         created_unix: now_unix,
         status: super::Status::Fresh,
         result: None,
@@ -254,8 +264,16 @@ fn disable_hooks(worktree: &Path, hooks: &Path) -> Result<()> {
 /// right way round: a loud exit 3 is recoverable, a quiet signature downgrade
 /// is not.
 ///
-/// (`.gitattributes` needs no carrying — it is tracked content, so the clone
-/// already has it.)
+/// - the `merge.*` group: `.gitattributes` names a driver in tracked content,
+///   but the driver's command and options live in local config, so every local
+///   `merge.*` entry is carried as well. Git's NUL-delimited output keeps a
+///   driver command containing whitespace or newlines intact.
+///
+/// Branch and pull workflow settings are deliberately absent. They describe
+/// upstream/remotes rather than a merge driver's behavior, and carrying them
+/// would reintroduce assumptions about remotes that the sandbox strips.
+/// (`.gitattributes` itself needs no carrying — it is tracked content, so the
+/// clone already has it.)
 const CARRIED_CONFIG: &[&str] = &[
     "user.name",
     "user.email",
@@ -292,6 +310,45 @@ fn carry_config(repo: &Path, worktree: &Path) -> Result<()> {
             git::run(worktree, ["config", key, &value])?;
         }
     }
+    carry_merge_config(repo, worktree)?;
+    Ok(())
+}
+
+/// Carries repository-local merge drivers and merge behavior settings.
+///
+/// A merge driver is split between tracked `.gitattributes` and the local
+/// `merge.<name>.*` config section. The clone supplies the former but not the
+/// latter. `--includes` is explicit because `--local` otherwise leaves
+/// include.path expansion disabled. `--show-origin --null` makes each
+/// `origin\0key\nvalue\0` record unambiguous even when a driver command
+/// contains whitespace or a literal newline, and leaves a valueless key as
+/// `origin\0key\0` rather than making it look like a boolean.
+fn carry_merge_config(repo: &Path, worktree: &Path) -> Result<()> {
+    let Ok(config) = git::run_bytes(
+        repo,
+        [
+            "config",
+            "--local",
+            "--includes",
+            "--null",
+            "--show-origin",
+            "--get-regexp",
+            r"^merge\.",
+        ],
+    ) else {
+        return Ok(());
+    };
+
+    let entries = merge_config::parse(&config).map_err(Error::Sandbox)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let config = git::run(worktree, ["rev-parse", "--git-path", "config"])?;
+    let config_path = worktree.join(config);
+    let contents = fs::read(&config_path).map_err(Error::io(&config_path))?;
+    let transformed = merge_config::append(&contents, &entries).map_err(Error::Sandbox)?;
+    fs::write(&config_path, transformed).map_err(Error::io(&config_path))?;
     Ok(())
 }
 

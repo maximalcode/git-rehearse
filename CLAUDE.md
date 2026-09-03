@@ -77,9 +77,11 @@ prevent.
    hooks disabled by default, lives under the user cache dir, auto-pruned.
 4. **Zero telemetry, zero network, zero spend.** The tool never phones
    anywhere; CI stays on the GitHub Actions free tier.
-5. **Refuse loudly rather than guess.** Dirty worktree → refuse. Refs moved
-   between rehearse and apply → refuse. Submodules/LFS/worktrees/shallow (v1)
-   → refuse with an explanation, exit code 4.
+5. **Refuse loudly rather than guess.** Refs moved between rehearse and apply
+   → refuse. Submodules/LFS/worktrees/shallow (v1) → refuse with an
+   explanation, exit code 4. (A dirty worktree was on this list until #59; it
+   is now carried through the rehearsal, and what gets refused is a worktree
+   that no longer holds what was carried. See SCOPE.md's v1.x item 2.)
 
 ## 6. Code conventions
 
@@ -90,3 +92,57 @@ prevent.
   directories.
 - Exit codes are API from v0.1 on (0 clean / 2 conflicts / 3 failed /
   4 refused / 1 internal). Don't burn them on other meanings.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues via `gh`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default labels: `needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout: root `CONTEXT.md` and `docs/adr/`. See
+`docs/agents/domain.md`.
+
+<!-- BEGIN maxi-quality agent-guard sha256:41659a1def91ce97 -->
+
+## The gate, and how a session ends
+
+This repo's quality baseline is enforced by two hooks and one deny rule in
+`.claude/settings.json`. They are not advice — they refuse.
+
+**Run the gate through the recorder, not directly:**
+
+```bash
+"$HOME/.local/bin/quality-runtime" record-gate --root "${CLAUDE_PROJECT_DIR}" --gate
+```
+
+`--gate` runs the command this repo declares in `.claude/agent-guard.json`,
+whole and through one shell, so a gate written as `a && b` is recorded as a
+gate rather than as its first half. It passes the gate's exit code straight
+through. (`-- <command>` still works for an ad-hoc run, and is what you want
+when the thing you are running is not the declared gate.)
+
+A session cannot end while the working tree holds changes the gate has not
+seen. If it refuses, the message says which of the four cases you are in: never
+ran, ran and failed, ran something that was not this repo's gate, or ran against
+different content.
+
+**Do not write `.claude/agent-guard-receipt.json` by hand.** The `Edit` tool is
+refused on it — that is a deny rule in `.claude/settings.json`, not advice. A
+shell command still reaches the file, and nothing downstream can tell: it is
+the gate's own input, so a hand-written one passes. It is the single action
+here that turns a guard into a lie.
+
+**Do not pass `--no-verify` to `git commit` or `git push`.** That is refused
+too. It switches off this repo's commit hook, which is the last check before
+content the gate has not seen becomes a commit. If the hook is failing for a
+reason that is not your change, say so — do not route around it.
+
+
+<!-- END maxi-quality agent-guard -->

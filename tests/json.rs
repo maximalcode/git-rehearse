@@ -177,11 +177,56 @@ fn applying_reports_what_moved_and_where_the_undo_is() {
 }
 
 #[test]
+fn undoing_is_a_document_too_and_so_is_having_nothing_to_undo() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let before = fixture.git(&["rev-parse", "main"]);
+    let (_, out, _) = fixture.rehearse(&["--json", "--apply", "merge", "--no-edit", "feature"]);
+    let id = document(&out)["id"].as_str().expect("an id").to_owned();
+
+    let (code, out, err) = fixture.rehearse(&["--json", "undo"]);
+
+    assert_eq!(code, CLEAN, "{err}");
+    let json = document(&out);
+    assert_eq!(json["schema"], 1);
+    assert_eq!(json["exit_code"], 0);
+    // Which apply was taken back, since there is one record and no prompt: a
+    // caller that applied twice can tell whether this was the one it meant.
+    assert_eq!(json["rehearsal"], id.as_str());
+    assert!(json["applied_at_unix"].is_number(), "{json}");
+    assert!(
+        json["restored"]
+            .as_array()
+            .expect("restored")
+            .iter()
+            .any(|restored| restored["name"] == "refs/heads/main"),
+        "{json}"
+    );
+    assert_eq!(fixture.git(&["rev-parse", "main"]), before);
+
+    let (code, out, _) = fixture.rehearse(&["--json", "undo"]);
+    assert_eq!(code, REFUSED);
+    let json = document(&out);
+    assert_eq!(json["kind"], "refused");
+    assert!(
+        json["message"]
+            .as_str()
+            .expect("a message")
+            .contains("nothing to undo"),
+        "{json}"
+    );
+}
+
+#[test]
 fn a_failure_is_a_document_as_well() {
     // A caller that parses JSON on success and meets English on failure has to
     // parse English anyway, so every exit path emits one.
     let fixture = Fixture::new();
-    fixture.write("file.txt", "uncommitted\n");
+    fixture.commit_file(
+        ".gitattributes",
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        "track binaries with lfs",
+    );
 
     let (code, out, err) = fixture.rehearse(&["--json", "merge", "feature"]);
 
@@ -193,11 +238,11 @@ fn a_failure_is_a_document_as_well() {
         json["message"]
             .as_str()
             .expect("a message")
-            .contains("uncommitted changes"),
+            .contains("Git LFS"),
         "{json}"
     );
     // And the human still gets it on stderr, which nobody parses.
-    assert!(err.contains("uncommitted changes"), "{err}");
+    assert!(err.contains("Git LFS"), "{err}");
 }
 
 #[test]
