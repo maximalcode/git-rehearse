@@ -140,8 +140,9 @@ impl Sandbox {
         self.meta.write(&self.root)
     }
 
-    /// Marks the rehearsal as one to keep, so `list` shows it and the prune
-    /// clock is the only thing that removes it.
+    /// Marks the rehearsal as one to keep, so `list` shows it until an
+    /// explicit discard. Kept rehearsals are durable across restarts and age
+    /// pruning.
     ///
     /// # Errors
     ///
@@ -162,6 +163,12 @@ impl Sandbox {
     ///
     /// [`Error::Io`](crate::Error::Io) if the directory cannot be removed.
     pub fn discard(self) -> Result<()> {
+        if store::is_recovery_reserved(&self.meta) {
+            return Err(crate::Error::Refused(format!(
+                "rehearsal {} is reserved by an interrupted apply; recover it before discarding",
+                self.id()
+            )));
+        }
         store::remove_rehearsal(&self.root)
     }
 }

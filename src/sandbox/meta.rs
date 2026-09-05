@@ -12,9 +12,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::carry::Carry;
 use crate::execute::Outcome;
@@ -53,7 +55,8 @@ pub enum Checkout {
 pub enum Status {
     /// Created by the current run; discarded unless the user says otherwise.
     Fresh,
-    /// Kept on purpose, listed by `git rehearse list` until it ages out.
+    /// Kept on purpose, listed by `git rehearse list` until explicitly
+    /// discarded.
     Kept,
 }
 
@@ -83,7 +86,8 @@ pub struct Meta {
     pub carry: Option<Carry>,
     /// Creation time, seconds since the Unix epoch (see [`crate::now_unix`]).
     pub created_unix: u64,
-    /// Fresh or kept.
+    /// Fresh or explicitly kept. Kept metadata is durable and is not age
+    /// pruned; this makes `--keep` a reliable handoff across restarts.
     pub status: Status,
     /// How the rehearsed command ended, once it has run.
     ///
@@ -106,7 +110,9 @@ impl Meta {
         let mut json =
             serde_json::to_string_pretty(self).map_err(|e| Error::Meta(path.clone(), e))?;
         json.push('\n');
-        fs::write(&tmp, json).map_err(Error::io(&tmp))?;
+        let mut file = fs::File::create(&tmp).map_err(Error::io(&tmp))?;
+        file.write_all(json.as_bytes()).map_err(Error::io(&tmp))?;
+        file.sync_all().map_err(Error::io(&tmp))?;
         fs::rename(&tmp, &path).map_err(Error::io(&path))
     }
 
@@ -114,16 +120,45 @@ impl Meta {
     pub(super) fn read(root: &Path) -> Result<Self> {
         let path = root.join(META_FILE);
         let text = fs::read_to_string(&path).map_err(Error::io(&path))?;
-        let meta: Self = serde_json::from_str(&text).map_err(|e| Error::Meta(path.clone(), e))?;
-        if meta.schema != META_SCHEMA {
+        let mut document: Value =
+            serde_json::from_str(&text).map_err(|e| Error::Meta(path.clone(), e))?;
+        let schema = document
+            .get("schema")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                Error::Sandbox(format!(
+                    "{}: rehearsal metadata has no numeric schema",
+                    path.display()
+                ))
+            })?;
+
+        if schema == 1 {
+            // Schema 1 predates dirty-worktree carrying. Its fields retain
+            // their meanings, so the only safe migration is to add the
+            // explicit empty carry record and atomically write schema 2.
+            let object = document.as_object_mut().ok_or_else(|| {
+                Error::Sandbox(format!(
+                    "{}: rehearsal metadata is not an object",
+                    path.display()
+                ))
+            })?;
+            object.insert("schema".to_owned(), Value::from(META_SCHEMA));
+            object.insert("carry".to_owned(), Value::Null);
+            let meta: Self =
+                serde_json::from_value(document).map_err(|e| Error::Meta(path.clone(), e))?;
+            meta.write(root)?;
+            return Ok(meta);
+        }
+
+        if schema != u64::from(META_SCHEMA) {
             return Err(Error::Sandbox(format!(
-                "{}: rehearsal uses meta schema {}, this build understands {META_SCHEMA} — \
+                "{}: rehearsal uses meta schema {schema}, this build understands {META_SCHEMA} — \
                  upgrade git-rehearse, or discard the rehearsal",
-                path.display(),
-                meta.schema
+                path.display()
             )));
         }
-        Ok(meta)
+
+        serde_json::from_value(document).map_err(|e| Error::Meta(path, e))
     }
 }
 

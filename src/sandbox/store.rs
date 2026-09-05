@@ -5,10 +5,10 @@
 //! it. Nothing in this file knows how a sandbox is built, and nothing in
 //! [`super::build`] knows how one is found again.
 //!
-//! A directory that does not parse as a rehearsal is consistently *skipped*
-//! rather than reported. A foreign directory, or one left by a run killed
-//! mid-clone, must not break a listing; [`prune`] is what eventually collects
-//! it.
+//! A directory with no metadata is skipped rather than reported. A foreign
+//! directory, or one left by a run killed mid-clone, must not break a listing;
+//! [`prune`] is what eventually collects it. Once metadata exists, a parse or
+//! schema failure is surfaced as a refusal and preserved for diagnosis.
 
 use std::fs;
 use std::io;
@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use super::Sandbox;
-use super::meta::Meta;
+use super::meta::{Meta, Status};
+use crate::git;
 use crate::{Error, Result};
 
-/// How long a kept rehearsal survives without being touched: seven days.
+/// How long a transient rehearsal survives without being touched: seven days.
 pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Every rehearsal in the cache, newest last.
@@ -40,8 +41,22 @@ pub fn list(cache_root: &Path, repo_id: Option<&str>) -> Result<Vec<Sandbox>> {
             continue;
         }
         for root in subdirectories(&repo_dir)? {
-            if let Ok(meta) = Meta::read(&root) {
-                found.push(Sandbox { root, meta });
+            let metadata = root.join("meta.json");
+            match Meta::read(&root) {
+                Ok(meta) => found.push(Sandbox { root, meta }),
+                // A directory without metadata is a clone interrupted before
+                // the durable record was written. It is not a rehearsal the
+                // management API can identify, so leave it for prune.
+                Err(_error) if !metadata.exists() => {}
+                // Once metadata exists, a parse or schema failure is an
+                // identifiable but unsafe state. Refuse the listing instead
+                // of silently dropping it and inviting a destructive guess.
+                Err(error) => {
+                    return Err(Error::Refused(format!(
+                        "cannot safely read rehearsal metadata at {}: {error}",
+                        metadata.display()
+                    )));
+                }
             }
         }
     }
@@ -109,9 +124,28 @@ pub fn prune(cache_root: &Path, now_unix: u64, max_age_secs: u64) -> Result<Vec<
     let mut removed = Vec::new();
     for repo_dir in subdirectories(cache_root)? {
         for root in subdirectories(&repo_dir)? {
-            let created = Meta::read(&root)
-                .map(|meta| meta.created_unix)
-                .or_else(|_| directory_mtime(&root))?;
+            let metadata = root.join("meta.json");
+            let meta = match Meta::read(&root) {
+                Ok(meta) => Some(meta),
+                // No metadata means a clone was interrupted before it could
+                // be identified. Age pruning is the only cleanup available.
+                Err(_) if !metadata.exists() => None,
+                // Unknown or corrupt metadata is protected: deleting it
+                // would destroy the only record that could be migrated or
+                // diagnosed later.
+                Err(_) => continue,
+            };
+            if meta
+                .as_ref()
+                .is_some_and(|meta| meta.status == Status::Kept)
+            {
+                continue;
+            }
+            if meta.as_ref().is_some_and(is_recovery_reserved) {
+                continue;
+            }
+            let created =
+                meta.map_or_else(|| directory_mtime(&root), |meta| Ok(meta.created_unix))?;
             if now_unix.saturating_sub(created) <= max_age_secs {
                 continue;
             }
@@ -135,6 +169,41 @@ pub(super) fn remove_rehearsal(root: &Path) -> Result<()> {
         // Already gone is the outcome the caller wanted.
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(Error::Io(root.to_path_buf(), err)),
+    }
+}
+
+/// Whether an apply journal has claimed this rehearsal for recovery.
+///
+/// The journal belongs to the real repository and is owned by the later
+/// recovery stage. This boundary only recognizes its durable claim so cache
+/// pruning and explicit discard cannot remove the rehearsal that recovery
+/// still needs. A damaged journal is treated as reserved as well: failing
+/// closed preserves the evidence for recovery to diagnose.
+pub(super) fn is_recovery_reserved(meta: &Meta) -> bool {
+    let Ok(path) = git::run(
+        &meta.repo_path,
+        ["rev-parse", "--git-path", "rehearse-apply"],
+    ) else {
+        return false;
+    };
+    let journal = PathBuf::from(path);
+    let journal = if journal.is_absolute() {
+        journal
+    } else {
+        meta.repo_path.join(journal)
+    };
+    if !journal.is_file() {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(&journal) else {
+        return true;
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(document) => document
+            .get("rehearsal")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id == meta.id),
+        Err(_) => true,
     }
 }
 

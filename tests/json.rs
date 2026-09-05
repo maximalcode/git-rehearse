@@ -137,6 +137,16 @@ fn every_management_command_answers_in_json_too() {
     assert_eq!(json["rehearsals"][0]["id"], id.as_str());
     assert_eq!(json["rehearsals"][0]["status"], "kept");
     assert_eq!(json["rehearsals"][0]["outcome"], "stopped");
+    assert_eq!(json["rehearsals"][0]["execution"], "stopped");
+    let origin = fixture.repo().display().to_string();
+    assert_eq!(json["rehearsals"][0]["origin_worktree"], origin);
+    assert_eq!(json["rehearsals"][0]["repository"], origin);
+    assert_eq!(json["rehearsals"][0]["lifecycle"], "kept");
+    assert!(
+        json["rehearsals"][0]["storage"]["metadata"]
+            .as_str()
+            .is_some()
+    );
 
     let (code, out, _) = fixture.rehearse(&["--json", "show", &id]);
     assert_eq!(code, CLEAN);
@@ -145,6 +155,59 @@ fn every_management_command_answers_in_json_too() {
     let (code, out, _) = fixture.rehearse(&["--json", "discard", &id]);
     assert_eq!(code, CLEAN);
     assert_eq!(document(&out)["discarded"][0], id.as_str());
+}
+
+#[test]
+fn an_unfinished_rehearsal_is_reported_as_incomplete_after_restart() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(
+        &["merge", "feature"],
+        git_rehearse::sandbox::Checkout::Branch("main".to_owned()),
+    );
+    let sandbox = git_rehearse::sandbox::create(fixture.cache(), &plan, git_rehearse::now_unix())
+        .expect("sandbox exists before the command starts");
+    let id = sandbox.id().to_owned();
+
+    let (code, out, err) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let listed = document(&out);
+    assert_eq!(listed["rehearsals"][0]["id"], id);
+    assert_eq!(listed["rehearsals"][0]["execution"], "incomplete");
+    assert!(listed["rehearsals"][0]["outcome"].is_null());
+
+    let (code, out, err) = fixture.rehearse(&["--json", "show", &id]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let shown = document(&out);
+    assert_eq!(shown["execution"], "incomplete");
+    assert_eq!(shown["id"], id);
+}
+
+#[test]
+fn unknown_metadata_is_a_json_refusal_without_deletion() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(
+        &["merge", "feature"],
+        git_rehearse::sandbox::Checkout::Branch("main".to_owned()),
+    );
+    let sandbox = git_rehearse::sandbox::create(fixture.cache(), &plan, git_rehearse::now_unix())
+        .expect("sandbox");
+    let metadata = sandbox.root().join("meta.json");
+    std::fs::write(&metadata, r#"{"schema":999,"id":"preserve-me"}"#).expect("unknown metadata");
+
+    let (code, out, err) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, REFUSED, "{out}\n{err}");
+    let failure = document(&out);
+    assert_eq!(failure["kind"], "refused");
+    assert!(
+        failure["message"]
+            .as_str()
+            .expect("message")
+            .contains("schema 999")
+    );
+    assert!(
+        metadata.exists(),
+        "the unknown record remains available for diagnosis"
+    );
 }
 
 #[test]

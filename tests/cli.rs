@@ -492,6 +492,42 @@ fn discard_all_empties_the_cache_for_this_repository() {
     assert!(listed.contains("no rehearsals"), "{listed}");
 }
 
+#[test]
+fn discarding_one_id_leaves_other_retained_rehearsals_intact() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let (_, first_out, first_err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+    let first = first_out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("first rehearsal id")
+        .to_owned();
+    let (_, second_out, second_err) =
+        fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+    let second = second_out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("second rehearsal id")
+        .to_owned();
+    assert_ne!(
+        first, second,
+        "retained rehearsals need distinct ids: {first_err}{second_err}"
+    );
+
+    let (code, _, err) = fixture.rehearse(&["discard", &first]);
+    assert_eq!(code, CLEAN, "{err}");
+    let (code, listed, err) = fixture.rehearse(&["list"]);
+    assert_eq!(code, CLEAN, "{err}");
+    assert!(
+        !listed.contains(&first),
+        "selected rehearsal remains: {listed}"
+    );
+    assert!(
+        listed.contains(&second),
+        "other rehearsal was removed: {listed}"
+    );
+}
+
 /// Every `git log --graph` the run spawned, counted off git's own trace.
 fn graph_walks(trace: &str) -> usize {
     trace

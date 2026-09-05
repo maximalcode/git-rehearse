@@ -82,7 +82,7 @@ usage:
 
 options (before the command; everything after it belongs to git):
   --apply           apply without asking
-  --keep            keep the rehearsal without asking
+  --keep            keep the rehearsal durably without asking
   --json            one JSON document on stdout instead of the report
   --stat-only       the report without the before/after graphs
   --todo <file>     drive an interactive rebase from a prepared todo
@@ -805,7 +805,7 @@ fn report_applied<W: Write>(applied: &apply::Applied, output: &mut W) -> Result<
     Ok(())
 }
 
-/// Lists this repository's rehearsals, pruning expired ones first.
+/// Lists this repository's rehearsals, pruning expired transient entries first.
 fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
     let cache_root = cache::root()?;
     let pruned = sandbox::prune(&cache_root, now_unix(), DEFAULT_TTL_SECS)?;
@@ -833,6 +833,29 @@ fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
             meta.id,
             meta.status,
             meta.command.join(" ")
+        )
+        .map_err(Error::Spawn)?;
+        writeln!(
+            output,
+            "  origin {}  checkout {:?}  execution {}  storage {}",
+            meta.repo_path.display(),
+            meta.checkout,
+            meta.result
+                .as_ref()
+                .map_or("incomplete", |result| match result {
+                    Outcome::Clean => "clean",
+                    Outcome::Stopped { .. } => "stopped",
+                    Outcome::Failed { .. } => "failed",
+                }),
+            sandbox.root().display()
+        )
+        .map_err(Error::Spawn)?;
+        writeln!(
+            output,
+            "  repository-id {}  lifecycle {:?}  pre-state refs {}",
+            meta.repo_id,
+            meta.status,
+            meta.pre_state.len()
         )
         .map_err(Error::Spawn)?;
     }
@@ -864,12 +887,24 @@ fn show<W: Write>(
     let meta = sandbox.meta();
     // What the command did is remembered rather than re-derived; a rehearsal
     // that was never run is the only case with nothing to remember.
-    let outcome = meta.result.clone().ok_or_else(|| {
-        Error::Refused(format!(
-            "rehearsal {} never ran a command, so there is no report.",
-            meta.id
-        ))
-    })?;
+    let Some(outcome) = meta.result.clone() else {
+        if format == Format::Json {
+            let document = json::Entry::of(&sandbox);
+            write_json(&document, output)?;
+        } else {
+            writeln!(
+                output,
+                "rehearsal {} is incomplete: its process ended before recording an execution result\n\
+                 origin {}\n\
+                 storage {}",
+                meta.id,
+                meta.repo_path.display(),
+                sandbox.root().display()
+            )
+            .map_err(Error::Spawn)?;
+        }
+        return Ok(exit::CLEAN);
+    };
     let analysis = analyze::run(
         &sandbox.worktree(),
         &meta.pre_state,
@@ -895,6 +930,18 @@ fn show<W: Write>(
     }
 
     let graphs = report::graphs(&sandbox.worktree(), &analysis, detail)?;
+    writeln!(
+        output,
+        "origin worktree {}  repository-id {}  checkout {:?}  lifecycle {:?}  storage {}\n\
+         pre-state refs {}",
+        meta.repo_path.display(),
+        meta.repo_id,
+        meta.checkout,
+        meta.status,
+        sandbox.root().display(),
+        meta.pre_state.len()
+    )
+    .map_err(Error::Spawn)?;
     write!(
         output,
         "{}",
