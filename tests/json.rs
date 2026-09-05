@@ -8,6 +8,7 @@
 
 mod support;
 
+use git_rehearse::sandbox::DEFAULT_TTL_SECS;
 use support::Fixture;
 
 const CLEAN: i32 = 0;
@@ -326,6 +327,51 @@ fn unknown_metadata_is_a_json_refusal_without_deletion() {
     assert!(
         metadata.exists(),
         "the unknown record remains available for diagnosis"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_metadata_entry_is_refused_without_pruning_the_rehearsal() {
+    use std::fs::{self, File, FileTimes};
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, SystemTime};
+
+    let fixture = Fixture::new();
+    let (code, out, err) = fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let id = document(&out)["id"]
+        .as_str()
+        .expect("rehearsal id")
+        .to_owned();
+    let worktree = std::path::PathBuf::from(document(&out)["sandbox"].as_str().expect("sandbox"));
+    let sandbox = worktree.parent().expect("sandbox root").to_owned();
+    let metadata = sandbox.join("meta.json");
+
+    fs::remove_file(&metadata).expect("remove metadata file");
+    symlink("meta.json", &metadata).expect("self-referential metadata symlink");
+    let old = SystemTime::now() - Duration::from_secs(DEFAULT_TTL_SECS + 86_400);
+    File::open(&sandbox)
+        .expect("open rehearsal directory")
+        .set_times(FileTimes::new().set_modified(old))
+        .expect("age rehearsal directory");
+
+    let (code, out, err) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, REFUSED, "{out}\n{err}");
+    assert_eq!(document(&out)["kind"], "refused");
+    assert!(
+        document(&out)["message"]
+            .as_str()
+            .expect("refusal message")
+            .contains("meta.json")
+    );
+    assert!(
+        sandbox.is_dir(),
+        "the damaged rehearsal remains for recovery"
+    );
+    assert_eq!(
+        id,
+        sandbox.file_name().expect("sandbox id").to_string_lossy()
     );
 }
 

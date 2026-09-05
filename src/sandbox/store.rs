@@ -47,10 +47,12 @@ pub fn list(cache_root: &Path, repo_id: Option<&str>) -> Result<Vec<Sandbox>> {
                 // A directory without metadata is a clone interrupted before
                 // the durable record was written. It is not a rehearsal the
                 // management API can identify, so leave it for prune.
-                Err(_error) if !metadata.exists() => {}
+                Err(_error) if matches!(metadata_state(&metadata), MetadataState::Absent) => {}
                 // Once metadata exists, a parse or schema failure is an
                 // identifiable but unsafe state. Refuse the listing instead
                 // of silently dropping it and inviting a destructive guess.
+                // A failed presence lookup is just as ambiguous as an entry
+                // that is present: only a confirmed NotFound means orphaned.
                 Err(error) => {
                     return Err(Error::Refused(format!(
                         "cannot safely read rehearsal metadata at {}: {error}",
@@ -129,10 +131,11 @@ pub fn prune(cache_root: &Path, now_unix: u64, max_age_secs: u64) -> Result<Vec<
                 Ok(meta) => Some(meta),
                 // No metadata means a clone was interrupted before it could
                 // be identified. Age pruning is the only cleanup available.
-                Err(_) if !metadata.exists() => None,
+                Err(_) if matches!(metadata_state(&metadata), MetadataState::Absent) => None,
                 // Unknown or corrupt metadata is protected: deleting it
                 // would destroy the only record that could be migrated or
-                // diagnosed later.
+                // diagnosed later. An error checking whether metadata exists
+                // is protected for the same reason.
                 Err(_) => continue,
             };
             if meta
@@ -230,6 +233,27 @@ fn subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     dirs.sort();
     Ok(dirs)
+}
+
+/// The only filesystem result that proves a metadata entry is absent.
+///
+/// `Path::exists` follows symlinks and collapses every lookup failure into
+/// `false`. That would turn a damaged or unreadable metadata entry into an
+/// apparently orphaned clone and let age pruning delete it. Inspect the
+/// directory entry itself so broken symlinks and other failures stay visible.
+#[derive(Debug)]
+enum MetadataState {
+    Present,
+    Absent,
+    Unknown,
+}
+
+fn metadata_state(path: &Path) -> MetadataState {
+    match fs::symlink_metadata(path) {
+        Ok(_) => MetadataState::Present,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => MetadataState::Absent,
+        Err(_) => MetadataState::Unknown,
+    }
 }
 
 /// A directory's modification time, in seconds since the Unix epoch.
