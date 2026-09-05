@@ -194,8 +194,13 @@ pub(super) fn is_recovery_reserved(meta: &Meta) -> bool {
     } else {
         meta.repo_path.join(journal)
     };
-    if !journal.is_file() {
-        return false;
+    match fs::symlink_metadata(&journal) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        // Only a confirmed absence says there is no recovery owner. Existing
+        // directories, symlinks, and other file types are ambiguous and must
+        // be preserved for recovery to inspect.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Ok(_) | Err(_) => return true,
     }
     let Ok(text) = fs::read_to_string(&journal) else {
         return true;

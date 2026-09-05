@@ -500,6 +500,12 @@ fn resume<W: Write>(
     output: &mut W,
 ) -> Result<u8> {
     let mut sandbox = find(id, cwd)?;
+    let stopped_on_replay = carry::stopped_on_replay(sandbox.meta());
+    if stopped_on_replay {
+        carry::validate_resume(&sandbox)?;
+    } else {
+        execute::validate_resume(&sandbox.worktree())?;
+    }
     sandbox.begin_execution()?;
     // Which half stopped decides what carrying on means. A rehearsal waiting
     // on its replay has no operation for `git … --continue` to advance: what

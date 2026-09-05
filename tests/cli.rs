@@ -6,6 +6,8 @@
 
 mod support;
 
+use git_rehearse::cache;
+use git_rehearse::execute::Outcome;
 use git_rehearse::sandbox;
 use support::Fixture;
 
@@ -918,4 +920,24 @@ fn continuing_something_that_is_not_stopped_is_refused() {
 
     assert_eq!(code, REFUSED, "{err}");
     assert!(err.contains("nothing in progress"), "{err}");
+}
+
+#[test]
+fn refusing_to_continue_preserves_the_completed_result() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let (_, out, _) = fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+
+    let (code, _, err) = fixture.rehearse(&["continue", &id]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(err.contains("nothing in progress"), "{err}");
+    let sandbox = sandbox::find(fixture.cache(), &cache::repo_id(fixture.repo()), Some(&id))
+        .expect("the completed rehearsal remains findable");
+    assert_eq!(sandbox.meta().result, Some(Outcome::Clean));
 }

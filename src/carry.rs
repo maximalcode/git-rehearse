@@ -380,6 +380,7 @@ fn moves_the_worktree(worktree: &Path, meta: &Meta) -> bool {
 /// [`Error::Refused`] if paths are still unmerged, or if there is nothing
 /// waiting. [`Error::Git`] if the sandbox cannot be read.
 pub fn resume(sandbox: &mut Sandbox) -> Result<Outcome> {
+    validate_resume(sandbox)?;
     let worktree = sandbox.worktree();
     let waiting = sandbox
         .meta()
@@ -390,23 +391,9 @@ pub fn resume(sandbox: &mut Sandbox) -> Result<Outcome> {
         .cloned();
 
     let replay = match waiting {
-        Some(Replay::Conflicted { .. }) => {
-            // Refused before anything is captured, and with the same words
-            // `continue` uses for a stopped command: a stash commit made over
-            // unmerged entries would bake the conflict markers in.
-            let unmerged = execute::unmerged(&worktree)?;
-            if !unmerged.is_empty() {
-                return Err(Error::Refused(format!(
-                    "{} path(s) are still unmerged in the sandbox:\n  {}\n\
-                     Resolve them and `git add` them there, then continue.",
-                    unmerged.len(),
-                    unmerged.join("\n  ")
-                )));
-            }
-            Replay::Restored {
-                result: capture(&worktree)?,
-            }
-        }
+        Some(Replay::Conflicted { .. }) => Replay::Restored {
+            result: capture(&worktree)?,
+        },
         Some(Replay::Refused { .. }) => replay(&worktree)?,
         Some(Replay::Restored { .. } | Replay::NotNeeded) | None => {
             return Err(Error::Refused(
@@ -420,6 +407,37 @@ pub fn resume(sandbox: &mut Sandbox) -> Result<Outcome> {
     let outcome = replay.outcome();
     sandbox.record_replay(replay)?;
     Ok(outcome)
+}
+
+/// Checks that carried work is waiting for a continuation without changing
+/// the sandbox metadata or worktree.
+pub fn validate_resume(sandbox: &Sandbox) -> Result<()> {
+    let waiting = sandbox
+        .meta()
+        .carry
+        .as_ref()
+        .and_then(|carry| carry.replay.as_ref())
+        .filter(|replay| replay.is_unfinished());
+    match waiting {
+        Some(Replay::Conflicted { .. }) => {
+            let unmerged = execute::unmerged(&sandbox.worktree())?;
+            if !unmerged.is_empty() {
+                return Err(Error::Refused(format!(
+                    "{} path(s) are still unmerged in the sandbox:\n  {}\n\
+                     Resolve them and `git add` them there, then continue.",
+                    unmerged.len(),
+                    unmerged.join("\n  ")
+                )));
+            }
+            Ok(())
+        }
+        Some(Replay::Refused { .. }) => Ok(()),
+        Some(Replay::Restored { .. } | Replay::NotNeeded) | None => Err(Error::Refused(
+            "this rehearsal has nothing in progress — there is nothing to continue.\n\
+             `git rehearse show` prints the report again; `apply` transplants it."
+                .to_owned(),
+        )),
+    }
 }
 
 /// Captures the sandbox worktree as a commit, parked so nothing collects it.
