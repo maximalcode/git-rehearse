@@ -482,6 +482,28 @@ fn discard_protects_a_rehearsal_claimed_by_an_apply_journal() {
 }
 
 #[test]
+fn discard_protects_a_rehearsal_when_the_apply_claim_is_unreadable() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox");
+    std::fs::write(
+        fixture.repo().join(".git/rehearse-apply"),
+        serde_json::json!({"phase": "refs_applied", "rehearsal": null}).to_string(),
+    )
+    .expect("damaged apply journal");
+
+    let error = sandbox
+        .discard()
+        .expect_err("unreadable recovery ownership is protected");
+    assert!(
+        error
+            .to_string()
+            .contains("reserved by an interrupted apply"),
+        "{error}"
+    );
+}
+
+#[test]
 fn prune_collects_a_directory_that_never_got_a_meta_file() {
     let fixture = Fixture::new();
     // What a run killed mid-clone leaves behind: no meta.json, so nothing but

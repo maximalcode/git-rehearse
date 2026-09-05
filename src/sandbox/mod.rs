@@ -122,6 +122,16 @@ impl Sandbox {
         self.meta.write(&self.root)
     }
 
+    /// Invalidates the previous execution before a continuation starts.
+    ///
+    /// A continuation can be killed after Git has begun but before it returns
+    /// an outcome. Keeping the preceding `Stopped` result in that case would
+    /// make a later process report the interrupted attempt as if it completed.
+    pub fn begin_execution(&mut self) -> Result<()> {
+        self.meta.result = None;
+        self.meta.write(&self.root)
+    }
+
     /// Records what became of the carried uncommitted work.
     ///
     /// Separate from [`Sandbox::record`] because the two are answered at

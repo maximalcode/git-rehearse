@@ -500,6 +500,7 @@ fn resume<W: Write>(
     output: &mut W,
 ) -> Result<u8> {
     let mut sandbox = find(id, cwd)?;
+    sandbox.begin_execution()?;
     // Which half stopped decides what carrying on means. A rehearsal waiting
     // on its replay has no operation for `git … --continue` to advance: what
     // it is waiting for is the resolution in the sandbox worktree, which
@@ -565,7 +566,14 @@ fn report_and_decide<W: Write>(
         write_next_steps(&sandbox, &worktree, will_prompt, output)?;
     }
 
-    let choice = choose(decision, will_prompt, can_apply, outcome, output)?;
+    let choice = choose(
+        decision,
+        will_prompt,
+        sandbox.meta().status == Status::Kept,
+        can_apply,
+        outcome,
+        output,
+    )?;
     if choice == Choice::Apply && !can_apply {
         return Err(refuse_apply(sandbox, outcome));
     }
@@ -627,9 +635,11 @@ fn decide_as_json<W: Write>(
     can_apply: bool,
     output: &mut W,
 ) -> Result<()> {
+    let already_kept = sandbox.meta().status == Status::Kept;
     let choice = match decision {
         Decision::Apply => Choice::Apply,
         Decision::Keep => Choice::Keep,
+        Decision::Ask if already_kept => Choice::Keep,
         Decision::Ask => report::non_interactive(outcome),
     };
     if choice == Choice::Apply && !can_apply {
@@ -715,6 +725,7 @@ fn code_for_outcome(outcome: &Outcome) -> u8 {
 fn choose<W: Write>(
     decision: Decision,
     will_prompt: bool,
+    already_kept: bool,
     can_apply: bool,
     outcome: &Outcome,
     output: &mut W,
@@ -727,7 +738,11 @@ fn choose<W: Write>(
         // has to be announced, because nothing else in the output would reveal
         // that a question was skipped at all.
         Decision::Ask => {
-            let choice = report::non_interactive(outcome);
+            let choice = if already_kept {
+                Choice::Keep
+            } else {
+                report::non_interactive(outcome)
+            };
             let notice = if choice == Choice::Keep {
                 NOT_A_TERMINAL_STOPPED
             } else {
@@ -889,7 +904,7 @@ fn show<W: Write>(
     // that was never run is the only case with nothing to remember.
     let Some(outcome) = meta.result.clone() else {
         if format == Format::Json {
-            let document = json::Entry::of(&sandbox);
+            let document = json::Incomplete::of(&sandbox);
             write_json(&document, output)?;
         } else {
             writeln!(

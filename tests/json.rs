@@ -178,8 +178,127 @@ fn an_unfinished_rehearsal_is_reported_as_incomplete_after_restart() {
     let (code, out, err) = fixture.rehearse(&["--json", "show", &id]);
     assert_eq!(code, CLEAN, "{out}\n{err}");
     let shown = document(&out);
+    assert_eq!(shown["schema"], 1);
     assert_eq!(shown["execution"], "incomplete");
     assert_eq!(shown["id"], id);
+}
+
+#[test]
+fn continuing_a_retained_rehearsal_keeps_it_without_a_new_decision() {
+    let fixture = Fixture::new();
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+
+    let (code, out, err) = fixture.rehearse(&["--json", "--keep", "rebase", "main"]);
+    assert_eq!(code, STOPPED, "{err}");
+    let first = document(&out);
+    let id = first["id"].as_str().expect("an id").to_owned();
+    let sandbox = std::path::PathBuf::from(first["sandbox"].as_str().expect("a sandbox"));
+    std::fs::write(sandbox.join("file.txt"), "resolved\n").expect("resolve");
+    fixture.git_in(&sandbox, &["add", "file.txt"]);
+
+    let (code, out, err) = fixture.rehearse(&["--json", "continue", &id]);
+    assert_eq!(code, CLEAN, "{err}");
+    assert_eq!(document(&out)["decision"], "kept");
+
+    let (code, out, err) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, CLEAN, "{err}");
+    assert_eq!(document(&out)["rehearsals"][0]["id"], id);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_killed_continuation_is_reported_incomplete_after_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+
+    let fixture = Fixture::new();
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+    let (code, out, err) = fixture.rehearse(&["--json", "--keep", "rebase", "main"]);
+    assert_eq!(code, STOPPED, "{err}");
+    let first = document(&out);
+    let id = first["id"].as_str().expect("an id").to_owned();
+    let sandbox = std::path::PathBuf::from(first["sandbox"].as_str().expect("a sandbox"));
+    std::fs::write(sandbox.join("file.txt"), "resolved\n").expect("resolve");
+    fixture.git_in(&sandbox, &["add", "file.txt"]);
+
+    let editor = fixture.base().join("blocking-editor.sh");
+    let marker = fixture.base().join("editor-started");
+    let editor_pid = fixture.base().join("editor-pid");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$EDITOR_PID\"\ntouch \"$EDITOR_MARKER\"\nwhile :; do sleep 1; done\n",
+    )
+    .expect("editor script");
+    let mut permissions = std::fs::metadata(&editor)
+        .expect("editor metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&editor, permissions).expect("editor executable");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+        .args(["--json", "--keep", "continue", &id])
+        .current_dir(fixture.repo())
+        .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
+        .env("GIT_EDITOR", &editor)
+        .env("EDITOR_MARKER", &marker)
+        .env("EDITOR_PID", &editor_pid)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("continuation starts");
+    for _ in 0..500 {
+        if marker.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        marker.exists(),
+        "the continuation reached the blocking editor"
+    );
+
+    child.kill().expect("kill continuation");
+    let pid = std::fs::read_to_string(&editor_pid).expect("editor pid");
+    let status = Command::new("kill")
+        .args(["-KILL", pid.trim()])
+        .status()
+        .expect("kill process group");
+    assert!(status.success(), "kill process group succeeded");
+    let _ = child.wait().expect("continuation exits after kill");
+
+    let (code, out, err) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    assert_eq!(document(&out)["rehearsals"][0]["execution"], "incomplete");
+}
+
+#[test]
+fn unavailable_origin_repository_has_no_substituted_repository_identity() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(
+        &["merge", "feature"],
+        git_rehearse::sandbox::Checkout::Branch("main".to_owned()),
+    );
+    let sandbox = git_rehearse::sandbox::create(fixture.cache(), &plan, git_rehearse::now_unix())
+        .expect("sandbox");
+    let metadata = sandbox.root().join("meta.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&metadata).expect("metadata"))
+            .expect("metadata json");
+    value["repo_path"] = serde_json::json!(fixture.base().join("repository-is-gone"));
+    std::fs::write(
+        &metadata,
+        serde_json::to_vec(&value).expect("metadata json"),
+    )
+    .expect("write metadata");
+
+    let (code, out, err) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    assert!(document(&out)["rehearsals"][0]["repository_id"].is_null());
 }
 
 #[test]

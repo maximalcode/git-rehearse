@@ -27,8 +27,6 @@
 //! output, drawn for a person; a caller that wants the shape of the history has
 //! the commit ids here and a git of its own.
 
-use std::path::PathBuf;
-
 use serde::Serialize;
 
 use crate::analyze::{Analysis, Commit, Conflict, Drift, FileChange, RefMove};
@@ -228,7 +226,9 @@ pub struct Report {
     /// The originating worktree. Kept separate from the repository identity
     /// because one repository can have several checkouts.
     pub origin_worktree: String,
-    pub repository_id: String,
+    /// Stable shared-repository identity, or `null` when the origin cannot be
+    /// inspected. A cache path hash is not a valid substitute.
+    pub repository_id: Option<String>,
     pub checkout: Checkout,
     pub pre_state: std::collections::BTreeMap<String, String>,
     pub lifecycle: String,
@@ -281,7 +281,9 @@ pub struct Entry {
     pub command: Vec<String>,
     pub repository: String,
     pub origin_worktree: String,
-    pub repository_id: String,
+    /// Stable shared-repository identity, or `null` when the origin cannot be
+    /// inspected. A cache path hash is not a valid substitute.
+    pub repository_id: Option<String>,
     pub checkout: Checkout,
     pub pre_state: std::collections::BTreeMap<String, String>,
     pub sandbox: String,
@@ -297,6 +299,26 @@ pub struct Entry {
     pub execution: String,
     pub lifecycle: String,
     pub storage: Storage,
+}
+
+/// The schema-versioned document returned by `show` when execution was
+/// interrupted before an outcome was recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Incomplete {
+    pub schema: u32,
+    #[serde(flatten)]
+    pub entry: Entry,
+}
+
+impl Incomplete {
+    /// Builds the incomplete `show` document from the durable entry.
+    #[must_use]
+    pub fn of(sandbox: &Sandbox) -> Self {
+        Self {
+            schema: SCHEMA,
+            entry: Entry::of(sandbox),
+        }
+    }
 }
 
 /// Durable paths and existence information for a rehearsal.
@@ -549,10 +571,10 @@ fn storage(sandbox: &Sandbox) -> Storage {
 /// Stable identity for the shared Git repository, separate from the
 /// worktree-specific cache key. Linked worktrees report the same common Git
 /// directory here while retaining separate rehearsal storage roots.
-fn repository_identity(meta: &Meta) -> String {
+fn repository_identity(meta: &Meta) -> Option<String> {
     let common = git::run(&meta.repo_path, ["rev-parse", "--git-common-dir"])
         .ok()
-        .map(PathBuf::from)
+        .map(std::path::PathBuf::from)
         .map(|path| {
             if path.is_absolute() {
                 path
@@ -561,9 +583,7 @@ fn repository_identity(meta: &Meta) -> String {
             }
         })
         .and_then(|path| git::canonicalize(&path).ok());
-    common
-        .as_deref()
-        .map_or_else(|| meta.repo_id.clone(), cache::repo_id)
+    common.as_deref().map(cache::repo_id)
 }
 
 fn reference(moved: &RefMove) -> Ref {
@@ -714,7 +734,7 @@ mod tests {
             id: "1786281796-00".to_owned(),
             repository: "/repo".to_owned(),
             origin_worktree: "/repo".to_owned(),
-            repository_id: "repo-id".to_owned(),
+            repository_id: Some("repo-id".to_owned()),
             checkout: crate::sandbox::Checkout::Branch("main".to_owned()),
             pre_state: std::collections::BTreeMap::new(),
             lifecycle: "kept".to_owned(),

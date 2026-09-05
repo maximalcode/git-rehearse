@@ -184,7 +184,9 @@ pub(super) fn is_recovery_reserved(meta: &Meta) -> bool {
         &meta.repo_path,
         ["rev-parse", "--git-path", "rehearse-apply"],
     ) else {
-        return false;
+        // If the originating repository cannot be inspected, ownership is
+        // unknown. Preserve the sandbox until recovery can make that call.
+        return true;
     };
     let journal = PathBuf::from(path);
     let journal = if journal.is_absolute() {
@@ -202,7 +204,7 @@ pub(super) fn is_recovery_reserved(meta: &Meta) -> bool {
         Ok(document) => document
             .get("rehearsal")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| id == meta.id),
+            .is_none_or(|id| id == meta.id),
         Err(_) => true,
     }
 }
