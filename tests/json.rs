@@ -221,38 +221,63 @@ fn continuing_a_retained_rehearsal_keeps_it_without_a_new_decision() {
 #[cfg(unix)]
 #[test]
 fn an_explicitly_kept_initial_run_survives_interruption_and_age_pruning() {
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
     let fixture = Fixture::new();
     let marker = fixture.base().join("editor-started");
+    let editor = fixture.base().join("blocking-editor.sh");
+    let stderr = fixture.base().join("rehearsal-stderr");
+    // Git supplies the message path as an argument. A script ignores that
+    // argument instead of accidentally passing it on to sleep.
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\ntouch \"$EDITOR_MARKER\"\nexec sleep 60\n",
+    )
+    .expect("blocking editor script");
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755))
+        .expect("editor executable");
     let mut child = Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
         .args(["--json", "--keep", "merge", "--no-ff", "--edit", "feature"])
         .current_dir(fixture.repo())
         .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
-        .env("GIT_EDITOR", "touch \"$EDITOR_MARKER\"; sleep 60")
+        .env("GIT_EDITOR", &editor)
         .env("EDITOR_MARKER", &marker)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&stderr).expect("rehearsal stderr"))
         .process_group(0)
         .spawn()
         .expect("rehearsal starts");
-    for _ in 0..1000 {
-        if marker.exists() {
+    for _ in 0..3000 {
+        if marker.exists() || child.try_wait().expect("check rehearsal status").is_some() {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    // Stop Git and its editor too, before any assertion can end the test.
+    let was_running = child.try_wait().expect("check rehearsal status").is_none();
+    // Kill the CLI first so Git's death cannot be recorded as a completed
+    // outcome. Then stop Git and its editor before any assertion can panic.
+    if was_running {
+        child.kill().expect("interrupt rehearsal");
+    }
     let killed = Command::new("kill")
         .args(["-KILL", &format!("-{}", child.id())])
         .status()
         .expect("kill rehearsal process group");
     child.wait().expect("reap rehearsal");
+    assert!(
+        marker.exists(),
+        "the merge reached its editor: {}",
+        std::fs::read_to_string(&stderr).expect("rehearsal stderr")
+    );
+    assert!(
+        was_running,
+        "the rehearsal was still running before interruption"
+    );
     assert!(killed.success(), "the rehearsal process group was killed");
-    assert!(marker.exists(), "the merge reached its editor");
 
     let (code, out, err) = fixture.rehearse(&["--json", "list"]);
     assert_eq!(code, CLEAN, "{out}\n{err}");
