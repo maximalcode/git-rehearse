@@ -463,6 +463,10 @@ fn rehearse<W: Write>(
     let plan = preflight::run(cwd)?.into_plan(command.to_vec());
     let cache_root = cache::root()?;
     let mut sandbox = sandbox::create(&cache_root, &plan, now_unix())?;
+    if decision == Decision::Keep {
+        // Retention must survive a kill while Git or its editor is running.
+        sandbox.keep()?;
+    }
 
     let todo = todo.map(Todo::new).transpose()?;
     let outcome = execute::run_with(
@@ -874,7 +878,9 @@ fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
         writeln!(
             output,
             "  repository-id {}  lifecycle {:?}  pre-state refs {}",
-            meta.repo_id,
+            json::repository_identity(meta)
+                .as_deref()
+                .unwrap_or("unavailable"),
             meta.status,
             meta.pre_state.len()
         )
@@ -917,9 +923,11 @@ fn show<W: Write>(
                 output,
                 "rehearsal {} is incomplete: its process ended before recording an execution result\n\
                  origin {}\n\
+                 repository-id {}\n\
                  storage {}",
                 meta.id,
                 meta.repo_path.display(),
+                json::repository_identity(meta).as_deref().unwrap_or("unavailable"),
                 sandbox.root().display()
             )
             .map_err(Error::Spawn)?;
@@ -956,7 +964,9 @@ fn show<W: Write>(
         "origin worktree {}  repository-id {}  checkout {:?}  lifecycle {:?}  storage {}\n\
          pre-state refs {}",
         meta.repo_path.display(),
-        meta.repo_id,
+        json::repository_identity(meta)
+            .as_deref()
+            .unwrap_or("unavailable"),
         meta.checkout,
         meta.status,
         sandbox.root().display(),

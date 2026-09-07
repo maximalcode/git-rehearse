@@ -571,7 +571,7 @@ fn storage(sandbox: &Sandbox) -> Storage {
 /// Stable identity for the shared Git repository, separate from the
 /// worktree-specific cache key. Linked worktrees report the same common Git
 /// directory here while retaining separate rehearsal storage roots.
-fn repository_identity(meta: &Meta) -> Option<String> {
+pub(crate) fn repository_identity(meta: &Meta) -> Option<String> {
     let common = git::run(&meta.repo_path, ["rev-parse", "--git-common-dir"])
         .ok()
         .map(std::path::PathBuf::from)

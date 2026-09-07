@@ -209,6 +209,68 @@ fn continuing_a_retained_rehearsal_keeps_it_without_a_new_decision() {
 
 #[cfg(unix)]
 #[test]
+fn an_explicitly_kept_initial_run_survives_interruption_and_age_pruning() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let fixture = Fixture::new();
+    let marker = fixture.base().join("editor-started");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+        .args(["--json", "--keep", "merge", "--no-ff", "--edit", "feature"])
+        .current_dir(fixture.repo())
+        .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
+        .env("GIT_EDITOR", "touch \"$EDITOR_MARKER\"; sleep 60")
+        .env("EDITOR_MARKER", &marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("rehearsal starts");
+    for _ in 0..1000 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Stop Git and its editor too, before any assertion can end the test.
+    let killed = Command::new("kill")
+        .args(["-KILL", &format!("-{}", child.id())])
+        .status()
+        .expect("kill rehearsal process group");
+    child.wait().expect("reap rehearsal");
+    assert!(killed.success(), "the rehearsal process group was killed");
+    assert!(marker.exists(), "the merge reached its editor");
+
+    let (code, out, err) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let listing = document(&out);
+    let entry = &listing["rehearsals"][0];
+    let id = entry["id"].as_str().expect("rehearsal id");
+    let metadata = entry["storage"]["metadata"]
+        .as_str()
+        .expect("metadata path");
+    // Move only the clock input forward relative to this record. Retention
+    // and execution state remain exactly as the interrupted CLI wrote them.
+    let mut saved = document(&std::fs::read_to_string(metadata).expect("metadata"));
+    saved["created_unix"] = serde_json::json!(1);
+    std::fs::write(metadata, serde_json::to_vec(&saved).expect("metadata JSON"))
+        .expect("age rehearsal");
+
+    let (code, out, err) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let listing = document(&out);
+    assert_eq!(listing["rehearsals"][0]["id"], id);
+    assert_eq!(listing["rehearsals"][0]["lifecycle"], "kept");
+    assert_eq!(listing["rehearsals"][0]["execution"], "incomplete");
+    let (code, out, err) = fixture.rehearse(&["--json", "show", id]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    assert_eq!(document(&out)["execution"], "incomplete");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_killed_continuation_is_reported_incomplete_after_restart() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
@@ -278,6 +340,27 @@ fn a_killed_continuation_is_reported_incomplete_after_restart() {
 }
 
 #[test]
+fn text_and_json_management_report_the_same_repository_identity() {
+    let fixture = Fixture::new();
+    let (code, out, err) = fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let report = document(&out);
+    let id = report["id"].as_str().expect("rehearsal id");
+    let repository_id = report["repository_id"]
+        .as_str()
+        .expect("repository identity");
+
+    for args in [vec!["list"], vec!["--stat-only", "show", id]] {
+        let (code, out, err) = fixture.rehearse(&args);
+        assert_eq!(code, CLEAN, "{out}\n{err}");
+        assert!(
+            out.contains(&format!("repository-id {repository_id} ")),
+            "text output must identify the same repository as JSON: {out}"
+        );
+    }
+}
+
+#[test]
 fn unavailable_origin_repository_has_no_substituted_repository_identity() {
     let fixture = Fixture::new();
     let plan = fixture.plan(
@@ -300,6 +383,12 @@ fn unavailable_origin_repository_has_no_substituted_repository_identity() {
     let (code, out, err) = fixture.rehearse(&["--json", "list"]);
     assert_eq!(code, CLEAN, "{out}\n{err}");
     assert!(document(&out)["rehearsals"][0]["repository_id"].is_null());
+
+    for args in [vec!["list"], vec!["show", sandbox.id()]] {
+        let (code, out, err) = fixture.rehearse(&args);
+        assert_eq!(code, CLEAN, "{out}\n{err}");
+        assert!(out.contains("repository-id unavailable"), "{out}");
+    }
 }
 
 #[test]

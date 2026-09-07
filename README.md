@@ -404,7 +404,9 @@ repository untouched until that last step.
 
 `list` and `show` include the exact rehearsal id, originating worktree,
 repository identity, checkout and pre-state refs, lifecycle, storage paths,
-and execution state. A rehearsal whose process ended before writing a result
+and execution state. Text and JSON output use the same shared-repository
+identity; if the origin cannot be resolved, text reports `unavailable` and
+JSON reports `null`. A rehearsal whose process ended before writing a result
 is reported as `incomplete`; it is never treated as a clean rehearsal or made
 applyable by inference. Management commands require an unambiguous id prefix.
 
@@ -516,7 +518,9 @@ macOS, `%LOCALAPPDATA%\git-rehearse` on Windows, `$XDG_CACHE_HOME` or
 `~/.cache/git-rehearse` elsewhere. Override with `GIT_REHEARSE_CACHE_DIR`.
 
 A rehearsal explicitly kept with `--keep` is durable until you explicitly
-discard it. Transient rehearsals and interrupted clone directories are pruned
+discard it. Retention is saved before the rehearsed Git command starts, so an
+interruption during execution or in its editor does not make it expire.
+Transient rehearsals and interrupted clone directories are pruned
 after seven days; unknown or damaged metadata and rehearsals reserved by an
 interrupted apply are preserved. A discarded one is gone immediately. The clone hardlinks your object store rather than copying it, so
 a sandbox costs almost nothing on disk, and deleting one can never touch your
