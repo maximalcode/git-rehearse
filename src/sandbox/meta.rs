@@ -96,6 +96,9 @@ pub struct Meta {
     /// re-running anything, and re-deriving that from the sandbox's state
     /// would be guessing at what git did rather than remembering it.
     pub result: Option<Outcome>,
+    /// Optional extensions survive migration and later metadata updates.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 impl Meta {
@@ -182,6 +185,7 @@ mod tests {
             created_unix: 1_786_248_000,
             status: Status::Fresh,
             result: None,
+            extensions: BTreeMap::new(),
         }
     }
 

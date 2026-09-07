@@ -115,6 +115,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
         created_unix: now_unix,
         status: super::Status::Fresh,
         result: None,
+        extensions: std::collections::BTreeMap::new(),
     };
     meta.write(root)?;
     Ok(meta)

@@ -182,6 +182,17 @@ fn an_unfinished_rehearsal_is_reported_as_incomplete_after_restart() {
     assert_eq!(shown["schema"], 1);
     assert_eq!(shown["execution"], "incomplete");
     assert_eq!(shown["id"], id);
+
+    let (code, out, err) = fixture.rehearse(&["show", &id]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    for detail in [
+        "checkout Branch(\"main\")",
+        "lifecycle Fresh",
+        "pre-state refs 3",
+        "execution incomplete",
+    ] {
+        assert!(out.contains(detail), "missing {detail}: {out}");
+    }
 }
 
 #[test]
@@ -389,6 +400,45 @@ fn unavailable_origin_repository_has_no_substituted_repository_identity() {
         assert_eq!(code, CLEAN, "{out}\n{err}");
         assert!(out.contains("repository-id unavailable"), "{out}");
     }
+}
+
+#[test]
+fn optional_metadata_survives_migration_and_later_continuation() {
+    let fixture = Fixture::new();
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+    let (code, out, err) = fixture.rehearse(&["--json", "--keep", "rebase", "main"]);
+    assert_eq!(code, STOPPED, "{out}\n{err}");
+    let report = document(&out);
+    let id = report["id"].as_str().expect("rehearsal id");
+    let metadata = report["storage"]["metadata"]
+        .as_str()
+        .expect("metadata path");
+    let worktree = std::path::Path::new(report["sandbox"].as_str().expect("sandbox"));
+    let extension = serde_json::json!({"label": "keep my resolution", "notes": [1, null, true]});
+    let mut saved = document(&std::fs::read_to_string(metadata).expect("metadata"));
+    saved["schema"] = serde_json::json!(1);
+    saved.as_object_mut().expect("object").remove("carry");
+    saved["optional_annotation"] = extension.clone();
+    std::fs::write(
+        metadata,
+        serde_json::to_vec(&saved).expect("legacy metadata"),
+    )
+    .expect("save legacy record");
+
+    let (code, out, err) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    assert_eq!(document(&out)["rehearsals"][0]["id"], id);
+    let migrated = document(&std::fs::read_to_string(metadata).expect("migrated metadata"));
+    assert_eq!(migrated["schema"], 2);
+    assert_eq!(migrated["optional_annotation"], extension);
+
+    std::fs::write(worktree.join("file.txt"), "resolved\n").expect("resolve");
+    fixture.git_in(worktree, &["add", "file.txt"]);
+    let (code, out, err) = fixture.rehearse(&["--json", "continue", id]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let continued = document(&std::fs::read_to_string(metadata).expect("continued metadata"));
+    assert_eq!(continued["optional_annotation"], extension);
 }
 
 #[test]

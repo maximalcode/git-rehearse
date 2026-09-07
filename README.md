@@ -408,7 +408,10 @@ and execution state. Text and JSON output use the same shared-repository
 identity; if the origin cannot be resolved, text reports `unavailable` and
 JSON reports `null`. A rehearsal whose process ended before writing a result
 is reported as `incomplete`; it is never treated as a clean rehearsal or made
-applyable by inference. Management commands require an unambiguous id prefix.
+applyable by inference. Supplied management IDs must be exact or an unambiguous
+prefix; omitting the ID keeps the existing most-recent-rehearsal behavior.
+The added management fields are optional extensions to schema 1: consumers
+reading output from older versions must tolerate their absence.
 
 ## For coding agents
 
@@ -521,7 +524,8 @@ A rehearsal explicitly kept with `--keep` is durable until you explicitly
 discard it. Retention is saved before the rehearsed Git command starts, so an
 interruption during execution or in its editor does not make it expire.
 Transient rehearsals and interrupted clone directories are pruned
-after seven days; unknown or damaged metadata and rehearsals reserved by an
+after seven days. Supported legacy metadata is migrated while preserving
+optional extension fields through later updates; unknown or damaged metadata and rehearsals reserved by an
 interrupted apply are preserved. A discarded one is gone immediately. The clone hardlinks your object store rather than copying it, so
 a sandbox costs almost nothing on disk, and deleting one can never touch your
 real repository's objects.

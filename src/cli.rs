@@ -919,16 +919,11 @@ fn show<W: Write>(
             let document = json::Incomplete::of(&sandbox);
             write_json(&document, output)?;
         } else {
+            write_show_metadata(&sandbox, output)?;
             writeln!(
                 output,
-                "rehearsal {} is incomplete: its process ended before recording an execution result\n\
-                 origin {}\n\
-                 repository-id {}\n\
-                 storage {}",
+                "rehearsal {}: execution incomplete; its process ended before recording an execution result",
                 meta.id,
-                meta.repo_path.display(),
-                json::repository_identity(meta).as_deref().unwrap_or("unavailable"),
-                sandbox.root().display()
             )
             .map_err(Error::Spawn)?;
         }
@@ -959,6 +954,18 @@ fn show<W: Write>(
     }
 
     let graphs = report::graphs(&sandbox.worktree(), &analysis, detail)?;
+    write_show_metadata(&sandbox, output)?;
+    write!(
+        output,
+        "{}",
+        report::render(meta, &analysis, &outcome, &graphs)
+    )
+    .map_err(Error::Spawn)?;
+    Ok(exit::CLEAN)
+}
+
+fn write_show_metadata<W: Write>(sandbox: &Sandbox, output: &mut W) -> Result<()> {
+    let meta = sandbox.meta();
     writeln!(
         output,
         "origin worktree {}  repository-id {}  checkout {:?}  lifecycle {:?}  storage {}\n\
@@ -972,14 +979,7 @@ fn show<W: Write>(
         sandbox.root().display(),
         meta.pre_state.len()
     )
-    .map_err(Error::Spawn)?;
-    write!(
-        output,
-        "{}",
-        report::render(meta, &analysis, &outcome, &graphs)
-    )
-    .map_err(Error::Spawn)?;
-    Ok(exit::CLEAN)
+    .map_err(Error::Spawn)
 }
 
 /// Applies a rehearsal that was kept.
