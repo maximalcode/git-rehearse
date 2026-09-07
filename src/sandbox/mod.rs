@@ -162,6 +162,17 @@ impl Sandbox {
     ///
     /// [`Error::Io`](crate::Error::Io) if the directory cannot be removed.
     pub fn discard(self) -> Result<()> {
+        let lock = crate::recovery::acquire(&self.meta.repo_path)?;
+        self.discard_locked(&lock)
+    }
+
+    /// Deletes the rehearsal while the caller's recovery ownership remains held.
+    ///
+    /// The lock must belong to this rehearsal's repository. Keeping it in the
+    /// caller's scope through removal closes the window in which an Apply could
+    /// mutate the repository while this sandbox is being destroyed.
+    pub fn discard_locked(self, lock: &crate::recovery::Lock) -> Result<()> {
+        crate::recovery::ensure_clear_locked(&self.meta.repo_path, lock)?;
         store::remove_rehearsal(&self.root)
     }
 }

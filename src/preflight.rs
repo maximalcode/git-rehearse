@@ -76,6 +76,10 @@ pub fn run(cwd: &Path) -> Result<Preflight> {
     refuse_if_submodules(&repo)?;
     refuse_if_lfs(&repo)?;
 
+    // Snapshotting writes Git objects. Keep recovery ownership from the
+    // refusal check through those writes and the ref snapshot.
+    let lock = crate::recovery::acquire(&repo)?;
+    crate::recovery::ensure_clear_locked(&repo, &lock)?;
     let (checkout, head_sha) = head(&repo)?;
     // Not a refusal any more, and deliberately last: a structural problem is
     // worth reporting before anything is written into the object store.

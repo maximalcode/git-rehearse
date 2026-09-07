@@ -17,6 +17,7 @@ use std::time::UNIX_EPOCH;
 
 use super::Sandbox;
 use super::meta::Meta;
+use crate::recovery;
 use crate::{Error, Result};
 
 /// How long a kept rehearsal survives without being touched: seven days.
@@ -109,9 +110,51 @@ pub fn prune(cache_root: &Path, now_unix: u64, max_age_secs: u64) -> Result<Vec<
     let mut removed = Vec::new();
     for repo_dir in subdirectories(cache_root)? {
         for root in subdirectories(&repo_dir)? {
-            let created = Meta::read(&root)
-                .map(|meta| meta.created_unix)
-                .or_else(|_| directory_mtime(&root))?;
+            let meta = Meta::read(&root).ok();
+            let lock = if let Some(meta) = meta.as_ref() {
+                // A repository can disappear or be moved after a rehearsal
+                // was cached. Its sandbox is still useful evidence, so keep
+                // the entry and let the other repositories in this shared
+                // cache continue pruning. A live lock refusal remains an
+                // error: hiding it could permit a concurrent mutation.
+                match recovery::acquire(&meta.repo_path) {
+                    Ok(lock) => Some(lock),
+                    Err(_error) if !meta.repo_path.exists() => continue,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            // An interrupted apply may be the only durable link to the
+            // sandbox's inspected result. Keep it until recovery has been
+            // explicitly resolved, even when its normal cache TTL expired.
+            if let Some(meta) = &meta {
+                match recovery::inspect_locked(
+                    &meta.repo_path,
+                    lock.as_ref().expect("lock for metadata"),
+                ) {
+                    // A journal for this rehearsal remains the durable link
+                    // to its result until recovery confirms completion.
+                    Ok(Some(journal))
+                        if journal.rehearsal == meta.id
+                            && journal.state != recovery::State::Complete =>
+                    {
+                        continue;
+                    }
+                    // A damaged, incompatible, or otherwise uninspectable
+                    // journal is itself an unresolved recovery state. Never
+                    // delete the sandbox merely because we cannot parse it.
+                    // A damaged journal, or one for another operation in the
+                    // same repository, is ambiguous from this cache entry's
+                    // perspective.
+                    Err(_) | Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                }
+            }
+            let created = match meta {
+                Some(meta) => meta.created_unix,
+                None => directory_mtime(&root)?,
+            };
             if now_unix.saturating_sub(created) <= max_age_secs {
                 continue;
             }
@@ -130,12 +173,20 @@ pub fn prune(cache_root: &Path, now_unix: u64, max_age_secs: u64) -> Result<Vec<
 
 /// Immediate, complete removal of one rehearsal directory.
 pub(super) fn remove_rehearsal(root: &Path) -> Result<()> {
-    match fs::remove_dir_all(root) {
+    pause_for_test("before-removal");
+    let removed = match fs::remove_dir_all(root) {
         Ok(()) => Ok(()),
         // Already gone is the outcome the caller wanted.
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(Error::Io(root.to_path_buf(), err)),
-    }
+    };
+    pause_for_test("after-removal");
+    removed
+}
+
+/// Test-only coordination seam for proving ownership survives actual removal.
+fn pause_for_test(stage: &str) {
+    crate::test_hooks::pause("GIT_REHEARSE_PAUSE_SANDBOX_REMOVAL_AT", stage);
 }
 
 /// The directories directly inside `dir`, sorted; empty if `dir` is absent.

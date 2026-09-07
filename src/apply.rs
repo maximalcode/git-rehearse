@@ -37,7 +37,7 @@ use crate::execute::Outcome;
 use crate::preflight::HEAD_KEY;
 use crate::sandbox::{Checkout, Sandbox};
 use crate::undo::{self, Record};
-use crate::{Error, Result, carry, collision, git};
+use crate::{Error, Result, carry, collision, git, recovery};
 
 /// What an apply did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,10 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
     let repo = meta.repo_path.as_path();
     let worktree = sandbox.worktree();
 
+    // An interrupted apply owns this repository until its real state has been
+    // classified and explicitly completed or rolled back.
+    let lock = recovery::acquire(repo)?;
+    recovery::ensure_clear_locked(repo, &lock)?;
     check_outcome(meta)?;
     let rehearsed = state_of(&worktree)?;
     let moved = ref_moves(&meta.pre_state, &rehearsed);
@@ -97,24 +101,52 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         None
     };
 
+    let worktree_before = git::run(repo, ["rev-parse", "HEAD"])?;
+    let anchor = format!("refs/rehearse/{}/", meta.id);
+    let undo_record = Record::of_apply(meta.id.clone(), now_unix, &moved);
+    abort_for_test("before-journal");
+    let journal = recovery::prepare_locked(
+        repo,
+        &lock,
+        &undo_record,
+        reset.as_deref(),
+        &anchor,
+        &worktree_before,
+    )?;
+    abort_for_test("after-journal");
+    recovery::set_worktree_after_locked(
+        &journal,
+        &lock,
+        carried.as_ref().map(|carried| carried.result),
+    )?;
+
     // Objects first: this adds nothing a user can see and leaves the
     // repository unchanged if it fails.
-    let anchor = format!("refs/rehearse/{}/", meta.id);
     fetch_objects(repo, &worktree, &anchor, &meta.id, carried.is_some())?;
 
-    let undo = undo::write(repo, &Record::of_apply(meta.id.clone(), now_unix, &moved))?;
+    let undo = undo::write(repo, &undo_record)?;
 
     transplant(repo, &moved, &meta.id)?;
+    abort_for_test("after-ref-transaction");
+    recovery::refs_applied_locked(&journal, &lock)?;
+    abort_for_test("after-refs-phase");
 
     if reset.is_some() {
         // After the refs move, HEAD's branch points at the rehearsed commit
         // while the index and worktree still hold the old one. Resetting to
         // HEAD — not to a commit id — because HEAD is already right.
         git::run(repo, ["reset", "--hard", "--quiet"])?;
+        abort_for_test("after-reset-before-carried");
         if let Some(carried) = &carried {
             carry::restore(repo, carried.result)?;
         }
+        abort_for_test("after-worktree-update");
+        recovery::worktree_updated_locked(&journal, &lock)?;
     }
+
+    recovery::complete_locked(&journal, &lock)?;
+    pause_for_test("after-complete");
+    recovery::forget_locked(&journal, &lock)?;
 
     Ok(Applied {
         moved,
@@ -123,6 +155,21 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         anchor,
         carried: carried.map(|carried| carried.paths.to_vec()),
     })
+}
+
+/// Test-only process interruption seams. Keeping them in the production path
+/// lets integration tests kill the actual CLI between the real mutation and
+/// its durable phase write; without that seam a crash test would only exercise
+/// a mocked or different implementation.
+fn abort_for_test(stage: &str) {
+    crate::test_hooks::abort("GIT_REHEARSE_ABORT_APPLY_AT", stage);
+}
+
+/// Test-only coordination seam for proving journal ownership across processes.
+/// The marker is created after the requested stage and the process continues
+/// only after the test removes it.
+fn pause_for_test(stage: &str) {
+    crate::test_hooks::pause("GIT_REHEARSE_PAUSE_APPLY_AT", stage);
 }
 
 /// Refuses to transplant a rehearsal whose command did not finish cleanly.
