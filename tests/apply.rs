@@ -497,17 +497,50 @@ fn a_journal_publication_sync_failure_preserves_the_previous_undo_and_refs() {
 }
 
 #[test]
+fn apply_refuses_a_rehearsal_whose_anchor_is_already_owned() {
+    let fixture = Fixture::new();
+    let first = rehearse(&fixture, &["branch", "first-apply", "feature"]);
+    apply::run(&first, NOW).expect("first apply succeeds");
+    let before = fixture.refs();
+    let undo_path = fixture.repo().join(".git/rehearse-undo");
+    let undo = std::fs::read(&undo_path).unwrap();
+
+    // Load metadata with a reused id, as an older allocator could produce.
+    // Apply must check namespace ownership at its mutation boundary too.
+    let second = rehearse(&fixture, &["branch", "second-apply", "feature"]);
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(second.root().join("meta.json")).unwrap()).unwrap();
+    metadata["id"] = serde_json::json!(first.id());
+    std::fs::write(
+        second.root().join("meta.json"),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+    let second = sandbox::list(fixture.cache(), None)
+        .expect("load rehearsals")
+        .into_iter()
+        .find(|found| found.root() == second.root())
+        .expect("load colliding rehearsal");
+    let refused = refusal(apply::run(&second, NOW).expect_err("occupied anchor is refused"));
+    assert!(refused.contains("anchor"), "{refused}");
+    assert_eq!(fixture.refs(), before);
+    assert_eq!(std::fs::read(&undo_path).unwrap(), undo);
+}
+
+#[test]
 fn a_later_journal_sync_failure_leaves_recoverable_refs_and_restores_previous_undo() {
     let fixture = Fixture::new();
-    let first = kept(&fixture, &["--", "branch", "first-apply", "feature"]);
-    let applied = fixture.rehearse(&["--json", "apply", &first]);
+    // Both rehearsals use the same timestamp, as on a fast CI runner. The
+    // first sandbox is removed by Apply, but its recovery refs remain.
+    let first = rehearse(&fixture, &["branch", "first-apply", "feature"]);
+    let applied = fixture.rehearse(&["--json", "apply", first.id()]);
     assert_eq!(applied.0, 0, "first apply succeeds: {}", applied.2);
     let undo = fixture.repo().join(".git/rehearse-undo");
     let previous_undo = std::fs::read(&undo).expect("first apply writes undo");
     let before = fixture.refs();
 
-    let second = kept(&fixture, &["--", "branch", "second-apply", "feature"]);
-    let failed = fail_recovery_storage(&fixture, &second, "refs-applied-sync");
+    let second = rehearse(&fixture, &["branch", "second-apply", "feature"]);
+    let failed = fail_recovery_storage(&fixture, second.id(), "refs-applied-sync");
     assert_eq!(failed.status.code(), Some(4), "storage refusal: {failed:?}");
     let document: serde_json::Value = serde_json::from_slice(&failed.stdout).expect("failure JSON");
     assert_eq!(document["kind"], "refused");
@@ -520,7 +553,7 @@ fn a_later_journal_sync_failure_leaves_recoverable_refs_and_restores_previous_un
     assert_ne!(fixture.refs(), before, "the real ref transaction landed");
     assert!(fixture.repo().join(".git/rehearse-apply").exists());
 
-    let rolled = fixture.rehearse(&["--json", "recover", "--rollback", &second]);
+    let rolled = fixture.rehearse(&["--json", "recover", "--rollback", second.id()]);
     assert_eq!(rolled.0, 0, "rollback succeeds: {}", rolled.2);
     assert_eq!(fixture.refs(), before, "rollback restores exact refs");
     assert_eq!(
@@ -982,17 +1015,16 @@ fn recovery_lock_cannot_delete_a_replacement_journal() {
     // stopping after its real worktree update.
     let initial = rehearse(&fixture, &["merge", "--no-edit", "feature"]);
     let initial_id = initial.id().to_owned();
-    apply::run(&initial, NOW).expect("initial apply establishes the later pre-state");
-    let replacement = rehearse(&fixture, &["branch", "replacement", "main"]);
-    let contender = rehearse(&fixture, &["branch", "contender", "main"]);
-    let undone = fixture.rehearse(&["--json", "undo"]);
-    assert_eq!(undone.0, 0, "restore the initial pre-state: {undone:?}");
     let killed = abort_apply(&fixture, &initial_id, "after-worktree-update");
     assert_aborted(&killed, "initial apply");
-    assert!(fixture.repo().join(".git/rehearse-apply").exists());
+    let journal_path = fixture.repo().join(".git/rehearse-apply");
+    let completed_journal = std::fs::read(&journal_path).expect("completed journal");
 
-    // Both later rehearsals were prepared before J0 existed, so their setup
-    // cannot reap the completed journal through the preflight recovery gate.
+    // Preflight legitimately reaps J0 while preparing later rehearsals.
+    // Restore its exact persisted bytes to exercise ownership at that endpoint.
+    let replacement = rehearse(&fixture, &["branch", "replacement", "main"]);
+    let contender = rehearse(&fixture, &["branch", "contender", "main"]);
+    std::fs::write(&journal_path, completed_journal).expect("restore completed endpoint");
     let marker = fixture.scratch("recovery-paused").join("marker");
     let mut first = Command::new(env!("CARGO_BIN_EXE_git-rehearse"));
     first

@@ -328,6 +328,11 @@ fn prepare_operation_locked(
 ) -> Result<PathBuf> {
     let journal_path = &lock.journal_path;
     ensure_clear_locked(repo, lock)?;
+    if !anchor.is_empty() && !git::refs(repo, anchor, 0)?.is_empty() {
+        return Err(Error::Refused(
+            "this rehearsal's recovery anchor is already owned by an earlier apply; create a new rehearsal before applying. No repository mutation was performed".to_owned(),
+        ));
+    }
     let previous_path = git_dir(repo)?.join(crate::undo::UNDO_FILE);
     let previous_undo = match fs::read(&previous_path) {
         Ok(bytes) => Some(bytes),
