@@ -36,6 +36,7 @@ use crate::analyze::Replay as CommitReplay;
 use crate::apply::Applied;
 use crate::carry::{Carry, Replay};
 use crate::execute::Outcome;
+use crate::recovery::{Action as RecoveryAction, Inspection, Phase, State as RecoveryState};
 use crate::report::Choice;
 use crate::sandbox::{Meta, Sandbox, Status};
 use crate::undo::Undone;
@@ -361,6 +362,90 @@ pub struct DiscardResult {
     /// The ids that are now gone.
     pub discarded: Vec<String>,
     pub exit_code: u8,
+}
+
+/// `git rehearse --json recover` and its explicit recovery actions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryResult {
+    pub schema: u32,
+    pub repository: String,
+    /// `none` when no interrupted apply is present.
+    pub state: String,
+    /// Which interrupted operation the available actions would finish or reverse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rehearsal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<&'static str>,
+    pub can_complete: bool,
+    pub can_rollback: bool,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal: Option<String>,
+}
+
+impl RecoveryResult {
+    /// Builds the public recovery document. The action is included so a
+    /// caller can distinguish a query from a mutation whose state was checked.
+    #[must_use]
+    pub fn new(
+        repository: String,
+        inspection: Option<&Inspection>,
+        action: RecoveryAction,
+    ) -> Self {
+        let action_name = match action {
+            RecoveryAction::Inspect => "inspect",
+            RecoveryAction::Complete => "complete",
+            RecoveryAction::Rollback => "rollback",
+        };
+        let (state, rehearsal, phase, can_complete, can_rollback, journal) =
+            inspection.map_or(("none", None, None, false, false, None), |found| {
+                (
+                    state_name(found.state),
+                    Some(found.rehearsal.clone()),
+                    Some(phase_name(found.phase)),
+                    found.can_complete,
+                    found.can_rollback,
+                    Some(found.journal.clone()),
+                )
+            });
+        Self {
+            schema: SCHEMA,
+            repository,
+            state: state.to_owned(),
+            operation: inspection.map(|found| match found.operation {
+                crate::recovery::Operation::Apply => "apply",
+                crate::recovery::Operation::Undo => "undo",
+            }),
+            rehearsal,
+            phase,
+            can_complete,
+            can_rollback,
+            action: action_name.to_owned(),
+            journal,
+        }
+    }
+}
+
+fn phase_name(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Prepared => "prepared",
+        Phase::RefsApplied => "refs_applied",
+        Phase::WorktreeUpdated => "worktree_updated",
+        Phase::Complete => "complete",
+        Phase::RollingBack => "rolling_back",
+    }
+}
+
+fn state_name(state: RecoveryState) -> &'static str {
+    match state {
+        RecoveryState::BeforeRefChange => "before_ref_change",
+        RecoveryState::AfterRefChange => "after_ref_change",
+        RecoveryState::Complete => "complete",
+        RecoveryState::RollingBack => "rolling_back",
+        RecoveryState::Ambiguous => "ambiguous",
+    }
 }
 
 /// Why a run failed.

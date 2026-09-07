@@ -154,6 +154,35 @@ Three properties worth knowing before you rely on it:
   after `git update-ref` and that ref goes back, with git refusing if it has
   moved on since.
 
+### If Apply is interrupted
+
+Apply writes a durable, synced journal in `.git/rehearse-apply` before it
+fetches objects or changes a ref. If the process is killed, inspect the real
+state without repeating Apply. The JSON in this example is abbreviated to
+show only the recovery state and available actions:
+
+```console
+$ git rehearse --json recover
+{"state":"after_ref_change","can_complete":true,"can_rollback":true}
+$ git rehearse recover --complete 1786178829-00
+```
+
+Use `--rollback` when the status shows a safe ref-applied endpoint. A journal
+whose refs, index, or files no longer match either endpoint is reported as
+ambiguous; Apply, Undo, and further rehearsal mutations remain refused until
+the state is resolved by hand. A damaged journal is likewise preserved and
+blocked rather than overwritten.
+The journal includes an integrity checksum; edits to its recorded recovery
+data are refused even when the file still contains valid JSON. Successful
+JSON recovery actions report `state: "none"` with both actions disabled.
+Pending recovery identifies `operation: "apply"` or `operation: "undo"`:
+completion finishes that operation, while rollback reverses it.
+An externally changed Undo record also blocks recovery and is preserved.
+
+Rollback also records its intent before changing refs. If rollback is
+interrupted, recovery reports `rolling_back`; use `recover --rollback` again
+to finish from the verified state. Changed files or refs still block recovery.
+
 ### When it conflicts
 
 ```console
@@ -299,6 +328,9 @@ git rehearse show [<id>]          print a rehearsal's report again
 git rehearse continue [<id>]      carry on a stopped one, once it is resolved
 git rehearse apply [<id>]         transplant a rehearsal into the real repo
 git rehearse undo [<id>]          put the refs back where the last apply found them
+git rehearse recover [<id>]       inspect an interrupted apply or undo
+git rehearse recover --complete|--rollback [<id>]
+                                 finish or roll back the recorded operation
 git rehearse discard [<id>|--all] throw one, or all, away
 ```
 
@@ -306,6 +338,8 @@ git rehearse discard [<id>|--all] throw one, or all, away
 rehearsal is meant. `undo` is the exception: it takes an id only to insist
 which apply you mean, because there is one undo record per repository and it
 always describes the most recent one.
+`recover` uses the repository's current recovery journal; its optional id
+checks which rehearsal that journal belongs to.
 
 | option | |
 |---|---|
