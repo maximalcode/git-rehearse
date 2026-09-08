@@ -8,7 +8,9 @@ mod support;
 
 use git_rehearse::cache;
 use git_rehearse::execute::Outcome;
+use git_rehearse::preflight;
 use git_rehearse::sandbox;
+use std::process::Command;
 use support::Fixture;
 
 /// 0 clean, 1 internal, 2 stopped, 3 failed, 4 refused.
@@ -31,6 +33,45 @@ fn a_clean_rehearsal_prints_a_report_and_exits_zero() {
     );
     assert!(out.contains("refs/heads/main"), "{out}");
     assert!(out.contains("graph  refs/heads/main"), "{out}");
+}
+
+#[test]
+fn listing_from_an_unrelated_repo_keeps_an_unavailable_origin_and_prunes_others() {
+    let fixture = Fixture::new();
+    let original_plan = fixture.plan(
+        &["merge", "feature"],
+        git_rehearse::sandbox::Checkout::Branch("main".to_owned()),
+    );
+    let unavailable = sandbox::create(fixture.cache(), &original_plan, 1_786_248_000)
+        .expect("old sandbox is created");
+    let unavailable_root = unavailable.root().to_owned();
+
+    let unrelated = fixture.sibling("unrelated");
+    let unrelated_plan = preflight::run(&unrelated)
+        .expect("unrelated repository passes preflight")
+        .into_plan(vec![
+            "branch".to_owned(),
+            "cache-only".to_owned(),
+            "main".to_owned(),
+        ]);
+    let available = sandbox::create(fixture.cache(), &unrelated_plan, 1_786_248_000)
+        .expect("another old sandbox is created");
+    let available_root = available.root().to_owned();
+
+    let moved_original = fixture.base().join("original-moved");
+    std::fs::rename(fixture.repo(), &moved_original).expect("origin repository is moved");
+    let output = Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+        .current_dir(&unrelated)
+        .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
+        .args(["--json", "list"])
+        .output()
+        .expect("list process runs");
+
+    assert_eq!(output.status.code(), Some(0), "list succeeds: {output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("listing JSON");
+    assert_eq!(document["pruned"], serde_json::json!([available.id()]));
+    assert!(unavailable_root.exists(), "unavailable origin is retained");
+    assert!(!available_root.exists(), "available origin is still pruned");
 }
 
 #[test]
@@ -267,6 +308,27 @@ fn an_unknown_command_is_refused_with_a_way_forward() {
 
     assert_eq!(code, REFUSED);
     assert!(err.contains("git rehearse -- bisect"), "{err}");
+}
+
+#[test]
+fn an_unknown_recovery_option_is_refused_with_an_explanation() {
+    let fixture = Fixture::new();
+
+    let (code, _, err) = fixture.rehearse(&["recover", "--complet"]);
+
+    assert_eq!(code, REFUSED);
+    assert!(err.contains("--complet"), "{err}");
+}
+
+#[test]
+fn recovery_actions_without_a_journal_are_explained_refusals() {
+    let fixture = Fixture::new();
+
+    for action in ["--complete", "--rollback"] {
+        let (code, _, err) = fixture.rehearse(&["recover", action]);
+        assert_eq!(code, REFUSED, "{action}: {err}");
+        assert!(err.contains("no interrupted apply"), "{action}: {err}");
+    }
 }
 
 #[test]

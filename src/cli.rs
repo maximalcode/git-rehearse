@@ -23,6 +23,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::execute::{Outcome, SEQUENCE_EDITOR_ARG, Todo};
+use crate::recovery::{self, Action as RecoveryAction, State as RecoveryState};
 use crate::report::{Choice, Detail};
 use crate::sandbox::{DEFAULT_TTL_SECS, Sandbox, Status};
 use crate::{
@@ -78,6 +79,8 @@ usage:
   git rehearse continue [<id>]
   git rehearse apply [<id>]
   git rehearse undo [<id>]
+  git rehearse recover [<id>]
+  git rehearse recover --complete|--rollback [<id>]
   git rehearse discard [<id>|--all]
 
 options (before the command; everything after it belongs to git):
@@ -190,6 +193,11 @@ pub enum Command {
     Undo {
         id: Option<String>,
     },
+    /// Inspect or resolve an interrupted apply.
+    Recover {
+        id: Option<String>,
+        action: RecoveryAction,
+    },
     /// Throw one — or all — away.
     Discard {
         id: Option<String>,
@@ -292,6 +300,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
             }
             "apply" => parsed!(Command::Apply { id: id_from(rest) }),
             "undo" => parsed!(Command::Undo { id: id_from(rest) }),
+            "recover" => parsed!(parse_recover(rest)?),
             "discard" => {
                 let arguments: Vec<&String> = rest.collect();
                 let all = arguments.iter().any(|arg| *arg == "--all");
@@ -364,6 +373,40 @@ fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Option<String> {
     rest.into_iter().find(|arg| !arg.starts_with('-')).cloned()
 }
 
+fn parse_recover<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let arguments: Vec<&String> = rest.collect();
+    if let Some(option) = arguments
+        .iter()
+        .find(|arg| arg.starts_with('-') && !matches!(arg.as_str(), "--complete" | "--rollback"))
+    {
+        return Err(Error::Refused(format!(
+            "unknown recover option {option}; use --complete or --rollback, or omit both to inspect"
+        )));
+    }
+    if arguments.iter().any(|arg| *arg == "--complete")
+        && arguments.iter().any(|arg| *arg == "--rollback")
+    {
+        return Err(Error::Refused(
+            "recover accepts either --complete or --rollback, not both".to_owned(),
+        ));
+    }
+    let action = if arguments.iter().any(|arg| *arg == "--complete") {
+        RecoveryAction::Complete
+    } else if arguments.iter().any(|arg| *arg == "--rollback") {
+        RecoveryAction::Rollback
+    } else {
+        RecoveryAction::Inspect
+    };
+    let mut ids = arguments.into_iter().filter(|arg| !arg.starts_with('-'));
+    let id = ids.next().cloned();
+    if ids.next().is_some() {
+        return Err(Error::Refused(
+            "recover accepts at most one rehearsal ID; no recovery action was done".to_owned(),
+        ));
+    }
+    Ok(Command::Recover { id, action })
+}
+
 /// Runs a parsed command and returns the process exit code.
 ///
 /// `cwd` is where the user ran us. Everything that touches the terminal goes
@@ -404,6 +447,7 @@ pub fn run<W: Write>(parsed: Parsed, cwd: &Path, output: &mut W) -> Result<u8> {
         }
         Command::Apply { id } => apply_kept(id.as_deref(), format, cwd, output),
         Command::Undo { id } => undo_apply(id.as_deref(), format, cwd, output),
+        Command::Recover { id, action } => recover(id.as_deref(), action, format, cwd, output),
         Command::Discard { id, all } => discard(id.as_deref(), all, format, cwd, output),
     }
 }
@@ -504,6 +548,7 @@ fn resume<W: Write>(
     output: &mut W,
 ) -> Result<u8> {
     let mut sandbox = find(id, cwd)?;
+    recovery::ensure_clear(&sandbox.meta().repo_path)?;
     let stopped_on_replay = carry::stopped_on_replay(sandbox.meta());
     if stopped_on_replay {
         carry::validate_resume(&sandbox)?;
@@ -1031,6 +1076,90 @@ fn undo_apply<W: Write>(
     Ok(exit::CLEAN)
 }
 
+fn recover<W: Write>(
+    id: Option<&str>,
+    action: RecoveryAction,
+    format: Format,
+    cwd: &Path,
+    output: &mut W,
+) -> Result<u8> {
+    let repo = repo_root(cwd)?;
+    let (inspection, recovered) = if action == RecoveryAction::Inspect {
+        let inspection = recovery::inspect(&repo)?;
+        if let Some(id) = id
+            && inspection
+                .as_ref()
+                .is_none_or(|found| !found.rehearsal.starts_with(id))
+        {
+            return Err(Error::Refused(format!(
+                "the apply journal does not belong to rehearsal {id}; no recovery action was done"
+            )));
+        }
+        (inspection, None)
+    } else {
+        // Selection, inspection, and mutation share the ownership acquired
+        // by recover_for; an earlier unlocked selection could become stale.
+        (None, Some(recovery::recover_for(&repo, action, id)?))
+    };
+    let shown = recovered
+        .as_ref()
+        .map(|result| &result.inspection)
+        .or(inspection.as_ref());
+    if format == Format::Json {
+        // Successful mutations removed their journal while owning the lock.
+        // Report that resulting state, rather than offering the old actions.
+        let document =
+            json::RecoveryResult::new(repo.display().to_string(), inspection.as_ref(), action);
+        write_json(&document, output)?;
+    } else {
+        report_recovery(shown, action, output)?;
+    }
+    Ok(exit::CLEAN)
+}
+
+fn report_recovery<W: Write>(
+    inspection: Option<&recovery::Inspection>,
+    action: RecoveryAction,
+    output: &mut W,
+) -> Result<()> {
+    let Some(inspection) = inspection else {
+        writeln!(output, "no interrupted apply requires recovery").map_err(Error::Spawn)?;
+        return Ok(());
+    };
+    let state = match inspection.state {
+        RecoveryState::BeforeRefChange => "before ref change",
+        RecoveryState::AfterRefChange => "after ref change",
+        RecoveryState::Complete => "complete",
+        RecoveryState::RollingBack => "rolling back",
+        RecoveryState::Ambiguous => "ambiguous",
+    };
+    writeln!(
+        output,
+        "rehearsal {}: {} {state} (journal phase {:?})",
+        inspection.rehearsal,
+        inspection.operation.name(),
+        inspection.phase
+    )
+    .map_err(Error::Spawn)?;
+    match action {
+        RecoveryAction::Inspect => {
+            writeln!(
+                output,
+                "actions: complete={}, rollback={}",
+                inspection.can_complete, inspection.can_rollback
+            )
+            .map_err(Error::Spawn)?;
+        }
+        RecoveryAction::Complete => {
+            writeln!(output, "recovery completed").map_err(Error::Spawn)?;
+        }
+        RecoveryAction::Rollback => {
+            writeln!(output, "recovery rolled back").map_err(Error::Spawn)?;
+        }
+    }
+    Ok(())
+}
+
 fn report_undone<W: Write>(undone: &undo::Undone, output: &mut W) -> Result<()> {
     writeln!(output, "put back:").map_err(Error::Spawn)?;
     for restored in &undone.restored {
@@ -1069,9 +1198,10 @@ fn discard<W: Write>(
     let mut discarded = Vec::new();
     if all {
         let repo_id = repo_id(cwd)?;
+        let lock = recovery::acquire(&repo_root(cwd)?)?;
         for sandbox in sandbox::list(&cache_root, Some(&repo_id))? {
             discarded.push(sandbox.id().to_owned());
-            sandbox.discard()?;
+            sandbox.discard_locked(&lock)?;
         }
     } else {
         let sandbox = find(id, cwd)?;
@@ -1122,6 +1252,7 @@ fn repo_id(cwd: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{Command, Decision, Format, code_for, exit, wants_json};
+    use crate::recovery::Action as RecoveryAction;
     use crate::report::Detail;
     use crate::{Error, Result};
     use std::path::PathBuf;
@@ -1237,6 +1368,28 @@ mod tests {
                 all: false
             }
         );
+    }
+
+    #[test]
+    fn recovery_commands_have_query_complete_and_rollback_actions() {
+        let Command::Recover { id, action } = parse(&args(&["recover", "1786"])).expect("parses")
+        else {
+            panic!("expected recovery query");
+        };
+        assert_eq!(id.as_deref(), Some("1786"));
+        assert_eq!(action, RecoveryAction::Inspect);
+        let Command::Recover { action, .. } =
+            parse(&args(&["--json", "recover", "--rollback", "1786"])).expect("parses rollback")
+        else {
+            panic!("expected rollback");
+        };
+        assert_eq!(action, RecoveryAction::Rollback);
+        let Command::Recover { action, .. } =
+            parse(&args(&["recover", "--complete", "1786"])).expect("parses completion")
+        else {
+            panic!("expected completion");
+        };
+        assert_eq!(action, RecoveryAction::Complete);
     }
 
     #[test]

@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 
 use crate::analyze::RefMove;
 use crate::preflight::HEAD_KEY;
-use crate::{Error, Result, git};
+use crate::{Error, Result, git, recovery};
 
 /// Where the undo record is written, inside the real repository's git dir.
 pub const UNDO_FILE: &str = "rehearse-undo";
@@ -141,7 +141,7 @@ pub struct Undone {
 pub fn write(repo: &Path, record: &Record) -> Result<PathBuf> {
     let git_dir = PathBuf::from(git::run(repo, ["rev-parse", "--absolute-git-dir"])?);
     let path = git_dir.join(UNDO_FILE);
-    fs::write(&path, render(record)).map_err(Error::io(&path))?;
+    recovery::atomic_bytes(&path, render(record).as_bytes())?;
     Ok(path)
 }
 
@@ -157,6 +157,8 @@ pub fn write(repo: &Path, record: &Record) -> Result<PathBuf> {
 /// `id` names, if any ref has moved since that apply, or if the worktree is in
 /// the way. [`Error::Git`] or [`Error::Io`] if the restore itself fails.
 pub fn run(repo: &Path, id: Option<&str>) -> Result<Undone> {
+    let lock = crate::recovery::acquire(repo)?;
+    crate::recovery::ensure_clear_locked(repo, &lock)?;
     let git_dir = PathBuf::from(git::run(repo, ["rev-parse", "--absolute-git-dir"])?);
     let path = git_dir.join(UNDO_FILE);
     let text = fs::read_to_string(&path).map_err(|_| nothing_to_undo(&path))?;
@@ -184,18 +186,43 @@ pub fn run(repo: &Path, id: Option<&str>) -> Result<Undone> {
         Worktree::Untouched => None,
     };
 
+    let worktree_before = git::run(repo, ["rev-parse", "HEAD"])?;
+    let inverse = record
+        .refs
+        .iter()
+        .cloned()
+        .map(reversed)
+        .collect::<Vec<_>>();
+    let journal = recovery::prepare_undo_locked(
+        repo,
+        &lock,
+        &record.rehearsal,
+        &inverse,
+        reset.as_deref(),
+        &worktree_before,
+    )?;
+    abort_for_test("after-journal");
+
     restore(repo, &record)?;
+    abort_for_test("after-ref-transaction");
+    recovery::refs_applied_locked(&journal, &lock)?;
+    abort_for_test("after-refs-phase");
 
     if reset.is_some() {
         // Same as apply, for the same reason: the branch under HEAD now points
         // at the restored commit while the index and worktree still hold the
         // one the apply left. Resetting to HEAD, because HEAD is already right.
         git::run(repo, ["reset", "--hard", "--quiet"])?;
+        abort_for_test("after-worktree-update");
+        recovery::worktree_updated_locked(&journal, &lock)?;
     }
 
     // Consumed only now, after everything that could refuse has refused: a
     // failed undo must leave the record where it was, or the way back is gone.
     fs::remove_file(&path).map_err(Error::io(&path))?;
+    abort_for_test("after-undo-record-removal");
+    recovery::complete_locked(&journal, &lock)?;
+    recovery::forget_locked(&journal, &lock)?;
 
     Ok(Undone {
         rehearsal: record.rehearsal,
@@ -204,6 +231,10 @@ pub fn run(repo: &Path, id: Option<&str>) -> Result<Undone> {
         reset,
         record: path,
     })
+}
+
+fn abort_for_test(stage: &str) {
+    crate::test_hooks::abort("GIT_REHEARSE_ABORT_UNDO_AT", stage);
 }
 
 /// The record as it is written to disk.

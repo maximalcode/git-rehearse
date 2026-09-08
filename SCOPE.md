@@ -273,6 +273,20 @@ interactive rebase to a real repo with zero surprises.
    no caller can spawn the walks by forgetting. Report paging and colour config are still
    unbuilt.
 
+5. **Clean Apply recovery: BUILT** (#88). A durable, atomically published phase
+   journal records origin, old/new refs, worktree endpoints, and previous/new Undo data
+   before mutations. `git rehearse recover [<id>]` reports observed progress from
+   the journal and actual refs/index/files; `--complete` and `--rollback` act only
+   on a verified endpoint and never repeat the rehearsed command. Rollback records
+   its direction before changing refs so another interruption can also be resumed.
+   Apply, Undo, snapshotting, and sandbox removal share repository ownership;
+   unresolved recovery blocks affected mutations and preserves the journal and
+   sandbox beyond the normal cache lifetime. Changed state, corrupt journals, and
+   storage failures produce explained refusals. Undo uses the same journal protocol.
+   Public JSON exposes recovery state and available actions. This slice covers
+   clean operations; recovery of carried local work is limited and its rollback
+   remains refused pending the follow-up issue.
+
 ## v2.0 — agent mode (the strategic release)
 
 Everything here rides on v1's mechanics; nothing requires rework if v1 keeps its exit

@@ -43,7 +43,7 @@ pub fn create(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result<Sandbox> 
     let repo_dir = cache_root.join(&repo_id);
     fs::create_dir_all(&repo_dir).map_err(Error::io(&repo_dir))?;
 
-    let (id, root) = claim_directory(&repo_dir, now_unix)?;
+    let (id, root) = claim_directory(&repo_dir, &plan.repo, now_unix)?;
     match build(&root, plan, &repo_id, id.clone(), now_unix) {
         Ok(meta) => Ok(Sandbox { root, meta }),
         Err(err) => {
@@ -60,9 +60,14 @@ pub fn create(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result<Sandbox> 
 /// Exclusive directory creation *is* the id allocator: no lock file, no
 /// randomness, and two rehearsals started in the same second cannot collide,
 /// because whoever loses the `create_dir` race simply takes the next suffix.
-fn claim_directory(repo_dir: &Path, now_unix: u64) -> Result<(String, PathBuf)> {
+/// Applied rehearsals also reserve their ids through their retained object refs,
+/// even after their sandbox directory has been removed.
+fn claim_directory(repo_dir: &Path, repo: &Path, now_unix: u64) -> Result<(String, PathBuf)> {
     for attempt in 0..100 {
         let id = format!("{now_unix}-{attempt:02}");
+        if !git::refs(repo, &format!("refs/rehearse/{id}/"), 0)?.is_empty() {
+            continue;
+        }
         let root = repo_dir.join(&id);
         match fs::create_dir(&root) {
             Ok(()) => return Ok((id, root)),
