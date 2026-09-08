@@ -264,7 +264,9 @@ fn an_explicitly_kept_initial_run_survives_interruption_and_age_pruning() {
         child.kill().expect("interrupt rehearsal");
     }
     let killed = Command::new("kill")
-        .args(["-KILL", &format!("-{}", child.id())])
+        // procps kill can parse -1234 as -1 without the option terminator,
+        // signalling unrelated processes instead of this process group.
+        .args(["-KILL", "--", &format!("-{}", child.id())])
         .status()
         .expect("kill rehearsal process group");
     child.wait().expect("reap rehearsal");
