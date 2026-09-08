@@ -520,6 +520,7 @@ mod tests {
             created_unix: 1_786_248_000,
             status: Status::Fresh,
             result: None,
+            extensions: BTreeMap::new(),
         }
     }
 

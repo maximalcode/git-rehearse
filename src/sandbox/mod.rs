@@ -122,6 +122,16 @@ impl Sandbox {
         self.meta.write(&self.root)
     }
 
+    /// Invalidates the previous execution before a continuation starts.
+    ///
+    /// A continuation can be killed after Git has begun but before it returns
+    /// an outcome. Keeping the preceding `Stopped` result in that case would
+    /// make a later process report the interrupted attempt as if it completed.
+    pub fn begin_execution(&mut self) -> Result<()> {
+        self.meta.result = None;
+        self.meta.write(&self.root)
+    }
+
     /// Records what became of the carried uncommitted work.
     ///
     /// Separate from [`Sandbox::record`] because the two are answered at
@@ -140,8 +150,9 @@ impl Sandbox {
         self.meta.write(&self.root)
     }
 
-    /// Marks the rehearsal as one to keep, so `list` shows it and the prune
-    /// clock is the only thing that removes it.
+    /// Marks the rehearsal as one to keep, so `list` shows it until an
+    /// explicit discard. Kept rehearsals are durable across restarts and age
+    /// pruning.
     ///
     /// # Errors
     ///
@@ -172,7 +183,16 @@ impl Sandbox {
     /// caller's scope through removal closes the window in which an Apply could
     /// mutate the repository while this sandbox is being destroyed.
     pub fn discard_locked(self, lock: &crate::recovery::Lock) -> Result<()> {
-        crate::recovery::ensure_clear_locked(&self.meta.repo_path, lock)?;
+        // Let recovery reap a completed journal first, while preserving the
+        // fail-closed reservation check for opaque or unreadable claims.
+        let clearance = crate::recovery::ensure_clear_locked(&self.meta.repo_path, lock);
+        if store::is_recovery_reserved(&self.meta) {
+            return Err(crate::Error::Refused(format!(
+                "rehearsal {} is reserved by an interrupted apply; recover it before discarding",
+                self.id()
+            )));
+        }
+        clearance?;
         store::remove_rehearsal(&self.root)
     }
 }

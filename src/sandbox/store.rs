@@ -5,10 +5,10 @@
 //! it. Nothing in this file knows how a sandbox is built, and nothing in
 //! [`super::build`] knows how one is found again.
 //!
-//! A directory that does not parse as a rehearsal is consistently *skipped*
-//! rather than reported. A foreign directory, or one left by a run killed
-//! mid-clone, must not break a listing; [`prune`] is what eventually collects
-//! it.
+//! A directory with no metadata is skipped rather than reported. A foreign
+//! directory, or one left by a run killed mid-clone, must not break a listing;
+//! [`prune`] is what eventually collects it. Once metadata exists, a parse or
+//! schema failure is surfaced as a refusal and preserved for diagnosis.
 
 use std::fs;
 use std::io;
@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use super::Sandbox;
-use super::meta::Meta;
+use super::meta::{Meta, Status};
+use crate::git;
 use crate::recovery;
 use crate::{Error, Result};
 
-/// How long a kept rehearsal survives without being touched: seven days.
+/// How long a transient rehearsal survives without being touched: seven days.
 pub const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Every rehearsal in the cache, newest last.
@@ -41,8 +42,24 @@ pub fn list(cache_root: &Path, repo_id: Option<&str>) -> Result<Vec<Sandbox>> {
             continue;
         }
         for root in subdirectories(&repo_dir)? {
-            if let Ok(meta) = Meta::read(&root) {
-                found.push(Sandbox { root, meta });
+            let metadata = root.join("meta.json");
+            match Meta::read(&root) {
+                Ok(meta) => found.push(Sandbox { root, meta }),
+                // A directory without metadata is a clone interrupted before
+                // the durable record was written. It is not a rehearsal the
+                // management API can identify, so leave it for prune.
+                Err(_error) if matches!(metadata_state(&metadata), MetadataState::Absent) => {}
+                // Once metadata exists, a parse or schema failure is an
+                // identifiable but unsafe state. Refuse the listing instead
+                // of silently dropping it and inviting a destructive guess.
+                // A failed presence lookup is just as ambiguous as an entry
+                // that is present: only a confirmed NotFound means orphaned.
+                Err(error) => {
+                    return Err(Error::Refused(format!(
+                        "cannot safely read rehearsal metadata at {}: {error}",
+                        metadata.display()
+                    )));
+                }
             }
         }
     }
@@ -110,7 +127,24 @@ pub fn prune(cache_root: &Path, now_unix: u64, max_age_secs: u64) -> Result<Vec<
     let mut removed = Vec::new();
     for repo_dir in subdirectories(cache_root)? {
         for root in subdirectories(&repo_dir)? {
-            let meta = Meta::read(&root).ok();
+            let metadata = root.join("meta.json");
+            let meta = match Meta::read(&root) {
+                Ok(meta) => Some(meta),
+                // No metadata means a clone was interrupted before it could
+                // be identified. Age pruning is the only cleanup available.
+                Err(_) if matches!(metadata_state(&metadata), MetadataState::Absent) => None,
+                // Unknown or corrupt metadata is protected: deleting it
+                // would destroy the only record that could be migrated or
+                // diagnosed later. An error checking whether metadata exists
+                // is protected for the same reason.
+                Err(_) => continue,
+            };
+            if meta
+                .as_ref()
+                .is_some_and(|meta| meta.status == Status::Kept)
+            {
+                continue;
+            }
             let lock = if let Some(meta) = meta.as_ref() {
                 // A repository can disappear or be moved after a rehearsal
                 // was cached. Its sandbox is still useful evidence, so keep
@@ -125,6 +159,9 @@ pub fn prune(cache_root: &Path, now_unix: u64, max_age_secs: u64) -> Result<Vec<
             } else {
                 None
             };
+            if meta.as_ref().is_some_and(is_recovery_reserved) {
+                continue;
+            }
             // An interrupted apply may be the only durable link to the
             // sandbox's inspected result. Keep it until recovery has been
             // explicitly resolved, even when its normal cache TTL expired.
@@ -189,6 +226,48 @@ fn pause_for_test(stage: &str) {
     crate::test_hooks::pause("GIT_REHEARSE_PAUSE_SANDBOX_REMOVAL_AT", stage);
 }
 
+/// Whether an apply journal has claimed this rehearsal for recovery.
+///
+/// The journal belongs to the real repository and is owned by the recovery
+/// module. This boundary also recognizes opaque claims so cache
+/// pruning and explicit discard cannot remove the rehearsal that recovery
+/// still needs. A damaged journal is treated as reserved as well: failing
+/// closed preserves the evidence for recovery to diagnose.
+pub(super) fn is_recovery_reserved(meta: &Meta) -> bool {
+    let Ok(path) = git::run(
+        &meta.repo_path,
+        ["rev-parse", "--git-path", "rehearse-apply"],
+    ) else {
+        // If the originating repository cannot be inspected, ownership is
+        // unknown. Preserve the sandbox until recovery can make that call.
+        return true;
+    };
+    let journal = PathBuf::from(path);
+    let journal = if journal.is_absolute() {
+        journal
+    } else {
+        meta.repo_path.join(journal)
+    };
+    match fs::symlink_metadata(&journal) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        // Only a confirmed absence says there is no recovery owner. Existing
+        // directories, symlinks, and other file types are ambiguous and must
+        // be preserved for recovery to inspect.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+        Ok(_) | Err(_) => return true,
+    }
+    let Ok(text) = fs::read_to_string(&journal) else {
+        return true;
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(document) => document
+            .get("rehearsal")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|id| id == meta.id),
+        Err(_) => true,
+    }
+}
+
 /// The directories directly inside `dir`, sorted; empty if `dir` is absent.
 fn subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(dir) {
@@ -205,6 +284,27 @@ fn subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     dirs.sort();
     Ok(dirs)
+}
+
+/// The only filesystem result that proves a metadata entry is absent.
+///
+/// `Path::exists` follows symlinks and collapses every lookup failure into
+/// `false`. That would turn a damaged or unreadable metadata entry into an
+/// apparently orphaned clone and let age pruning delete it. Inspect the
+/// directory entry itself so broken symlinks and other failures stay visible.
+#[derive(Debug)]
+enum MetadataState {
+    Present,
+    Absent,
+    Unknown,
+}
+
+fn metadata_state(path: &Path) -> MetadataState {
+    match fs::symlink_metadata(path) {
+        Ok(_) => MetadataState::Present,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => MetadataState::Absent,
+        Err(_) => MetadataState::Unknown,
+    }
 }
 
 /// A directory's modification time, in seconds since the Unix epoch.

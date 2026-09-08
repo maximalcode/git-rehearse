@@ -25,10 +25,10 @@ away. Your repository is not touched until you say so.
 
 ### Upgrading from v1.1.0
 
-Kept rehearsals from v1.1.0 are not loaded by v1.2.0, which uses sandbox
-metadata schema 2 to record carried work. Save any work you need from old
-sandboxes before upgrading, then create fresh rehearsals. Do not edit their
-metadata to force compatibility.
+Kept rehearsals from v1.1.0 are migrated when first read by v1.2.0. Metadata
+schema 1 is upgraded atomically to schema 2, preserving the original
+repository, checkout, refs and result. Unknown schemas and damaged metadata
+are refused and left in place so they can be recovered or diagnosed.
 
 ### A prebuilt binary
 
@@ -344,7 +344,7 @@ checks which rehearsal that journal belongs to.
 | option | |
 |---|---|
 | `--apply` | apply without asking |
-| `--keep` | keep without asking |
+| `--keep` | keep durably without asking |
 | `--json` | one JSON document on stdout instead of the report |
 | `--stat-only` | the report without the before/after graphs |
 | `--todo <file>` | drive an interactive rebase from a prepared todo |
@@ -435,6 +435,17 @@ English anyway:
 So the loop a program runs is `rehearse` → read `conflicts` → resolve them under
 `sandbox` → `continue` → read `drift_unexpected` → `apply`, with the real
 repository untouched until that last step.
+
+`list` and `show` include the exact rehearsal id, originating worktree,
+repository identity, checkout and pre-state refs, lifecycle, storage paths,
+and execution state. Text and JSON output use the same shared-repository
+identity; if the origin cannot be resolved, text reports `unavailable` and
+JSON reports `null`. A rehearsal whose process ended before writing a result
+is reported as `incomplete`; it is never treated as a clean rehearsal or made
+applyable by inference. Supplied management IDs must be exact or an unambiguous
+prefix; omitting the ID keeps the existing most-recent-rehearsal behavior.
+The added management fields are optional extensions to schema 1: consumers
+reading output from older versions must tolerate their absence.
 
 ## For coding agents
 
@@ -543,8 +554,13 @@ Sandboxes go in your cache directory — `~/Library/Caches/git-rehearse` on
 macOS, `%LOCALAPPDATA%\git-rehearse` on Windows, `$XDG_CACHE_HOME` or
 `~/.cache/git-rehearse` elsewhere. Override with `GIT_REHEARSE_CACHE_DIR`.
 
-A kept rehearsal is pruned after seven days. A discarded one is gone
-immediately. The clone hardlinks your object store rather than copying it, so
+A rehearsal explicitly kept with `--keep` is durable until you explicitly
+discard it. Retention is saved before the rehearsed Git command starts, so an
+interruption during execution or in its editor does not make it expire.
+Transient rehearsals and interrupted clone directories are pruned
+after seven days. Supported legacy metadata is migrated while preserving
+optional extension fields through later updates; unknown or damaged metadata and rehearsals reserved by an
+interrupted apply are preserved. A discarded one is gone immediately. The clone hardlinks your object store rather than copying it, so
 a sandbox costs almost nothing on disk, and deleting one can never touch your
 real repository's objects.
 

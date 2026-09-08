@@ -280,6 +280,7 @@ pub fn resume(worktree: &Path) -> Result<Outcome> {
 ///
 /// As [`resume`].
 pub fn resume_with(worktree: &Path, chatter: Chatter) -> Result<Outcome> {
+    validate_resume(worktree)?;
     let Some(operation) = in_progress(worktree)? else {
         return Err(Error::Refused(
             "this rehearsal has nothing in progress — there is nothing to continue.\n\
@@ -296,6 +297,32 @@ pub fn resume_with(worktree: &Path, chatter: Chatter) -> Result<Outcome> {
         ));
     };
 
+    let status = git::spawn_with(worktree, [subcommand, "--continue"], &[], chatter)?;
+    classify(worktree, status)
+}
+
+/// Checks that a continuation can start without changing the sandbox.
+///
+/// Callers that will invalidate recorded metadata must run this first. A
+/// refused continuation leaves the recorded outcome available for `show` and
+/// `apply` to report accurately.
+pub fn validate_resume(worktree: &Path) -> Result<()> {
+    let Some(operation) = in_progress(worktree)? else {
+        return Err(Error::Refused(
+            "this rehearsal has nothing in progress — there is nothing to continue.\n\
+             `git rehearse show` prints the report again; `apply` transplants it."
+                .to_owned(),
+        ));
+    };
+    if operation.subcommand().is_none() {
+        return Err(Error::Refused(
+            "this rehearsal stopped in a bisect, which cannot be continued for you.\n\
+             A bisect advances on your answer — mark the commit yourself inside the \
+             sandbox with `git bisect good|bad`."
+                .to_owned(),
+        ));
+    }
+
     // Refused before git is even started: `--continue` on an unresolved
     // conflict fails with git's own message about staging, which is correct
     // but arrives after the user has been told the rehearsal is resuming.
@@ -309,9 +336,7 @@ pub fn resume_with(worktree: &Path, chatter: Chatter) -> Result<Outcome> {
             unmerged.join("\n  ")
         )));
     }
-
-    let status = git::spawn_with(worktree, [subcommand, "--continue"], &[], chatter)?;
-    classify(worktree, status)
+    Ok(())
 }
 
 /// Turns git's exit status plus the state it left behind into an [`Outcome`].

@@ -461,6 +461,7 @@ mod tests {
             created_unix: 1_786_248_000,
             status: Status::Kept,
             result,
+            extensions: BTreeMap::new(),
         }
     }
 

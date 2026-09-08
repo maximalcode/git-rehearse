@@ -38,8 +38,9 @@ use crate::carry::{Carry, Replay};
 use crate::execute::Outcome;
 use crate::recovery::{Action as RecoveryAction, Inspection, Phase, State as RecoveryState};
 use crate::report::Choice;
-use crate::sandbox::{Meta, Sandbox, Status};
+use crate::sandbox::{Checkout, Meta, Sandbox, Status};
 use crate::undo::Undone;
+use crate::{cache, git};
 
 /// Version of the document below.
 ///
@@ -57,6 +58,9 @@ pub enum OutcomeKind {
     Stopped,
     /// Git refused the command outright.
     Failed,
+    /// The durable metadata has no result, which indicates the process was
+    /// interrupted before it could classify the Git command.
+    Incomplete,
 }
 
 /// What became of the rehearsal afterwards.
@@ -220,6 +224,18 @@ pub struct Report {
     pub id: String,
     /// The real repository this was rehearsed against.
     pub repository: String,
+    /// The originating worktree. Kept separate from the repository identity
+    /// because one repository can have several checkouts.
+    pub origin_worktree: String,
+    /// Stable shared-repository identity, or `null` when the origin cannot be
+    /// inspected. A cache path hash is not a valid substitute.
+    pub repository_id: Option<String>,
+    pub checkout: Checkout,
+    pub pre_state: std::collections::BTreeMap<String, String>,
+    pub lifecycle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<Storage>,
+    pub execution: String,
     /// The sandbox worktree. Present whatever the decision, but only usable
     /// when `decision` is not `discarded`.
     pub sandbox: String,
@@ -264,6 +280,13 @@ pub struct Report {
 pub struct Entry {
     pub id: String,
     pub command: Vec<String>,
+    pub repository: String,
+    pub origin_worktree: String,
+    /// Stable shared-repository identity, or `null` when the origin cannot be
+    /// inspected. A cache path hash is not a valid substitute.
+    pub repository_id: Option<String>,
+    pub checkout: Checkout,
+    pub pre_state: std::collections::BTreeMap<String, String>,
     pub sandbox: String,
     /// `fresh` or `kept`, as recorded in the sandbox's own metadata.
     pub status: String,
@@ -272,6 +295,40 @@ pub struct Entry {
     /// How the command ended, if it has run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<OutcomeKind>,
+    /// `clean`, `stopped`, `failed`, or `incomplete` when the process ended
+    /// before it could record an outcome.
+    pub execution: String,
+    pub lifecycle: String,
+    pub storage: Storage,
+}
+
+/// The schema-versioned document returned by `show` when execution was
+/// interrupted before an outcome was recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Incomplete {
+    pub schema: u32,
+    #[serde(flatten)]
+    pub entry: Entry,
+}
+
+impl Incomplete {
+    /// Builds the incomplete `show` document from the durable entry.
+    #[must_use]
+    pub fn of(sandbox: &Sandbox) -> Self {
+        Self {
+            schema: SCHEMA,
+            entry: Entry::of(sandbox),
+        }
+    }
+}
+
+/// Durable paths and existence information for a rehearsal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Storage {
+    pub root: String,
+    pub sandbox: String,
+    pub metadata: String,
+    pub exists: bool,
 }
 
 impl Entry {
@@ -282,6 +339,11 @@ impl Entry {
         Self {
             id: meta.id.clone(),
             command: meta.command.clone(),
+            repository: meta.repo_path.display().to_string(),
+            origin_worktree: meta.repo_path.display().to_string(),
+            repository_id: repository_identity(meta),
+            checkout: meta.checkout.clone(),
+            pre_state: meta.pre_state.clone(),
             sandbox: sandbox.worktree().display().to_string(),
             // Spelled out rather than derived from `Status`: that enum is
             // `meta.json`'s, and a rename there must not reach the wire.
@@ -292,6 +354,9 @@ impl Entry {
             .to_owned(),
             created_unix: meta.created_unix,
             outcome: meta.result.as_ref().map(kind_of),
+            execution: execution(meta),
+            lifecycle: lifecycle(meta),
+            storage: storage(sandbox),
         }
     }
 }
@@ -511,6 +576,13 @@ impl Report {
             schema: SCHEMA,
             id: meta.id.clone(),
             repository: meta.repo_path.display().to_string(),
+            origin_worktree: meta.repo_path.display().to_string(),
+            repository_id: repository_identity(meta),
+            checkout: meta.checkout.clone(),
+            pre_state: meta.pre_state.clone(),
+            lifecycle: lifecycle(meta),
+            storage: (choice == Choice::Keep).then(|| storage(sandbox)),
+            execution: kind_of(outcome).as_str().to_owned(),
             sandbox: sandbox.worktree().display().to_string(),
             command: meta.command.clone(),
             outcome: kind_of(outcome),
@@ -544,6 +616,59 @@ fn kind_of(outcome: &Outcome) -> OutcomeKind {
         Outcome::Stopped { .. } => OutcomeKind::Stopped,
         Outcome::Failed { .. } => OutcomeKind::Failed,
     }
+}
+
+impl OutcomeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+fn execution(meta: &Meta) -> String {
+    meta.result
+        .as_ref()
+        .map_or("incomplete", |outcome| kind_of(outcome).as_str())
+        .to_owned()
+}
+
+fn lifecycle(meta: &Meta) -> String {
+    match meta.status {
+        Status::Fresh => "fresh",
+        Status::Kept => "kept",
+    }
+    .to_owned()
+}
+
+fn storage(sandbox: &Sandbox) -> Storage {
+    Storage {
+        root: sandbox.root().display().to_string(),
+        sandbox: sandbox.worktree().display().to_string(),
+        metadata: sandbox.root().join("meta.json").display().to_string(),
+        exists: sandbox.root().exists(),
+    }
+}
+
+/// Stable identity for the shared Git repository, separate from the
+/// worktree-specific cache key. Linked worktrees report the same common Git
+/// directory here while retaining separate rehearsal storage roots.
+pub(crate) fn repository_identity(meta: &Meta) -> Option<String> {
+    let common = git::run(&meta.repo_path, ["rev-parse", "--git-common-dir"])
+        .ok()
+        .map(std::path::PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                meta.repo_path.join(path)
+            }
+        })
+        .and_then(|path| git::canonicalize(&path).ok());
+    common.as_deref().map(cache::repo_id)
 }
 
 fn reference(moved: &RefMove) -> Ref {
@@ -693,6 +818,18 @@ mod tests {
             schema: SCHEMA,
             id: "1786281796-00".to_owned(),
             repository: "/repo".to_owned(),
+            origin_worktree: "/repo".to_owned(),
+            repository_id: Some("repo-id".to_owned()),
+            checkout: crate::sandbox::Checkout::Branch("main".to_owned()),
+            pre_state: std::collections::BTreeMap::new(),
+            lifecycle: "kept".to_owned(),
+            storage: Some(super::Storage {
+                root: "/cache/id".to_owned(),
+                sandbox: "/cache/id/sandbox".to_owned(),
+                metadata: "/cache/id/meta.json".to_owned(),
+                exists: true,
+            }),
+            execution: super::kind_of(outcome).as_str().to_owned(),
             sandbox: "/cache/1786281796-00/sandbox".to_owned(),
             command: vec!["rebase".to_owned(), "main".to_owned()],
             outcome: super::kind_of(outcome),

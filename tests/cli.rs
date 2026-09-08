@@ -6,6 +6,8 @@
 
 mod support;
 
+use git_rehearse::cache;
+use git_rehearse::execute::Outcome;
 use git_rehearse::preflight;
 use git_rehearse::sandbox;
 use std::process::Command;
@@ -554,6 +556,42 @@ fn discard_all_empties_the_cache_for_this_repository() {
     assert!(listed.contains("no rehearsals"), "{listed}");
 }
 
+#[test]
+fn discarding_one_id_leaves_other_retained_rehearsals_intact() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let (_, first_out, first_err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+    let first = first_out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("first rehearsal id")
+        .to_owned();
+    let (_, second_out, second_err) =
+        fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+    let second = second_out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("second rehearsal id")
+        .to_owned();
+    assert_ne!(
+        first, second,
+        "retained rehearsals need distinct ids: {first_err}{second_err}"
+    );
+
+    let (code, _, err) = fixture.rehearse(&["discard", &first]);
+    assert_eq!(code, CLEAN, "{err}");
+    let (code, listed, err) = fixture.rehearse(&["list"]);
+    assert_eq!(code, CLEAN, "{err}");
+    assert!(
+        !listed.contains(&first),
+        "selected rehearsal remains: {listed}"
+    );
+    assert!(
+        listed.contains(&second),
+        "other rehearsal was removed: {listed}"
+    );
+}
+
 /// Every `git log --graph` the run spawned, counted off git's own trace.
 fn graph_walks(trace: &str) -> usize {
     trace
@@ -944,4 +982,24 @@ fn continuing_something_that_is_not_stopped_is_refused() {
 
     assert_eq!(code, REFUSED, "{err}");
     assert!(err.contains("nothing in progress"), "{err}");
+}
+
+#[test]
+fn refusing_to_continue_preserves_the_completed_result() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let (_, out, _) = fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+
+    let (code, _, err) = fixture.rehearse(&["continue", &id]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(err.contains("nothing in progress"), "{err}");
+    let sandbox = sandbox::find(fixture.cache(), &cache::repo_id(fixture.repo()), Some(&id))
+        .expect("the completed rehearsal remains findable");
+    assert_eq!(sandbox.meta().result, Some(Outcome::Clean));
 }

@@ -85,7 +85,7 @@ usage:
 
 options (before the command; everything after it belongs to git):
   --apply           apply without asking
-  --keep            keep the rehearsal without asking
+  --keep            keep the rehearsal durably without asking
   --json            one JSON document on stdout instead of the report
   --stat-only       the report without the before/after graphs
   --todo <file>     drive an interactive rebase from a prepared todo
@@ -507,6 +507,10 @@ fn rehearse<W: Write>(
     let plan = preflight::run(cwd)?.into_plan(command.to_vec());
     let cache_root = cache::root()?;
     let mut sandbox = sandbox::create(&cache_root, &plan, now_unix())?;
+    if decision == Decision::Keep {
+        // Retention must survive a kill while Git or its editor is running.
+        sandbox.keep()?;
+    }
 
     let todo = todo.map(Todo::new).transpose()?;
     let outcome = execute::run_with(
@@ -545,6 +549,13 @@ fn resume<W: Write>(
 ) -> Result<u8> {
     let mut sandbox = find(id, cwd)?;
     recovery::ensure_clear(&sandbox.meta().repo_path)?;
+    let stopped_on_replay = carry::stopped_on_replay(sandbox.meta());
+    if stopped_on_replay {
+        carry::validate_resume(&sandbox)?;
+    } else {
+        execute::validate_resume(&sandbox.worktree())?;
+    }
+    sandbox.begin_execution()?;
     // Which half stopped decides what carrying on means. A rehearsal waiting
     // on its replay has no operation for `git … --continue` to advance: what
     // it is waiting for is the resolution in the sandbox worktree, which
@@ -610,7 +621,14 @@ fn report_and_decide<W: Write>(
         write_next_steps(&sandbox, &worktree, will_prompt, output)?;
     }
 
-    let choice = choose(decision, will_prompt, can_apply, outcome, output)?;
+    let choice = choose(
+        decision,
+        will_prompt,
+        sandbox.meta().status == Status::Kept,
+        can_apply,
+        outcome,
+        output,
+    )?;
     if choice == Choice::Apply && !can_apply {
         return Err(refuse_apply(sandbox, outcome));
     }
@@ -672,9 +690,11 @@ fn decide_as_json<W: Write>(
     can_apply: bool,
     output: &mut W,
 ) -> Result<()> {
+    let already_kept = sandbox.meta().status == Status::Kept;
     let choice = match decision {
         Decision::Apply => Choice::Apply,
         Decision::Keep => Choice::Keep,
+        Decision::Ask if already_kept => Choice::Keep,
         Decision::Ask => report::non_interactive(outcome),
     };
     if choice == Choice::Apply && !can_apply {
@@ -760,6 +780,7 @@ fn code_for_outcome(outcome: &Outcome) -> u8 {
 fn choose<W: Write>(
     decision: Decision,
     will_prompt: bool,
+    already_kept: bool,
     can_apply: bool,
     outcome: &Outcome,
     output: &mut W,
@@ -772,7 +793,11 @@ fn choose<W: Write>(
         // has to be announced, because nothing else in the output would reveal
         // that a question was skipped at all.
         Decision::Ask => {
-            let choice = report::non_interactive(outcome);
+            let choice = if already_kept {
+                Choice::Keep
+            } else {
+                report::non_interactive(outcome)
+            };
             let notice = if choice == Choice::Keep {
                 NOT_A_TERMINAL_STOPPED
             } else {
@@ -850,7 +875,7 @@ fn report_applied<W: Write>(applied: &apply::Applied, output: &mut W) -> Result<
     Ok(())
 }
 
-/// Lists this repository's rehearsals, pruning expired ones first.
+/// Lists this repository's rehearsals, pruning expired transient entries first.
 fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
     let cache_root = cache::root()?;
     let pruned = sandbox::prune(&cache_root, now_unix(), DEFAULT_TTL_SECS)?;
@@ -878,6 +903,31 @@ fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
             meta.id,
             meta.status,
             meta.command.join(" ")
+        )
+        .map_err(Error::Spawn)?;
+        writeln!(
+            output,
+            "  origin {}  checkout {:?}  execution {}  storage {}",
+            meta.repo_path.display(),
+            meta.checkout,
+            meta.result
+                .as_ref()
+                .map_or("incomplete", |result| match result {
+                    Outcome::Clean => "clean",
+                    Outcome::Stopped { .. } => "stopped",
+                    Outcome::Failed { .. } => "failed",
+                }),
+            sandbox.root().display()
+        )
+        .map_err(Error::Spawn)?;
+        writeln!(
+            output,
+            "  repository-id {}  lifecycle {:?}  pre-state refs {}",
+            json::repository_identity(meta)
+                .as_deref()
+                .unwrap_or("unavailable"),
+            meta.status,
+            meta.pre_state.len()
         )
         .map_err(Error::Spawn)?;
     }
@@ -909,12 +959,21 @@ fn show<W: Write>(
     let meta = sandbox.meta();
     // What the command did is remembered rather than re-derived; a rehearsal
     // that was never run is the only case with nothing to remember.
-    let outcome = meta.result.clone().ok_or_else(|| {
-        Error::Refused(format!(
-            "rehearsal {} never ran a command, so there is no report.",
-            meta.id
-        ))
-    })?;
+    let Some(outcome) = meta.result.clone() else {
+        if format == Format::Json {
+            let document = json::Incomplete::of(&sandbox);
+            write_json(&document, output)?;
+        } else {
+            write_show_metadata(&sandbox, output)?;
+            writeln!(
+                output,
+                "rehearsal {}: execution incomplete; its process ended before recording an execution result",
+                meta.id,
+            )
+            .map_err(Error::Spawn)?;
+        }
+        return Ok(exit::CLEAN);
+    };
     let analysis = analyze::run(
         &sandbox.worktree(),
         &meta.pre_state,
@@ -940,6 +999,7 @@ fn show<W: Write>(
     }
 
     let graphs = report::graphs(&sandbox.worktree(), &analysis, detail)?;
+    write_show_metadata(&sandbox, output)?;
     write!(
         output,
         "{}",
@@ -947,6 +1007,24 @@ fn show<W: Write>(
     )
     .map_err(Error::Spawn)?;
     Ok(exit::CLEAN)
+}
+
+fn write_show_metadata<W: Write>(sandbox: &Sandbox, output: &mut W) -> Result<()> {
+    let meta = sandbox.meta();
+    writeln!(
+        output,
+        "origin worktree {}  repository-id {}  checkout {:?}  lifecycle {:?}  storage {}\n\
+         pre-state refs {}",
+        meta.repo_path.display(),
+        json::repository_identity(meta)
+            .as_deref()
+            .unwrap_or("unavailable"),
+        meta.checkout,
+        meta.status,
+        sandbox.root().display(),
+        meta.pre_state.len()
+    )
+    .map_err(Error::Spawn)
 }
 
 /// Applies a rehearsal that was kept.
