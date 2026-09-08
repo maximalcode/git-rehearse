@@ -283,9 +283,13 @@ interactive rebase to a real repo with zero surprises.
    unresolved recovery blocks affected mutations and preserves the journal and
    sandbox beyond the normal cache lifetime. Changed state, corrupt journals, and
    storage failures produce explained refusals. Undo uses the same journal protocol.
-   Public JSON exposes recovery state and available actions. This slice covers
-   clean operations; recovery of carried local work is limited and its rollback
-   remains refused pending the follow-up issue.
+   Public JSON exposes recovery state and available actions.
+6. **Carried-work recovery: BUILT** (#89). Protected stash snapshots retain the
+   original and reviewed index and tracked-file trees. Completion transplants the
+   reviewed trees; rollback restores the original staging and file bytes. Recovery
+   recognizes the reset and carry-checkout boundaries, including interruptions of
+   rollback itself, and refuses external edits or untracked/ignored collisions.
+   Snapshots are retained until completion; unknown partial writes stay blocked.
 
 ## v2.0 — agent mode (the strategic release)
 

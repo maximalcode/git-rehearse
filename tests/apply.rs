@@ -1231,7 +1231,36 @@ fn a_killed_undo_is_journaled_and_can_be_completed() {
 }
 
 #[test]
-fn recovery_does_not_call_a_carried_apply_complete_before_the_result_is_restored() {
+fn carried_rollback_restores_original_staging_and_file_bytes() {
+    for stage in [
+        "after-journal",
+        "after-ref-transaction",
+        "after-reset-before-carried",
+        "after-carry-files",
+        "after-worktree-update",
+    ] {
+        let fixture = Fixture::new();
+        fixture.commit_file("carried.txt", "base\n", "add carried path");
+        fixture.write("carried.txt", "staged\n");
+        fixture.git(&["add", "carried.txt"]);
+        fixture.write("carried.txt", "unstaged\n");
+        let refs = fixture.refs();
+        let index = fixture.git(&["write-tree"]);
+        let id = kept_merge(&fixture);
+        assert_aborted(&abort_apply(&fixture, &id, stage), "apply");
+        let rolled = fixture.rehearse(&["--json", "recover", "--rollback", &id]);
+        assert_eq!(rolled.0, 0, "{} {}", rolled.1, rolled.2);
+        assert_eq!(fixture.refs(), refs);
+        assert_eq!(fixture.git(&["write-tree"]), index);
+        assert_eq!(
+            std::fs::read(fixture.repo().join("carried.txt")).unwrap(),
+            b"unstaged\n"
+        );
+    }
+}
+
+#[test]
+fn recovery_finishes_a_carried_apply_after_reset() {
     let fixture = Fixture::new();
     fixture.commit_file("carried.txt", "base\n", "add carried path");
     fixture.write("carried.txt", "carried work\n");
@@ -1241,14 +1270,207 @@ fn recovery_does_not_call_a_carried_apply_complete_before_the_result_is_restored
 
     let status = fixture.rehearse(&["--json", "recover", &id]);
     let status: serde_json::Value = serde_json::from_str(&status.1).expect("status JSON");
-    assert_eq!(status["state"], "ambiguous");
-    assert_eq!(status["can_complete"], false);
+    assert_eq!(status["state"], "after_ref_change");
+    assert_eq!(status["can_complete"], true);
     let complete = fixture.rehearse(&["--json", "recover", "--complete", &id]);
+    assert_eq!(complete.0, 0, "the reviewed carry can be finished");
+    assert!(!fixture.repo().join(".git/rehearse-apply").exists());
     assert_eq!(
-        complete.0, 4,
-        "unknown carried endpoint must remain blocked"
+        std::fs::read(fixture.repo().join("carried.txt")).unwrap(),
+        b"carried work\n"
     );
-    assert!(fixture.repo().join(".git/rehearse-apply").exists());
+}
+
+#[test]
+fn carried_completion_uses_the_reviewed_conflict_resolution_and_index() {
+    for stage in [
+        "after-ref-transaction",
+        "after-reset-before-carried",
+        "after-carry-files",
+    ] {
+        let fixture = Fixture::new();
+        fixture.write("file.txt", "local conflict\n");
+        let preview = fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "feature"]);
+        assert_eq!(preview.0, 2, "{} {}", preview.1, preview.2);
+        let report: serde_json::Value = serde_json::from_str(&preview.1).unwrap();
+        let id = report["id"].as_str().unwrap();
+        let sandbox = std::path::Path::new(report["sandbox"].as_str().unwrap());
+        std::fs::write(sandbox.join("file.txt"), b"reviewed staged resolution\n").unwrap();
+        fixture.git_in(sandbox, &["add", "file.txt"]);
+        std::fs::write(sandbox.join("file.txt"), b"reviewed final bytes\n").unwrap();
+        let continued = fixture.rehearse(&["--json", "--keep", "continue", id]);
+        assert_eq!(continued.0, 0, "{} {}", continued.1, continued.2);
+        let expected_head = fixture.git_in(sandbox, &["rev-parse", "HEAD"]);
+        let expected_index = fixture.git_in(sandbox, &["write-tree"]);
+        assert_aborted(&abort_apply(&fixture, id, stage), "apply");
+        let complete = fixture.rehearse(&["--json", "recover", "--complete", id]);
+        assert_eq!(complete.0, 0, "{stage}: {} {}", complete.1, complete.2);
+        assert_eq!(fixture.git(&["rev-parse", "HEAD"]), expected_head);
+        assert_eq!(fixture.git(&["write-tree"]), expected_index);
+        assert_eq!(
+            std::fs::read(fixture.repo().join("file.txt")).unwrap(),
+            b"reviewed final bytes\n"
+        );
+    }
+}
+
+#[test]
+fn carried_rollback_can_resume_after_its_own_interruption() {
+    for stage in [
+        "after-rollback-journal",
+        "after-rollback-refs",
+        "after-carry-files",
+        "after-rollback-worktree",
+    ] {
+        let fixture = Fixture::new();
+        fixture.commit_file("local.txt", "base\n", "local base");
+        fixture.write("local.txt", "staged\n");
+        fixture.git(&["add", "local.txt"]);
+        fixture.write("local.txt", "unstaged\n");
+        let before = fixture.refs();
+        let index = fixture.git(&["write-tree"]);
+        let id = kept_merge(&fixture);
+        assert_aborted(
+            &abort_apply(&fixture, &id, "after-reset-before-carried"),
+            "apply",
+        );
+        assert_aborted(&abort_rollback(&fixture, &id, stage), "rollback");
+        let result = fixture.rehearse(&["--json", "recover", "--rollback", &id]);
+        assert_eq!(result.0, 0, "{stage}: {} {}", result.1, result.2);
+        assert_eq!(fixture.refs(), before);
+        assert_eq!(fixture.git(&["write-tree"]), index);
+        assert_eq!(
+            std::fs::read(fixture.repo().join("local.txt")).unwrap(),
+            b"unstaged\n"
+        );
+    }
+}
+
+#[test]
+fn carried_storage_failures_preserve_snapshots_and_allow_rollback() {
+    for stage in [
+        "worktree-after-sync",
+        "refs-applied-sync",
+        "worktree-updated-sync",
+        "complete-sync",
+    ] {
+        let fixture = Fixture::new();
+        fixture.commit_file("local.txt", "base\n", "local base");
+        fixture.write("local.txt", "staged\n");
+        fixture.git(&["add", "local.txt"]);
+        fixture.write("local.txt", "unstaged\n");
+        let before = fixture.refs();
+        let index = fixture.git(&["write-tree"]);
+        let id = kept_merge(&fixture);
+        let failed = fail_recovery_storage(&fixture, &id, stage);
+        assert_eq!(failed.status.code(), Some(4), "{stage}: {failed:?}");
+        if stage == "worktree-after-sync" || stage == "refs-applied-sync" {
+            let discarded = fixture.rehearse(&["--json", "discard", &id]);
+            assert_eq!(discarded.0, 4, "recovery retains the sandbox");
+        }
+        fixture.git(&["reflog", "expire", "--expire=now", "--all"]);
+        fixture.git(&["gc", "--prune=now"]);
+        let rolled = fixture.rehearse(&["--json", "recover", "--rollback", &id]);
+        assert_eq!(rolled.0, 0, "{stage}: {} {}", rolled.1, rolled.2);
+        assert_eq!(fixture.refs(), before);
+        assert_eq!(fixture.git(&["write-tree"]), index);
+        assert_eq!(
+            std::fs::read(fixture.repo().join("local.txt")).unwrap(),
+            b"unstaged\n"
+        );
+    }
+}
+
+#[test]
+fn carried_recovery_preserves_external_edits_and_staging() {
+    for restage in [false, true] {
+        let fixture = Fixture::new();
+        fixture.commit_file("local.txt", "base\n", "local base");
+        fixture.write("local.txt", "carried\n");
+        let id = kept_merge(&fixture);
+        assert_aborted(
+            &abort_apply(&fixture, &id, "after-ref-transaction"),
+            "apply",
+        );
+        if restage {
+            fixture.git(&["add", "local.txt"]);
+        } else {
+            fixture.write("local.txt", "external\n");
+        }
+        let refs = fixture.refs();
+        let index = std::fs::read(fixture.repo().join(".git/index")).unwrap();
+        let bytes = std::fs::read(fixture.repo().join("local.txt")).unwrap();
+        for action in ["--complete", "--rollback"] {
+            let result = fixture.rehearse(&["--json", "recover", action, &id]);
+            assert_eq!(result.0, 4, "{action}: {} {}", result.1, result.2);
+            assert_eq!(fixture.refs(), refs);
+            assert_eq!(
+                std::fs::read(fixture.repo().join(".git/index")).unwrap(),
+                index
+            );
+            assert_eq!(
+                std::fs::read(fixture.repo().join("local.txt")).unwrap(),
+                bytes
+            );
+        }
+    }
+}
+
+#[test]
+fn carried_recovery_preserves_external_recreation_of_a_deleted_tracked_path() {
+    let fixture = Fixture::new();
+    fixture.commit_file("local.txt", "base\n", "local base");
+    std::fs::remove_file(fixture.repo().join("local.txt")).unwrap();
+    let id = kept_merge(&fixture);
+    assert_aborted(
+        &abort_apply(&fixture, &id, "after-ref-transaction"),
+        "apply",
+    );
+    fixture.write("local.txt", "external recreated file\n");
+    let refs = fixture.refs();
+    let index = std::fs::read(fixture.repo().join(".git/index")).unwrap();
+    let result = fixture.rehearse(&["--json", "recover", "--complete", &id]);
+    assert_eq!(result.0, 4, "{} {}", result.1, result.2);
+    assert_eq!(fixture.refs(), refs);
+    assert_eq!(
+        std::fs::read(fixture.repo().join(".git/index")).unwrap(),
+        index
+    );
+    assert_eq!(
+        std::fs::read(fixture.repo().join("local.txt")).unwrap(),
+        b"external recreated file\n"
+    );
+}
+
+#[test]
+fn carried_recovery_refuses_untracked_and_ignored_collisions() {
+    for ignored in [false, true] {
+        let fixture = Fixture::new();
+        fixture.commit_file("local.txt", "base\n", "local base");
+        fixture.write("added.txt", "tracked local addition\n");
+        fixture.git(&["add", "added.txt"]);
+        let id = kept_merge(&fixture);
+        assert_aborted(
+            &abort_apply(&fixture, &id, "after-reset-before-carried"),
+            "apply",
+        );
+        fixture.write("added.txt", "external untracked work\n");
+        if ignored {
+            std::fs::write(fixture.repo().join(".git/info/exclude"), "added.txt\n").unwrap();
+        }
+        let refs = fixture.refs();
+        let index = fixture.git(&["write-tree"]);
+        for action in ["--complete", "--rollback"] {
+            let result = fixture.rehearse(&["--json", "recover", action, &id]);
+            assert_eq!(result.0, 4, "{action}: {} {}", result.1, result.2);
+            assert_eq!(fixture.refs(), refs);
+            assert_eq!(fixture.git(&["write-tree"]), index);
+            assert_eq!(
+                std::fs::read(fixture.repo().join("added.txt")).unwrap(),
+                b"external untracked work\n"
+            );
+        }
+    }
 }
 
 #[test]

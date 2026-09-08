@@ -23,7 +23,7 @@
 //! 5. Only then touch the worktree.
 //!
 //! Uncommitted work carried through the rehearsal is transplanted the same
-//! way and for the same reason: [`crate::carry::restore`] checks out the tree
+//! way and for the same reason: [`crate::carry::restore_snapshot`] checks out the trees
 //! the sandbox produced rather than merging the user's changes here for the
 //! first time. Principle 2 covers the worktree, not only the refs.
 
@@ -138,7 +138,7 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         git::run(repo, ["reset", "--hard", "--quiet"])?;
         abort_for_test("after-reset-before-carried");
         if let Some(carried) = &carried {
-            carry::restore(repo, carried.result)?;
+            carry::restore_snapshot(repo, carried.result)?;
         }
         abort_for_test("after-worktree-update");
         recovery::worktree_updated_locked(&journal, &lock)?;

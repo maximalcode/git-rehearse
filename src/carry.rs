@@ -485,7 +485,7 @@ pub fn result_of(carry: &Carry) -> Option<&str> {
 /// Compared by tree rather than by commit id, because `git stash create` stamps
 /// a commit time and so never produces the same id twice. Both trees are
 /// compared — the worktree's and the index's — so that restaging counts as a
-/// change too, since the restore cannot preserve what was staged.
+/// change too: only the original staging that was rehearsed may be replaced.
 ///
 /// # Errors
 ///
@@ -519,7 +519,7 @@ fn trees_of(repo: &Path, commit: &str) -> Result<(String, Option<String>)> {
     Ok((worktree, index))
 }
 
-/// Puts the rehearsed result into the worktree, after the reset.
+/// Restores the worktree endpoint recorded by legacy apply journals.
 ///
 /// Not a merge, and not a `git stash apply`: `result` is a tree that was
 /// produced in the sandbox and inspected in the report, and this checks it
@@ -540,6 +540,25 @@ pub fn restore(repo: &Path, result: &str) -> Result<()> {
         ["read-tree", "-u", "--reset", &format!("{result}^{{tree}}")],
     )?;
     git::run(repo, ["reset", "--mixed", "--quiet", "HEAD"])?;
+    Ok(())
+}
+
+/// Transplants both trees of a protected stash snapshot, including staging.
+/// The intermediate index equals the worktree tree and is recognizable after
+/// interruption; no merge or replay is performed in the original repository.
+pub fn restore_snapshot(repo: &Path, snapshot: &str) -> Result<()> {
+    git::run(
+        repo,
+        [
+            "read-tree",
+            "-u",
+            "--reset",
+            &format!("{snapshot}^{{tree}}"),
+        ],
+    )?;
+    crate::test_hooks::abort("GIT_REHEARSE_ABORT_APPLY_AT", "after-carry-files");
+    crate::test_hooks::abort("GIT_REHEARSE_ABORT_RECOVERY_AT", "after-carry-files");
+    git::run(repo, ["read-tree", &format!("{snapshot}^2^{{tree}}")])?;
     Ok(())
 }
 
