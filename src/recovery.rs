@@ -125,6 +125,8 @@ struct Journal {
     worktree_before: String,
     #[serde(default)]
     worktree_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_before: Option<String>,
     previous_undo: Option<Vec<u8>>,
     expected_undo: Option<Vec<u8>>,
     rollback_undo: Option<Vec<u8>>,
@@ -354,6 +356,24 @@ fn prepare_operation_locked(
             after: moved.after.clone(),
         })
         .collect();
+    let local_before = if checkout.is_some() {
+        carry::snapshot(repo)?.map(|carry| carry.snapshot)
+    } else {
+        None
+    };
+    if let Some(snapshot) = &local_before {
+        if !worktree_result_matches(repo, snapshot, Some(&format!("{snapshot}^2"))) {
+            return Err(Error::Refused("the original index or tracked files cannot be verified against their snapshot; apply was not started".to_owned()));
+        }
+        git::run(
+            repo,
+            [
+                "update-ref",
+                &format!("refs/rehearse/{rehearsal}-original"),
+                snapshot,
+            ],
+        )?;
+    }
     let journal = Journal {
         schema: JOURNAL_SCHEMA,
         rehearsal: rehearsal.to_owned(),
@@ -363,6 +383,7 @@ fn prepare_operation_locked(
         anchor: anchor.to_owned(),
         worktree_before: worktree_before.to_owned(),
         worktree_after: None,
+        local_before,
         previous_undo,
         expected_undo,
         rollback_undo: None,
@@ -531,7 +552,7 @@ fn recover_locked(
                 return Ok(Recovered { inspection, action });
             };
             ensure_checkout(repo, branch)?;
-            ensure_worktree_matches(repo, &journal.worktree_before)?;
+            ensure_known_worktree(repo, &journal)?;
             update_worktree(repo, &journal)?;
             remove_undo_for(repo, &journal)?;
             complete_locked(journal_path, lock)?;
@@ -588,13 +609,17 @@ fn rollback_locked(
         }
         ensure_rollback_worktree(repo, &journal)?;
         if !worktree_matches_journal(repo, &journal, Endpoint::Before) {
-            git::run(repo, ["reset", "--hard", "--quiet"])?;
+            if let Some(snapshot) = &journal.local_before {
+                carry::restore_snapshot(repo, snapshot)?;
+            } else {
+                git::run(repo, ["reset", "--hard", "--quiet"])?;
+            }
         }
     }
     crate::test_hooks::abort("GIT_REHEARSE_ABORT_RECOVERY_AT", "after-rollback-worktree");
-    remove_anchor(repo, &journal)?;
     restore_previous(repo, &journal)?;
     forget_locked(&lock.journal_path, lock)?;
+    remove_anchor(repo, &journal)?;
     Ok(Recovered {
         inspection,
         action: Action::Rollback,
@@ -605,18 +630,59 @@ fn ensure_rollback_worktree(repo: &Path, journal: &Journal) -> Result<()> {
     if worktree_matches_journal(repo, journal, Endpoint::Before) {
         return Ok(());
     }
-    let branch = journal
-        .checkout
-        .as_deref()
-        .ok_or_else(|| Error::Refused("rollback has no recorded checkout to restore".to_owned()))?;
-    let expected = journal
+    ensure_known_worktree(repo, journal)?;
+    if let Some(snapshot) = &journal.local_before {
+        collision::check_restore(repo, repo, snapshot)
+    } else {
+        let branch = journal.checkout.as_deref().ok_or_else(|| {
+            Error::Refused("rollback has no recorded checkout to restore".to_owned())
+        })?;
+        rollback_reset_safe(repo, journal, branch)
+    }
+}
+
+/// Only exact recorded endpoints or the two Git checkout steps are recoverable.
+/// Partial file writes and unrelated edits remain ambiguous.
+fn worktree_in_transit(repo: &Path, journal: &Journal) -> bool {
+    if journal.local_before.is_none()
+        || !matches!(
+            journal.phase,
+            Phase::Prepared | Phase::RefsApplied | Phase::RollingBack
+        )
+    {
+        return false;
+    }
+    let Some(branch) = &journal.checkout else {
+        return false;
+    };
+    if ensure_checkout(repo, branch).is_err() {
+        return false;
+    }
+    let reset = journal
         .refs
         .iter()
         .find(|reference| reference.name == format!("refs/heads/{branch}"))
-        .and_then(|reference| reference.after.as_deref())
-        .unwrap_or(&journal.worktree_before);
-    ensure_worktree_matches(repo, expected)?;
-    rollback_reset_safe(repo, journal, branch)
+        .and_then(|reference| reference.after.as_deref());
+    reset.is_some_and(|commit| worktree_at(repo, commit))
+        || journal
+            .worktree_after
+            .as_deref()
+            .is_some_and(|snapshot| worktree_at(repo, snapshot))
+        || (journal.phase == Phase::RollingBack
+            && journal
+                .local_before
+                .as_deref()
+                .is_some_and(|snapshot| worktree_at(repo, snapshot)))
+}
+
+fn ensure_known_worktree(repo: &Path, journal: &Journal) -> Result<()> {
+    if worktree_matches_journal(repo, journal, Endpoint::Before)
+        || worktree_matches_journal(repo, journal, Endpoint::After)
+        || worktree_in_transit(repo, journal)
+    {
+        return Ok(());
+    }
+    Err(Error::Refused("apply recovery is blocked: the worktree or index changed while interrupted; preserve the external work before recovering".to_owned()))
 }
 
 fn refs_match(refs: &BTreeMap<String, String>, journal: &Journal, endpoint: Endpoint) -> bool {
@@ -665,7 +731,8 @@ fn inspect_journal(repo: &Path, journal: &Journal, journal_path: &Path) -> Resul
             },
             worktree: EndpointMatches {
                 after: worktree_matches_journal(repo, journal, Endpoint::After),
-                before: worktree_matches_journal(repo, journal, Endpoint::Before),
+                before: worktree_matches_journal(repo, journal, Endpoint::Before)
+                    || worktree_in_transit(repo, journal),
             },
         },
     );
@@ -678,7 +745,7 @@ fn inspect_journal(repo: &Path, journal: &Journal, journal_path: &Path) -> Resul
     let can_rollback = matches!(
         state,
         State::BeforeRefChange | State::AfterRefChange | State::Complete | State::RollingBack
-    ) && journal.worktree_after.is_none()
+    ) && (journal.worktree_after.is_none() || journal.local_before.is_some())
         && rollback_safe(repo, journal, state);
     Ok(Inspection {
         operation: journal.operation,
@@ -734,6 +801,15 @@ fn worktree_matches_journal(repo: &Path, journal: &Journal, endpoint: Endpoint) 
     };
     let checkout_matches = git::run(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"])
         .is_ok_and(|current| current == branch);
+    let snapshot = match endpoint {
+        Endpoint::Before => journal.local_before.as_deref(),
+        Endpoint::After if journal.local_before.is_some() => journal.worktree_after.as_deref(),
+        Endpoint::After => None,
+    };
+    if let Some(snapshot) = snapshot {
+        return checkout_matches
+            && worktree_result_matches(repo, snapshot, Some(&format!("{snapshot}^2")));
+    }
     if endpoint == Endpoint::After && journal.worktree_after.is_some() {
         return checkout_matches
             && worktree_result_matches(
@@ -763,32 +839,97 @@ fn worktree_result_matches(repo: &Path, expected: &str, expected_head: Option<&s
         return false;
     };
     let expected_index = git::run(repo, ["rev-parse", &format!("{expected_head}^{{tree}}")]);
-    let actual_index = git::run(repo, ["write-tree"]);
+    let actual_index = index_tree(repo);
     matches!((expected_index, actual_index), (Ok(expected), Ok(actual)) if expected == actual)
         // The carried result is a stash-shaped commit whose tree is the
         // promised worktree endpoint. Compare it through a disposable index
         // so assume-unchanged and skip-worktree cannot hide edits made after
         // the interrupted apply.
+        && deleted_paths_match(repo, expected_head, expected)
         && worktree_matches_without_index_flags(repo, expected)
+}
+
+/// The worktree-only comparison cannot see paths absent from its tree. A
+/// recreated unstaged deletion is still tracked in the real index, so the
+/// untracked collision check cannot protect it either.
+fn deleted_paths_match(repo: &Path, index: &str, worktree: &str) -> bool {
+    let Ok(deleted) = git::run_bytes(
+        repo,
+        [
+            "diff-tree",
+            "-r",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=D",
+            "-z",
+            index,
+            worktree,
+            "--",
+        ],
+    ) else {
+        return false;
+    };
+    if deleted.is_empty() {
+        return true;
+    }
+    let Ok(listing) = git::run_bytes(repo, ["ls-tree", "-r", "--name-only", "-z", worktree]) else {
+        return false;
+    };
+    let leaves: Vec<_> = listing
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect();
+    deleted
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .all(|path| {
+            // Directory -> file/symlink: the new leaf's ordinary comparison
+            // verifies this replacement without following it to inspect children.
+            if leaves.iter().any(|leaf| {
+                path.strip_prefix(*leaf)
+                    .is_some_and(|suffix| suffix.starts_with(b"/"))
+            }) {
+                return true;
+            }
+            let Some(name) = os_string_from_git_path(path) else {
+                return false;
+            };
+            match fs::symlink_metadata(repo.join(name)) {
+                // File -> directory: a directory is expected only when the
+                // reviewed tree actually puts descendants underneath it.
+                Ok(metadata) => {
+                    metadata.is_dir()
+                        && leaves.iter().any(|leaf| {
+                            leaf.strip_prefix(path)
+                                .is_some_and(|suffix| suffix.starts_with(b"/"))
+                        })
+                }
+                Err(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ),
+            }
+        })
 }
 
 fn completion_safe(repo: &Path, journal: &Journal) -> bool {
     let Some(branch) = journal.checkout.as_deref() else {
         return true;
     };
-    if !worktree_matches_journal(repo, journal, Endpoint::Before) {
+    if ensure_known_worktree(repo, journal).is_err() {
+        return false;
+    }
+    if collision::check_reset(repo, repo, &format!("refs/heads/{branch}")).is_err() {
         return false;
     }
     match journal.worktree_after.as_deref() {
         Some(result) => collision::check_restore(repo, repo, result).is_ok(),
-        None => collision::check_reset(repo, repo, &format!("refs/heads/{branch}")).is_ok(),
+        None => true,
     }
 }
 
 fn rollback_safe(repo: &Path, journal: &Journal, state: State) -> bool {
-    if journal.worktree_after.is_some() {
-        return false;
-    }
     let Some(branch) = journal.checkout.as_deref() else {
         return state == State::BeforeRefChange || ensure_checkout_not_moved(repo, journal).is_ok();
     };
@@ -831,7 +972,11 @@ fn ensure_checkout_not_moved(repo: &Path, journal: &Journal) -> Result<()> {
 fn update_worktree(repo: &Path, journal: &Journal) -> Result<()> {
     if let Some(result) = journal.worktree_after.as_deref() {
         collision::check_restore(repo, repo, result)?;
-        carry::restore(repo, result)
+        if journal.local_before.is_some() {
+            carry::restore_snapshot(repo, result)
+        } else {
+            carry::restore(repo, result)
+        }
     } else {
         git::run(repo, ["reset", "--hard", "--quiet"])?;
         Ok(())
@@ -842,9 +987,23 @@ fn state_of(repo: &Path) -> Result<BTreeMap<String, String>> {
     git::refs(repo, "refs/heads/", 0)
 }
 
+/// `write-tree` can update the index's cache-tree extension. Compare a copy
+/// so inspection and refused recovery leave even the real index bytes alone.
+fn index_tree(repo: &Path) -> Result<String> {
+    let storage = git_dir(repo)?;
+    let temporary = tempfile::tempdir_in(&storage).map_err(Error::io(&storage))?;
+    let index = temporary.path().join("index");
+    fs::copy(storage.join("index"), &index).map_err(Error::io(&index))?;
+    git::run_with_clean_env(
+        repo,
+        ["write-tree"],
+        &[("GIT_INDEX_FILE", index.into_os_string())],
+    )
+}
+
 fn worktree_at(repo: &Path, expected_head: &str) -> bool {
     let expected_tree = git::run(repo, ["rev-parse", &format!("{expected_head}^{{tree}}")]);
-    let index_tree = git::run(repo, ["write-tree"]);
+    let index_tree = index_tree(repo);
     matches!((expected_tree, index_tree), (Ok(expected), Ok(index)) if expected == index)
         && worktree_matches_without_index_flags(repo, expected_head)
 }
@@ -962,18 +1121,6 @@ fn os_string_from_git_path(path: &[u8]) -> Option<OsString> {
     }
 }
 
-fn ensure_worktree_matches(repo: &Path, expected_head: &str) -> Result<()> {
-    if worktree_at(repo, expected_head) {
-        return Ok(());
-    }
-    Err(Error::Refused(
-        "apply recovery is blocked: the worktree or index changed while the operation was \
-         interrupted. Preserve the current work by resolving the state by hand; no recovery \
-         action was performed."
-            .to_owned(),
-    ))
-}
-
 fn ensure_checkout(repo: &Path, expected: &str) -> Result<()> {
     let current = git::run(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"])
         .unwrap_or_else(|_| "detached HEAD".to_owned());
@@ -1041,6 +1188,22 @@ fn remove_anchor(repo: &Path, journal: &Journal) -> Result<()> {
     let anchored = git::refs(repo, &journal.anchor, 0)?;
     for name in anchored.keys() {
         git::run(repo, ["update-ref", "-d", name])?;
+    }
+    for (suffix, snapshot) in [
+        ("original", &journal.local_before),
+        ("carry", &journal.worktree_after),
+    ] {
+        if let Some(snapshot) = snapshot {
+            git::run(
+                repo,
+                [
+                    "update-ref",
+                    "-d",
+                    &format!("refs/rehearse/{}-{suffix}", journal.rehearsal),
+                    snapshot,
+                ],
+            )?;
+        }
     }
     Ok(())
 }
@@ -1308,6 +1471,7 @@ mod tests {
             anchor: String::new(),
             worktree_before: "abc".to_owned(),
             worktree_after: None,
+            local_before: None,
             previous_undo: None,
             expected_undo: None,
             rollback_undo: None,

@@ -183,6 +183,15 @@ Rollback also records its intent before changing refs. If rollback is
 interrupted, recovery reports `rolling_back`; use `recover --rollback` again
 to finish from the verified state. Changed files or refs still block recovery.
 
+Interrupted Apply also protects the original and reviewed snapshots of tracked
+files and the index. `recover --complete` transplants the reviewed carry result;
+`recover --rollback` restores the original file contents and staging. Recovery
+recognizes the gap after the branch reset and between restoring files and the
+index. Snapshots remain protected until recovery finishes. Later external edits
+or untracked/ignored collisions block recovery; partial file writes that do not
+match a recorded state remain ambiguous. Older journals without an original
+local snapshot cannot roll back carried work automatically.
+
 ### When it conflicts
 
 ```console
@@ -284,12 +293,13 @@ carried  1 uncommitted path(s): config.toml
 Four things worth knowing:
 
 - **Untracked files are left alone** — not carried, not touched. They are not in
-  a stash without `-u`, and git was never going to destroy them.
+  a stash without `-u`. Apply and recovery refuse untracked or ignored paths
+  that a checkout would replace.
 - **Apply refuses if your worktree has changed since.** What the report promised
   to put back was rehearsed; anything you typed afterwards was not.
-- **Everything comes back unstaged**, in your worktree, exactly where
-  `git stash pop` without `--index` would leave it. A transplanted tree does not
-  carry the staged/unstaged distinction.
+- **Apply preserves the reviewed sandbox index and file contents.** The initial
+  replay normally leaves carried changes unstaged. If you stage a conflict
+  resolution before Continue, Apply preserves that reviewed staging too.
 - **`undo` refuses while those changes are in the way**, because rewinding the
   branch means `git reset --hard` and that would eat them. Stash them, undo,
   put them back.
