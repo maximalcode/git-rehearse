@@ -513,6 +513,7 @@ mod tests {
             id: "1786248000-00".to_owned(),
             repo_id: "app-0123456789abcdef".to_owned(),
             repo_path: PathBuf::from("/repos/app"),
+            origin: None,
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
             checkout: Checkout::Branch("feature".to_owned()),
             pre_state: BTreeMap::new(),

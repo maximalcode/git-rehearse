@@ -457,7 +457,7 @@ fn optional_metadata_survives_migration_and_later_continuation() {
     assert_eq!(code, CLEAN, "{out}\n{err}");
     assert_eq!(document(&out)["rehearsals"][0]["id"], id);
     let migrated = document(&std::fs::read_to_string(metadata).expect("migrated metadata"));
-    assert_eq!(migrated["schema"], 2);
+    assert_eq!(migrated["schema"], git_rehearse::sandbox::META_SCHEMA);
     assert_eq!(migrated["optional_annotation"], extension);
 
     std::fs::write(worktree.join("file.txt"), "resolved\n").expect("resolve");

@@ -119,6 +119,8 @@ struct Journal {
     schema: u32,
     rehearsal: String,
     origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<crate::worktree::Origin>,
     checkout: Option<String>,
     refs: Vec<JournalRef>,
     anchor: String,
@@ -206,7 +208,7 @@ impl Drop for Lock {
 
 /// Returns the journal path for a repository.
 pub fn path(repo: &Path) -> Result<PathBuf> {
-    Ok(git_dir(repo)?.join(JOURNAL_FILE))
+    Ok(crate::worktree::common_dir(repo)?.join(JOURNAL_FILE))
 }
 
 /// Acquires exclusive recovery ownership for the repository.
@@ -378,6 +380,7 @@ fn prepare_operation_locked(
         schema: JOURNAL_SCHEMA,
         rehearsal: rehearsal.to_owned(),
         origin: repo.display().to_string(),
+        identity: Some(crate::worktree::Origin::capture(repo)?),
         checkout: checkout.map(str::to_owned),
         refs,
         anchor: anchor.to_owned(),
@@ -485,6 +488,21 @@ pub fn inspect_locked(repo: &Path, lock: &Lock) -> Result<Option<Inspection>> {
     }
     let journal = read(journal_path)?;
     inspect_journal(repo, &journal, journal_path).map(Some)
+}
+
+/// Refuse worktree updates if an external process changed an endpoint after
+/// the ref transaction. The journal remains available for explicit recovery.
+pub(crate) fn check_update_locked(repo: &Path, lock: &Lock) -> Result<()> {
+    let inspection = inspect_locked(repo, lock)?.ok_or_else(|| {
+        Error::Refused("the apply journal disappeared; worktree update is blocked".to_owned())
+    })?;
+    if inspection.state == State::Complete
+        || (inspection.state == State::AfterRefChange && inspection.can_complete)
+    {
+        Ok(())
+    } else {
+        Err(blocked(&inspection))
+    }
 }
 
 /// Complete or roll back a journal based on observed state.
@@ -712,6 +730,19 @@ fn inspect_journal(repo: &Path, journal: &Journal, journal_path: &Path) -> Resul
             "apply journal belongs to another repository; recovery is blocked".to_owned(),
         ));
     }
+    journal
+        .identity
+        .as_ref()
+        .ok_or_else(|| {
+            Error::Refused(
+                "apply journal has no durable worktree identity; recovery is blocked".to_owned(),
+            )
+        })?
+        .verify(repo)?;
+    crate::worktree::check_occupancy(
+        repo,
+        journal.refs.iter().map(|reference| reference.name.as_str()),
+    )?;
     let expected_anchor = match journal.operation {
         Operation::Apply => format!("refs/rehearse/{}/", journal.rehearsal),
         Operation::Undo => String::new(),
@@ -1155,10 +1186,23 @@ fn restore_refs(repo: &Path, journal: &Journal) -> Result<()> {
         }
     }
     if !commands.is_empty() {
-        git::run_with_stdin(
+        crate::worktree::transact(
             repo,
-            ["update-ref", "-m", "git-rehearse recovery", "--stdin", "-z"],
-            Some(&commands),
+            &commands,
+            &journal
+                .refs
+                .iter()
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            "git-rehearse recovery rollback",
+            || {
+                if let Some(branch) = journal.checkout.as_deref() {
+                    ensure_checkout(repo, branch)?;
+                } else {
+                    ensure_checkout_not_moved(repo, journal)?;
+                }
+                ensure_rollback_worktree(repo, journal)
+            },
         )?;
     }
     Ok(())
@@ -1466,6 +1510,7 @@ mod tests {
             schema: super::JOURNAL_SCHEMA,
             rehearsal: "second".to_owned(),
             origin: "/repo".to_owned(),
+            identity: None,
             checkout: None,
             refs: Vec::new(),
             anchor: String::new(),

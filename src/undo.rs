@@ -174,10 +174,12 @@ pub fn run(repo: &Path, id: Option<&str>) -> Result<Undone> {
         )));
     }
 
+    crate::worktree::check_occupancy(repo, record.refs.iter().map(|moved| moved.name.as_str()))?;
     let now = branches(repo)?;
     check_still_applied(&record, &now)?;
 
-    let reset = match worktree_action(current_branch(repo).as_deref(), &record.refs) {
+    let checkout = current_branch(repo);
+    let reset = match worktree_action(checkout.as_deref(), &record.refs) {
         Worktree::Refuse(branch) => return Err(refuse_deleting_the_checkout(&branch)),
         Worktree::Reset(branch) => {
             check_clean(repo)?;
@@ -203,12 +205,14 @@ pub fn run(repo: &Path, id: Option<&str>) -> Result<Undone> {
     )?;
     abort_for_test("after-journal");
 
-    restore(repo, &record)?;
+    crate::worktree::check_occupancy(repo, record.refs.iter().map(|moved| moved.name.as_str()))?;
+    restore(repo, &record, checkout.as_deref(), &worktree_before)?;
     abort_for_test("after-ref-transaction");
     recovery::refs_applied_locked(&journal, &lock)?;
     abort_for_test("after-refs-phase");
 
     if reset.is_some() {
+        recovery::check_update_locked(repo, &lock)?;
         // Same as apply, for the same reason: the branch under HEAD now points
         // at the restored commit while the index and worktree still hold the
         // one the apply left. Resetting to HEAD, because HEAD is already right.
@@ -498,24 +502,42 @@ fn check_clean(repo: &Path) -> Result<()> {
 }
 
 /// The restore itself: one transaction, all or nothing.
-fn restore(repo: &Path, record: &Record) -> Result<()> {
+fn restore(repo: &Path, record: &Record, checkout: Option<&str>, head: &str) -> Result<()> {
     let commands = restore_commands(&record.refs);
     if commands.is_empty() {
         return Ok(());
     }
-    git::run_with_stdin(
+    crate::worktree::transact(
         repo,
-        [
-            "update-ref",
-            // The apply put a line in the reflog saying where the commits came
-            // from; taking it back deserves a line of its own, or the branch
-            // appears to have jumped backwards on its own.
-            "-m",
-            &format!("git-rehearse undo {}", record.rehearsal),
-            "--stdin",
-            "-z",
-        ],
-        Some(&commands),
+        &commands,
+        &record
+            .refs
+            .iter()
+            .map(|reference| reference.name.as_str())
+            .collect::<Vec<_>>(),
+        &format!("git-rehearse undo {}", record.rehearsal),
+        || {
+            if current_branch(repo).as_deref() != checkout
+                || git::run(repo, ["rev-parse", "HEAD"])? != head
+            {
+                return Err(Error::Refused(
+                    "the original checkout changed while preparing Undo; no refs were restored"
+                        .to_owned(),
+                ));
+            }
+            if let Worktree::Reset(branch) = worktree_action(checkout, &record.refs) {
+                check_clean(repo)?;
+                let reference = format!("refs/heads/{branch}");
+                let target = record
+                    .refs
+                    .iter()
+                    .find(|reference_move| reference_move.name == reference)
+                    .and_then(|reference_move| reference_move.before.as_deref())
+                    .expect("reset target");
+                crate::collision::check_reset(repo, repo, target)?;
+            }
+            Ok(())
+        },
     )?;
     Ok(())
 }

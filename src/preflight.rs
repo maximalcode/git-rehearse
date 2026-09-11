@@ -72,7 +72,7 @@ pub fn run(cwd: &Path) -> Result<Preflight> {
     // being told that submodules are unsupported anyway, wastes someone's
     // afternoon.
     refuse_if_shallow(&repo)?;
-    refuse_if_multiple_worktrees(&repo)?;
+    crate::worktree::check_occupancy(&repo, std::iter::empty())?;
     refuse_if_submodules(&repo)?;
     refuse_if_lfs(&repo)?;
 
@@ -148,23 +148,6 @@ fn refuse_if_shallow(repo: &Path) -> Result<()> {
              what the same command does in a complete clone — run `git fetch --unshallow` first."
                 .to_owned(),
         ));
-    }
-    Ok(())
-}
-
-fn refuse_if_multiple_worktrees(repo: &Path) -> Result<()> {
-    let listing = git::run(repo, ["worktree", "list", "--porcelain"])?;
-    let count = listing
-        .lines()
-        .filter(|line| line.starts_with("worktree "))
-        .count();
-    if count > 1 {
-        return Err(refused(format!(
-            "this repository has {count} worktrees (see `git worktree list`).\n\
-             Applying a rehearsal moves branches, and a branch checked out in another worktree \
-             would be moved out from under it — v0.1 will not risk that. Remove the extra \
-             worktrees, or rehearse elsewhere."
-        )));
     }
     Ok(())
 }

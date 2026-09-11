@@ -17,7 +17,6 @@ use std::time::UNIX_EPOCH;
 
 use super::Sandbox;
 use super::meta::{Meta, Status};
-use crate::git;
 use crate::recovery;
 use crate::{Error, Result};
 
@@ -234,19 +233,8 @@ fn pause_for_test(stage: &str) {
 /// still needs. A damaged journal is treated as reserved as well: failing
 /// closed preserves the evidence for recovery to diagnose.
 pub(super) fn is_recovery_reserved(meta: &Meta) -> bool {
-    let Ok(path) = git::run(
-        &meta.repo_path,
-        ["rev-parse", "--git-path", "rehearse-apply"],
-    ) else {
-        // If the originating repository cannot be inspected, ownership is
-        // unknown. Preserve the sandbox until recovery can make that call.
+    let Ok(journal) = recovery::path(&meta.repo_path) else {
         return true;
-    };
-    let journal = PathBuf::from(path);
-    let journal = if journal.is_absolute() {
-        journal
-    } else {
-        meta.repo_path.join(journal)
     };
     match fs::symlink_metadata(&journal) {
         Ok(metadata) if metadata.file_type().is_file() => {}

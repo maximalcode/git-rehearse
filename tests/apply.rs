@@ -856,7 +856,9 @@ fn a_live_completed_apply_keeps_its_journal_owner_until_exit() {
         )
         .args(["--json", "apply", &id]);
     let first = first.spawn().expect("first apply starts");
-    for _ in 0..500 {
+    // Prepared HEAD checks and endpoint validation may exceed five seconds
+    // when the full real-Git suite runs concurrently.
+    for _ in 0..6000 {
         if marker.exists() {
             break;
         }

@@ -291,6 +291,16 @@ interactive rebase to a real repo with zero surprises.
    rollback itself, and refuses external edits or untracked/ignored collisions.
    Snapshots are retained until completion; unknown partial writes stay blocked.
 
+7. **Multiple worktrees: BUILT** (#90). This supersedes the v1.0 blanket refusal.
+   Rehearsals retain their worktree-specific storage and durable administrative
+   origin, with a separate shared-repository identity. Apply, Undo and recovery
+   coordinate through one common-directory lock/journal and refuse foreign branch
+   occupancy or lost origin. Simple explicit single-branch operations validate
+   their relevant branches; complex commands retain the conservative full branch
+   snapshot. Dependency refs and changed refs are checked in the Git transaction.
+   Independent results remain usable; overlapping results are preserved but refused.
+   Older metadata without durable origin cannot authorize Apply or recovery.
+
 ## v2.0 — agent mode (the strategic release)
 
 Everything here rides on v1's mechanics; nothing requires rework if v1 keeps its exit

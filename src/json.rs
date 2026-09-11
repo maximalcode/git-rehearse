@@ -34,13 +34,13 @@ use crate::analyze::{Analysis, Commit, Conflict, Drift, FileChange, RefMove};
 // they were replayed, and what happened to the *carried changes*.
 use crate::analyze::Replay as CommitReplay;
 use crate::apply::Applied;
+use crate::cache;
 use crate::carry::{Carry, Replay};
 use crate::execute::Outcome;
 use crate::recovery::{Action as RecoveryAction, Inspection, Phase, State as RecoveryState};
 use crate::report::Choice;
 use crate::sandbox::{Checkout, Meta, Sandbox, Status};
 use crate::undo::Undone;
-use crate::{cache, git};
 
 /// Version of the document below.
 ///
@@ -657,18 +657,9 @@ fn storage(sandbox: &Sandbox) -> Storage {
 /// worktree-specific cache key. Linked worktrees report the same common Git
 /// directory here while retaining separate rehearsal storage roots.
 pub(crate) fn repository_identity(meta: &Meta) -> Option<String> {
-    let common = git::run(&meta.repo_path, ["rev-parse", "--git-common-dir"])
-        .ok()
-        .map(std::path::PathBuf::from)
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                meta.repo_path.join(path)
-            }
-        })
-        .and_then(|path| git::canonicalize(&path).ok());
-    common.as_deref().map(cache::repo_id)
+    let origin = meta.origin.as_ref()?;
+    origin.verify(&meta.repo_path).ok()?;
+    Some(cache::repo_id(&origin.common_dir))
 }
 
 fn reference(moved: &RefMove) -> Ref {
