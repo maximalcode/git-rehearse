@@ -394,7 +394,7 @@ fn object(value: &str) -> Option<String> {
 /// saying so is the only useful thing left to do.
 fn check_is_the_one_meant(record: &Record, id: Option<&str>) -> Result<()> {
     let Some(id) = id else { return Ok(()) };
-    if record.rehearsal.starts_with(id) {
+    if crate::sandbox::matches_id(&record.rehearsal, id) {
         return Ok(());
     }
     Err(Error::Refused(format!(
@@ -852,5 +852,13 @@ mod tests {
         // A prefix of the recorded id is how every other command takes an id.
         assert!(check_is_the_one_meant(&record(), Some("17862480")).is_ok());
         assert!(check_is_the_one_meant(&record(), None).is_ok());
+    }
+    #[test]
+    fn a_complete_main_id_cannot_select_a_legacy_linked_undo() {
+        let mut record = record();
+        record.rehearsal = "1786248000-00-linked-0123456789abcdef".to_owned();
+        assert!(check_is_the_one_meant(&record, Some("1786248000-00")).is_err());
+        assert!(check_is_the_one_meant(&record, Some(&record.rehearsal)).is_ok());
+        assert!(check_is_the_one_meant(&record, Some("1786248000")).is_ok());
     }
 }

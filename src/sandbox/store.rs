@@ -96,7 +96,7 @@ pub fn find(cache_root: &Path, repo_id: &str, id: Option<&str>) -> Result<Sandbo
 
     let mut matches: Vec<Sandbox> = candidates
         .into_iter()
-        .filter(|sandbox| sandbox.id() == id || sandbox.id().starts_with(id))
+        .filter(|sandbox| matches_id(sandbox.id(), id))
         .collect();
     match matches.len() {
         1 => Ok(matches.remove(0)),
@@ -110,6 +110,19 @@ pub fn find(cache_root: &Path, repo_id: &str, id: Option<&str>) -> Result<Sandbo
             matches.len()
         ))),
     }
+}
+
+/// Matches an exact rehearsal ID or an unambiguous shorthand candidate.
+pub(crate) fn matches_id(rehearsal: &str, id: &str) -> bool {
+    // Older linked IDs extended a complete main-worktree ID. Never resolve
+    // that complete ID to a different rehearsal through prefix shorthand.
+    let complete_main_id = id.split_once('-').is_some_and(|(timestamp, counter)| {
+        !timestamp.is_empty()
+            && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+            && counter.len() == 2
+            && counter.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    rehearsal == id || (!complete_main_id && rehearsal.starts_with(id))
 }
 
 /// Deletes rehearsals older than `max_age_secs`, returning the ids removed.

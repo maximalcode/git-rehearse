@@ -579,3 +579,75 @@ fn an_empty_cache_is_an_empty_listing_not_an_error() {
         Vec::<String>::new()
     );
 }
+
+#[test]
+fn a_full_main_worktree_id_never_selects_a_linked_rehearsal_from_the_same_second() {
+    let fixture = Fixture::new();
+    let linked = fixture.scratch("linked");
+    fixture.git(&["worktree", "add", linked.to_str().unwrap(), "-b", "other"]);
+    let command = vec!["merge".to_owned(), "feature".to_owned()];
+    let main_plan = git_rehearse::preflight::run(fixture.repo())
+        .unwrap()
+        .into_plan(command.clone());
+    let linked_plan = git_rehearse::preflight::run(&linked)
+        .unwrap()
+        .into_plan(command);
+    let main = sandbox::create(fixture.cache(), &main_plan, NOW).unwrap();
+    let linked = sandbox::create(fixture.cache(), &linked_plan, NOW).unwrap();
+    assert!(
+        sandbox::find(fixture.cache(), &linked.meta().repo_id, Some(main.id())).is_err(),
+        "a complete main-worktree ID must not select a linked rehearsal created in the same second"
+    );
+    assert_eq!(
+        sandbox::find(fixture.cache(), &linked.meta().repo_id, Some(linked.id()))
+            .unwrap()
+            .id(),
+        linked.id()
+    );
+    assert_eq!(
+        sandbox::find(fixture.cache(), &linked.meta().repo_id, Some("1786248000"))
+            .unwrap()
+            .id(),
+        linked.id()
+    );
+}
+
+#[test]
+fn legacy_linked_ids_do_not_accept_a_complete_main_id_as_a_prefix() {
+    let fixture = Fixture::new();
+    let linked_path = fixture.scratch("linked");
+    fixture.git(&[
+        "worktree",
+        "add",
+        linked_path.to_str().unwrap(),
+        "-b",
+        "other",
+    ]);
+    let plan = git_rehearse::preflight::run(&linked_path)
+        .unwrap()
+        .into_plan(vec!["merge".to_owned(), "feature".to_owned()]);
+    let linked = sandbox::create(fixture.cache(), &plan, NOW).unwrap();
+    let main_id = format!("{NOW}-00");
+    let legacy_id = format!("{main_id}-linked-0123456789abcdef");
+    let metadata = linked.root().join("meta.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+    document["id"] = serde_json::json!(legacy_id);
+    std::fs::write(&metadata, serde_json::to_vec(&document).unwrap()).unwrap();
+    let legacy_root = linked.root().parent().unwrap().join(&legacy_id);
+    std::fs::rename(linked.root(), &legacy_root).unwrap();
+
+    assert!(sandbox::find(fixture.cache(), &linked.meta().repo_id, Some(&main_id)).is_err());
+    assert_eq!(
+        sandbox::find(fixture.cache(), &linked.meta().repo_id, Some(&legacy_id))
+            .unwrap()
+            .id(),
+        legacy_id
+    );
+    assert_eq!(
+        sandbox::find(fixture.cache(), &linked.meta().repo_id, Some("1786248000"))
+            .unwrap()
+            .id(),
+        legacy_id
+    );
+}

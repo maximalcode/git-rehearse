@@ -537,7 +537,7 @@ fn recover_locked(
     let mut journal = read(journal_path)?;
     let mut inspection = inspect_journal(repo, &journal, journal_path)?;
     if let Some(expected) = expected_rehearsal
-        && !journal.rehearsal.starts_with(expected)
+        && !crate::sandbox::matches_id(&journal.rehearsal, expected)
     {
         return Err(Error::Refused(format!(
             "the apply journal does not belong to rehearsal {expected}; no recovery action was done"

@@ -65,11 +65,12 @@ pub fn create(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result<Sandbox> 
 fn claim_directory(repo_dir: &Path, repo: &Path, now_unix: u64) -> Result<(String, PathBuf)> {
     for attempt in 0..100 {
         let origin = crate::worktree::Origin::capture(repo)?;
+        // A full main-worktree ID must never be a prefix of a linked ID.
         let id = if origin.git_dir == origin.common_dir {
             format!("{now_unix}-{attempt:02}")
         } else {
             format!(
-                "{now_unix}-{attempt:02}-{}",
+                "{now_unix}-w{}-{attempt:02}",
                 crate::cache::repo_id(&origin.git_dir)
             )
         };
