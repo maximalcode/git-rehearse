@@ -36,6 +36,7 @@ mod store;
 
 pub use build::create;
 pub use meta::{Checkout, META_SCHEMA, Meta, Status};
+pub(crate) use store::matches_id;
 pub use store::{DEFAULT_TTL_SECS, find, list, prune};
 
 use std::collections::BTreeMap;

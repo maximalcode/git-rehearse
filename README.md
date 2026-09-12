@@ -26,7 +26,7 @@ away. Your repository is not touched until you say so.
 ### Upgrading from v1.1.0
 
 Kept rehearsals from v1.1.0 are migrated when first read by v1.2.0. Metadata
-schema 1 is upgraded atomically to schema 2, preserving the original
+schema 1 is upgraded atomically to the current metadata schema, preserving the original
 repository, checkout, refs and result. Unknown schemas and damaged metadata
 are refused and left in place so they can be recovered or diagnosed.
 
@@ -546,8 +546,8 @@ Principle 5 is *refuse loudly rather than guess*. All of these exit `4` with an
 explanation rather than doing something approximate:
 
 a bare repository · a shallow clone · a repository with submodules · one using
-Git LFS · one with multiple worktrees · one with no commits yet · and, at apply
-time, a repository whose refs have moved since the rehearsal, or whose worktree
+Git LFS · one with no commits yet · and, at apply
+time, a repository whose relevant refs have moved since the rehearsal, or whose worktree
 no longer holds the uncommitted changes the rehearsal carried.
 
 A dirty worktree used to head that list. It is now carried through the
@@ -557,6 +557,39 @@ rehearsal instead — the principle did not change, only the thing being refused
 different apply than the one you named, a ref that has moved since that apply,
 a worktree with uncommitted changes it would have to rewind, and a branch that
 undoing would delete while you are standing on it.
+
+## Multiple worktrees
+
+Rehearse from the main worktree or a linked worktree using the same commands.
+Each worktree retains its own rehearsal list and Undo record. Opening another
+worktree does not reassign a rehearsal; Apply always targets its recorded origin.
+The JSON repository identity is shared, while the origin worktree remains explicit.
+
+Apply, Undo, and recovery refuse to move a branch checked out in another worktree.
+This includes branches retained by a paused rebase or bisect. They recheck
+occupancy before mutation and refuse missing or ambiguous worktree
+registrations. Other worktrees' files and indices are left alone. Rehearsals may
+run independently; shared mutations use one repository lock. An interrupted Apply
+or Undo blocks further mutations across the repository until recovery is performed
+from its original worktree.
+
+Simple merge, rebase, and cherry-pick operations with one explicit local branch
+check that branch, the original checkout, and all changed branches. Independent
+results can therefore be applied in sequence; an overlapping result becomes stale
+and stays available for reference. Complex revision expressions and arbitrary
+commands conservatively check every recorded branch. Git checks expected old ref
+values in the transaction, including unchanged branch dependencies; external Git
+processes are also checked before updating the origin's files. Prepared Git
+transactions lock existing worktree HEADs during the final occupancy checks;
+observed changes to the worktree registry also cause refusal. Git has no shared
+lock for new worktree registrations, so avoid adding or removing worktrees during
+Apply, Undo, or recovery. Mutation requires Git support
+for transactional symbolic-ref verification; older Git versions refuse safely
+and need upgrading.
+
+Older rehearsals and recovery journals without durable origin information remain
+readable but cannot authorize mutation. Keep their sandboxes for reference and
+create a new rehearsal; do not discard an unresolved recovery journal.
 
 ## Where things live
 

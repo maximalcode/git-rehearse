@@ -436,6 +436,60 @@ pub fn flag_with_path(prefix: &str, path: &Path) -> OsString {
     arg
 }
 
+/// Hold Git's own ref locks while the caller rechecks worktree occupancy.
+/// EOF aborts an uncommitted transaction, including when our process crashes.
+pub(crate) fn ref_transaction(
+    repo: &Path,
+    commands: &str,
+    message: &str,
+    check: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    use std::io::BufRead as _;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["update-ref", "--stdin", "-z", "--no-deref", "-m", message])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(Error::Spawn)?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let result = (|| {
+        stdin
+            .write_all(format!("start\0{commands}prepare\0").as_bytes())
+            .map_err(Error::Spawn)?;
+        stdin.flush().map_err(Error::Spawn)?;
+        for expected in ["start: ok\n", "prepare: ok\n"] {
+            let mut line = String::new();
+            stdout.read_line(&mut line).map_err(Error::Spawn)?;
+            if line != expected {
+                return Err(Error::Refused(
+                    "Git could not lock the expected refs and worktree HEADs; mutation was refused"
+                        .to_owned(),
+                ));
+            }
+        }
+        check()?;
+        stdin.write_all(b"commit\0").map_err(Error::Spawn)?;
+        stdin.flush().map_err(Error::Spawn)
+    })();
+    drop(stdin);
+    // Drain the remaining protocol reply before waiting. It is not JSON output.
+    let mut rest = String::new();
+    let _ = stdout.read_to_string(&mut rest);
+    let output = child.wait_with_output().map_err(Error::Spawn)?;
+    if !output.status.success() {
+        return Err(Error::Git {
+            args: "update-ref --stdin -z --no-deref".to_owned(),
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::{describe, flag_with_path, run};

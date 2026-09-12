@@ -64,7 +64,16 @@ pub fn create(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result<Sandbox> 
 /// even after their sandbox directory has been removed.
 fn claim_directory(repo_dir: &Path, repo: &Path, now_unix: u64) -> Result<(String, PathBuf)> {
     for attempt in 0..100 {
-        let id = format!("{now_unix}-{attempt:02}");
+        let origin = crate::worktree::Origin::capture(repo)?;
+        // A full main-worktree ID must never be a prefix of a linked ID.
+        let id = if origin.git_dir == origin.common_dir {
+            format!("{now_unix}-{attempt:02}")
+        } else {
+            format!(
+                "{now_unix}-w{}-{attempt:02}",
+                crate::cache::repo_id(&origin.git_dir)
+            )
+        };
         if !git::refs(repo, &format!("refs/rehearse/{id}/"), 0)?.is_empty() {
             continue;
         }
@@ -113,6 +122,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
         id,
         repo_id: repo_id.to_owned(),
         repo_path: plan.repo.clone(),
+        origin: Some(crate::worktree::Origin::capture(&plan.repo)?),
         command: plan.command.clone(),
         checkout: plan.checkout.clone(),
         pre_state: plan.pre_state.clone(),

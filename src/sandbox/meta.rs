@@ -22,6 +22,7 @@ use crate::carry::Carry;
 use crate::execute::Outcome;
 use crate::{Error, Result};
 
+/// Schema 3 adds durable worktree origin and makes older builds refuse it.
 /// Version of the `meta.json` document. Bump on any incompatible change; a
 /// build that meets an unfamiliar schema refuses the rehearsal rather than
 /// half-reading it.
@@ -30,7 +31,7 @@ use crate::{Error, Result};
 /// optional field: a rehearsal written by an older build carries no record of
 /// the uncommitted work it did *not* carry, and applying it with a build that
 /// now expects one would restore nothing while the report said otherwise.
-pub const META_SCHEMA: u32 = 2;
+pub const META_SCHEMA: u32 = 3;
 
 const META_FILE: &str = "meta.json";
 const META_TMP: &str = "meta.json.tmp";
@@ -71,6 +72,9 @@ pub struct Meta {
     pub repo_id: String,
     /// Where the real repository is.
     pub repo_path: PathBuf,
+    /// Durable shared-repository and worktree administrative identity.
+    #[serde(default)]
+    pub origin: Option<crate::worktree::Origin>,
     /// The command being rehearsed.
     pub command: Vec<String>,
     /// What the sandbox has checked out.
@@ -138,7 +142,8 @@ impl Meta {
         if schema == 1 {
             // Schema 1 predates dirty-worktree carrying. Its fields retain
             // their meanings, so the only safe migration is to add the
-            // explicit empty carry record and atomically write schema 2.
+            // explicit empty carry record and write the current schema without
+            // inventing an origin. Such a preview remains reference material.
             let object = document.as_object_mut().ok_or_else(|| {
                 Error::Sandbox(format!(
                     "{}: rehearsal metadata is not an object",
@@ -151,6 +156,12 @@ impl Meta {
                 serde_json::from_value(document).map_err(|e| Error::Meta(path.clone(), e))?;
             meta.write(root)?;
             return Ok(meta);
+        }
+
+        if schema == 2 {
+            // Preserve older previews as reference material; their missing origin
+            // cannot authorize Apply, and the original file is not rewritten.
+            return serde_json::from_value(document).map_err(|e| Error::Meta(path, e));
         }
 
         if schema != u64::from(META_SCHEMA) {
@@ -178,6 +189,7 @@ mod tests {
             id: "1786248000-00".to_owned(),
             repo_id: "git-city-0123456789abcdef".to_owned(),
             repo_path: PathBuf::from("/repos/git-city"),
+            origin: None,
             command: vec!["rebase".to_owned(), "-i".to_owned(), "main".to_owned()],
             checkout: Checkout::Branch("feature".to_owned()),
             pre_state: BTreeMap::from([("refs/heads/main".to_owned(), "abc123".to_owned())]),
@@ -202,7 +214,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).expect("serialises");
         // Apply reads pre_state out of this file; the field names are part of
         // the on-disk contract that META_SCHEMA versions.
-        assert!(json.contains(r#""schema":2"#), "{json}");
+        assert!(json.contains(r#""schema":3"#), "{json}");
         assert!(
             json.contains(r#""pre_state":{"refs/heads/main":"abc123"}"#),
             "{json}"

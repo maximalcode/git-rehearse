@@ -1089,7 +1089,7 @@ fn recover<W: Write>(
         if let Some(id) = id
             && inspection
                 .as_ref()
-                .is_none_or(|found| !found.rehearsal.starts_with(id))
+                .is_none_or(|found| !crate::sandbox::matches_id(&found.rehearsal, id))
         {
             return Err(Error::Refused(format!(
                 "the apply journal does not belong to rehearsal {id}; no recovery action was done"

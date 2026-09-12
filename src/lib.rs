@@ -27,6 +27,7 @@ pub mod report;
 pub mod sandbox;
 mod test_hooks;
 pub mod undo;
+pub mod worktree;
 
 pub use error::{Error, Result};
 

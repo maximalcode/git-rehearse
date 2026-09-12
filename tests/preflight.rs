@@ -185,20 +185,12 @@ fn a_shallow_clone_is_refused() {
 }
 
 #[test]
-fn a_second_worktree_is_refused() {
+fn a_second_worktree_can_be_rehearsed_from_either_origin() {
     let fixture = Fixture::new();
     let linked = fixture.base().join("linked");
     fixture.git(&["worktree", "add", &linked.to_string_lossy(), "feature"]);
-
-    let message = refusal(preflight::run(fixture.repo()).expect_err("two worktrees are refused"));
-
-    assert!(message.contains("2 worktrees"), "{message}");
-    assert!(message.contains("git worktree list"), "{message}");
-
-    // And from inside the linked worktree too — the hazard is the same one.
-    let from_linked =
-        refusal(preflight::run(&linked).expect_err("also refused from the other side"));
-    assert!(from_linked.contains("worktree"), "{from_linked}");
+    assert!(preflight::run(fixture.repo()).is_ok());
+    assert!(preflight::run(&linked).is_ok());
 }
 
 #[test]
