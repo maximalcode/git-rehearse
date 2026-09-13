@@ -132,6 +132,22 @@ from the apply of rehearsal 1786178829-00 at 1786178954 (unix time).
 The record is used up — one apply is undoable at a time.
 ```
 
+`git rehearse --json undo --check` reports `rehearsal`, `applied_at_unix`,
+`worktree`, `available`, and an explanatory `reason` (null when available).
+The full rehearsal ID identifies the concrete Apply: a rehearsal cannot be
+applied again after a completed Apply. Pass that ID to `undo <id> --check`
+and then `undo <id>` to prevent a later Apply from silently changing the target.
+Inspection exits 0 even when unavailable; malformed/unreadable records are
+reported as unavailable, while inability to acquire the repository lock is a
+refusal. Availability is a snapshot; Undo repeats the checks under the shared
+repository lock before moving refs.
+
+Each worktree owns its last Apply record. The record stores both its worktree
+path and Git administrative identity; moving/copying the record to another
+worktree cannot authorize Undo there. Version 1 records remain readable for
+manual recovery but cannot authorize automatic Undo because they lack durable
+origin. Version 2 records require a compatible git-rehearse version.
+
 Undo is the apply run backwards, out of a record written **before** the apply
 moved anything — so it survives a crash, and it works after the rehearsal
 itself has been discarded or pruned. It is one transaction, and it refuses
@@ -141,7 +157,7 @@ away to be convenient.
 
 Three properties worth knowing before you rely on it:
 
-- **One level deep.** There is one record per repository, so applying again
+- **One level deep.** There is one record per originating worktree, so applying again
   overwrites it and a successful undo uses it up. `git rehearse undo <id>`
   refuses if the record is not the apply you meant — which is the only warning
   you can get, since a second `undo` has nothing left to work from.
@@ -149,7 +165,7 @@ Three properties worth knowing before you rely on it:
   commits it moved away from are unreferenced, not deleted, and your reflog
   keeps them for weeks. The rehearsed commits are kept too, under
   `refs/rehearse/<id>/*`, so undoing does not orphan them.
-- **The record is a file you can use yourself.** Every line in
+- **The record is a file you can use yourself.** Every ref line in
   `.git/rehearse-undo` is a complete `git update-ref` argument list — paste one
   after `git update-ref` and that ref goes back, with git refusing if it has
   moved on since.
@@ -338,6 +354,7 @@ git rehearse show [<id>]          print a rehearsal's report again
 git rehearse continue [<id>]      carry on a stopped one, once it is resolved
 git rehearse apply [<id>]         transplant a rehearsal into the real repo
 git rehearse undo [<id>]          put the refs back where the last apply found them
+git rehearse undo [<id>] --check  inspect current Undo availability without mutation
 git rehearse recover [<id>]       inspect an interrupted apply or undo
 git rehearse recover --complete|--rollback [<id>]
                                  finish or roll back the recorded operation
@@ -346,7 +363,7 @@ git rehearse discard [<id>|--all] throw one, or all, away
 
 `<id>` can be any unambiguous prefix. Leave it out and the most recent
 rehearsal is meant. `undo` is the exception: it takes an id only to insist
-which apply you mean, because there is one undo record per repository and it
+which apply you mean, because there is one undo record per originating worktree and it
 always describes the most recent one.
 `recover` uses the repository's current recovery journal; its optional id
 checks which rehearsal that journal belongs to.

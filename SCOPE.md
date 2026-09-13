@@ -301,6 +301,18 @@ interactive rebase to a real repo with zero surprises.
    Independent results remain usable; overlapping results are preserved but refused.
    Older metadata without durable origin cannot authorize Apply or recovery.
 
+8. **Bound Undo and crash recovery: BUILT** (#91). Undo records name the concrete
+   Apply by its rehearsal ID and timestamp, with durable worktree path and shared
+   repository/administrative identity. `undo [<id>] --check` exposes current
+   availability without acknowledging recovery; execution rechecks origin, branch
+   occupancy, expected refs, tracked work and untracked/ignored collisions.
+   Version 1 records remain available for manual recovery but do not authorize
+   automatic mutation. Undo journal transitions cover ref restoration, worktree
+   updates, durable record removal and completion; already restored endpoints are
+   acknowledged without repeating the inverse transaction. Real JSON CLI tests
+   cover main/linked origins, every Undo boundary, interrupted rollback, external
+   work and competing Apply processes.
+
 ## v2.0 — agent mode (the strategic release)
 
 Everything here rides on v1's mechanics; nothing requires rework if v1 keeps its exit

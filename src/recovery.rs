@@ -244,7 +244,7 @@ pub fn ensure_clear_locked(repo: &Path, lock: &Lock) -> Result<()> {
     let inspection = inspect_journal(repo, &journal, journal_path)?;
     if inspection.state == State::Complete {
         remove_undo_for(repo, &journal)?;
-        remove_journal(journal_path)?;
+        remove_durable(journal_path)?;
         return Ok(());
     }
     Err(blocked(&inspection))
@@ -469,7 +469,7 @@ pub fn forget(journal_path: &Path) -> Result<()> {
 /// Removes a completed journal while `lock` remains held by the caller.
 pub fn forget_locked(journal_path: &Path, _lock: &Lock) -> Result<()> {
     if journal_path.exists() {
-        remove_journal(journal_path)?;
+        remove_durable(journal_path)?;
     }
     Ok(())
 }
@@ -1220,7 +1220,7 @@ fn restore_previous(repo: &Path, journal: &Journal) -> Result<()> {
         return atomic_bytes(&undo_path, bytes);
     }
     if undo_path.exists() {
-        fs::remove_file(&undo_path).map_err(Error::io(&undo_path))?;
+        remove_durable(&undo_path)?;
     }
     Ok(())
 }
@@ -1264,8 +1264,8 @@ fn remove_undo_for(repo: &Path, journal: &Journal) -> Result<()> {
     }
     let path = git_dir(repo)?.join(crate::undo::UNDO_FILE);
     match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => sync_parent_directory(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => sync_parent_directory(&path),
         Err(error) => Err(Error::io(&path)(error)),
     }
 }
@@ -1448,7 +1448,7 @@ fn fail_storage_for_test(stage: &str, operation: &str, path: &Path) -> Result<()
     Ok(())
 }
 
-fn remove_journal(path: &Path) -> Result<()> {
+pub(crate) fn remove_durable(path: &Path) -> Result<()> {
     fs::remove_file(path).map_err(Error::io(path))?;
     sync_parent_directory(path)
 }
@@ -1485,7 +1485,7 @@ fn blocked(inspection: &Inspection) -> Error {
 mod tests {
     use super::{Action, Journal, Operation, Phase, State, write_atomic_exclusive};
     #[cfg(windows)]
-    use super::{atomic_bytes, remove_journal};
+    use super::{atomic_bytes, remove_durable};
     use std::fs;
 
     #[test]
@@ -1543,7 +1543,7 @@ mod tests {
             b"durable journal"
         );
 
-        remove_journal(&path).expect("journal removal");
+        remove_durable(&path).expect("journal removal");
         assert!(!path.exists(), "journal is removed");
     }
 }

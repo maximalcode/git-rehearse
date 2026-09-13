@@ -1715,7 +1715,7 @@ fn the_undo_record_is_written_with_both_sides_of_every_move() {
         "{record}"
     );
     assert!(record.contains(sandbox.id()), "{record}");
-    assert!(record.contains("version 1"), "{record}");
+    assert!(record.contains("version 2"), "{record}");
     assert!(
         record.contains("git update-ref"),
         "the record should say how to use it: {record}"

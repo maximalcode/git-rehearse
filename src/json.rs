@@ -392,7 +392,7 @@ pub struct UndoResult {
     /// The rehearsal whose apply was taken back.
     pub rehearsal: String,
     /// When that apply happened, seconds since the Unix epoch. There is one
-    /// record per repository, so this is how a caller tells whether the apply
+    /// record per originating worktree, so this is how a caller tells whether the apply
     /// it undid is the one it made.
     pub applied_at_unix: u64,
     /// The refs that were put back, stated in the direction the undo moved
@@ -416,6 +416,38 @@ impl UndoResult {
             restored: undone.restored.iter().map(reference).collect(),
             worktree_reset: undone.reset.clone(),
             exit_code,
+        }
+    }
+}
+
+/// `git rehearse --json undo [<id>] --check`: a read-only availability snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UndoStatusResult {
+    pub schema: u32,
+    pub repository: String,
+    pub rehearsal: Option<String>,
+    pub applied_at_unix: Option<u64>,
+    pub worktree: Option<String>,
+    pub available: bool,
+    pub reason: Option<String>,
+    pub exit_code: u8,
+}
+
+impl UndoStatusResult {
+    #[must_use]
+    pub fn new(repository: String, status: &crate::undo::Status) -> Self {
+        Self {
+            schema: SCHEMA,
+            repository,
+            rehearsal: status.rehearsal.clone(),
+            applied_at_unix: status.applied_at_unix,
+            worktree: status
+                .worktree
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            available: status.available,
+            reason: status.reason.clone(),
+            exit_code: 0,
         }
     }
 }

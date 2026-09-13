@@ -78,7 +78,7 @@ usage:
   git rehearse show [<id>]
   git rehearse continue [<id>]
   git rehearse apply [<id>]
-  git rehearse undo [<id>]
+  git rehearse undo [<id>] [--check]
   git rehearse recover [<id>]
   git rehearse recover --complete|--rollback [<id>]
   git rehearse discard [<id>|--all]
@@ -118,7 +118,9 @@ that document never carried the graphs to begin with.
 undo puts the refs back where the last apply found them, in one transaction and
 only if every one of them is still where that apply left it. One apply is
 undoable at a time: applying again overwrites the record, and a successful undo
-uses it up. Give it an id to insist on which apply you mean.
+uses it up. Records belong to the originating worktree. Give it the full rehearsal
+id to insist on which apply you mean. `undo --check` reports current availability
+without changing refs, files, or recovery records. Undo rechecks before mutation.
 
 Uncommitted changes to tracked files are carried through a rehearsal: they are
 snapshotted with `git stash create` (your stash list is never touched), the
@@ -188,9 +190,13 @@ pub enum Command {
     /// Put the refs back where the last apply found them.
     ///
     /// The id is optional and, unlike everywhere else, does not select
-    /// anything: there is one undo record per repository, so it is only a way
+    /// anything: there is one undo record per originating worktree, so it is only a way
     /// of insisting which apply is meant. See [`crate::undo`].
     Undo {
+        id: Option<String>,
+    },
+    /// Inspect Undo availability without changing the repository.
+    UndoStatus {
         id: Option<String>,
     },
     /// Inspect or resolve an interrupted apply.
@@ -299,7 +305,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 });
             }
             "apply" => parsed!(Command::Apply { id: id_from(rest) }),
-            "undo" => parsed!(Command::Undo { id: id_from(rest) }),
+            "undo" => parsed!(parse_undo(rest)?),
             "recover" => parsed!(parse_recover(rest)?),
             "discard" => {
                 let arguments: Vec<&String> = rest.collect();
@@ -366,6 +372,29 @@ pub fn wants_json(args: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Reject misspelled inspection flags rather than accidentally executing Undo.
+fn parse_undo<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut check = false;
+    let mut id = None;
+    for arg in rest {
+        if arg == "--check" {
+            check = true;
+        } else if arg.starts_with('-') || id.is_some() {
+            return Err(Error::Refused(
+                "undo accepts one rehearsal ID and optional --check; no Undo was performed"
+                    .to_owned(),
+            ));
+        } else {
+            id = Some(arg.clone());
+        }
+    }
+    Ok(if check {
+        Command::UndoStatus { id }
+    } else {
+        Command::Undo { id }
+    })
 }
 
 /// The first non-flag argument left, if any.
@@ -447,6 +476,7 @@ pub fn run<W: Write>(parsed: Parsed, cwd: &Path, output: &mut W) -> Result<u8> {
         }
         Command::Apply { id } => apply_kept(id.as_deref(), format, cwd, output),
         Command::Undo { id } => undo_apply(id.as_deref(), format, cwd, output),
+        Command::UndoStatus { id } => undo_status(id.as_deref(), format, cwd, output),
         Command::Recover { id, action } => recover(id.as_deref(), action, format, cwd, output),
         Command::Discard { id, all } => discard(id.as_deref(), all, format, cwd, output),
     }
@@ -1049,6 +1079,39 @@ fn apply_kept<W: Write>(
         report_applied(&applied, output)?;
     }
     sandbox.discard()?;
+    Ok(exit::CLEAN)
+}
+
+/// Reports current Undo availability without acknowledging recovery.
+fn undo_status<W: Write>(
+    id: Option<&str>,
+    format: Format,
+    cwd: &Path,
+    output: &mut W,
+) -> Result<u8> {
+    let repo = repo_root(cwd)?;
+    let status = undo::status(&repo, id)?;
+    if format == Format::Json {
+        write_json(
+            &json::UndoStatusResult::new(repo.display().to_string(), &status),
+            output,
+        )?;
+    } else if status.available {
+        writeln!(
+            output,
+            "Undo available for Apply of rehearsal {} in {}",
+            status.rehearsal.as_deref().unwrap_or_default(),
+            status.worktree.as_deref().unwrap_or(cwd).display()
+        )
+        .map_err(Error::Spawn)?;
+    } else {
+        writeln!(
+            output,
+            "Undo unavailable: {}",
+            status.reason.as_deref().unwrap_or_default()
+        )
+        .map_err(Error::Spawn)?;
+    }
     Ok(exit::CLEAN)
 }
 

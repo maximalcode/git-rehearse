@@ -29,7 +29,7 @@
 //!
 //! # One level deep
 //!
-//! There is one record per repository, at a fixed path, so **a second apply
+//! There is one record per originating worktree, at a fixed path, so **a second apply
 //! overwrites the first record**. That is deliberate: undo means "take back the
 //! thing I just did", not "walk my history backwards" — git-branchless already
 //! owns the latter and does it far better than a fixed filename ever could. The
@@ -59,7 +59,7 @@ pub const UNDO_FILE: &str = "rehearse-undo";
 /// and this file had nothing, which meant every future change to it would have
 /// been a guess about what wrote it. Bump on any change that a reader of an
 /// older record could get wrong.
-pub const RECORD_SCHEMA: u32 = 1;
+pub const RECORD_SCHEMA: u32 = 2;
 
 /// Git's own spelling for "this ref does not exist", used in the record for a
 /// missing side.
@@ -73,6 +73,7 @@ const ABSENT: &str = "0000000000000000000000000000000000000000";
 const VERSION_KEY: &str = "version";
 const REHEARSAL_KEY: &str = "rehearsal";
 const APPLIED_AT_KEY: &str = "applied-at";
+const ORIGIN_KEY: &str = "origin";
 
 /// What one apply did, in the form that lets it be taken back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +85,34 @@ pub struct Record {
     /// Every ref the apply moved and an undo can move back: `before` is where
     /// it was, `after` is where the apply put it. Never `HEAD` — see [`render`].
     pub refs: Vec<RefMove>,
+    /// Durable source; legacy records cannot authorize mutation.
+    pub origin: Option<Origin>,
+}
+
+/// The concrete worktree that owns an Apply and its Undo record.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Origin {
+    pub worktree: PathBuf,
+    pub identity: crate::worktree::Origin,
+}
+
+impl Origin {
+    pub fn capture(repo: &Path) -> Result<Self> {
+        Ok(Self {
+            worktree: git::canonicalize(repo)?,
+            identity: crate::worktree::Origin::capture(repo)?,
+        })
+    }
+
+    fn verify(&self, repo: &Path) -> Result<()> {
+        self.identity.verify(repo)?;
+        if self.worktree != git::canonicalize(repo)? {
+            return Err(Error::Refused(
+                "the Undo record belongs to another worktree; no mutation was performed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Record {
@@ -99,6 +128,7 @@ impl Record {
         Self {
             rehearsal,
             applied_at_unix,
+            origin: None,
             refs: moved
                 .iter()
                 .filter(|moved| moved.name != HEAD_KEY)
@@ -165,28 +195,8 @@ pub fn run(repo: &Path, id: Option<&str>) -> Result<Undone> {
     let record = parse(&text, &path)?;
     check_is_the_one_meant(&record, id)?;
 
-    if record.refs.is_empty() {
-        return Err(Error::Refused(format!(
-            "the apply of rehearsal {} moved no branch, so there is nothing to put back.\n\
-             The record is {}; delete it if it is in your way.",
-            record.rehearsal,
-            path.display()
-        )));
-    }
-
-    crate::worktree::check_occupancy(repo, record.refs.iter().map(|moved| moved.name.as_str()))?;
-    let now = branches(repo)?;
-    check_still_applied(&record, &now)?;
-
     let checkout = current_branch(repo);
-    let reset = match worktree_action(checkout.as_deref(), &record.refs) {
-        Worktree::Refuse(branch) => return Err(refuse_deleting_the_checkout(&branch)),
-        Worktree::Reset(branch) => {
-            check_clean(repo)?;
-            Some(branch)
-        }
-        Worktree::Untouched => None,
-    };
+    let reset = check_available(repo, &record, checkout.as_deref())?;
 
     let worktree_before = git::run(repo, ["rev-parse", "HEAD"])?;
     let inverse = record
@@ -195,6 +205,7 @@ pub fn run(repo: &Path, id: Option<&str>) -> Result<Undone> {
         .cloned()
         .map(reversed)
         .collect::<Vec<_>>();
+    abort_for_test("before-journal");
     let journal = recovery::prepare_undo_locked(
         repo,
         &lock,
@@ -219,13 +230,15 @@ pub fn run(repo: &Path, id: Option<&str>) -> Result<Undone> {
         git::run(repo, ["reset", "--hard", "--quiet"])?;
         abort_for_test("after-worktree-update");
         recovery::worktree_updated_locked(&journal, &lock)?;
+        abort_for_test("after-worktree-phase");
     }
 
     // Consumed only now, after everything that could refuse has refused: a
     // failed undo must leave the record where it was, or the way back is gone.
-    fs::remove_file(&path).map_err(Error::io(&path))?;
+    recovery::remove_durable(&path)?;
     abort_for_test("after-undo-record-removal");
     recovery::complete_locked(&journal, &lock)?;
+    abort_for_test("after-complete");
     recovery::forget_locked(&journal, &lock)?;
 
     Ok(Undone {
@@ -235,6 +248,83 @@ pub fn run(repo: &Path, id: Option<&str>) -> Result<Undone> {
         reset,
         record: path,
     })
+}
+
+/// Check the same preconditions for inspection and mutation.
+fn check_available(repo: &Path, record: &Record, checkout: Option<&str>) -> Result<Option<String>> {
+    record.origin.as_ref().ok_or_else(|| Error::Refused(
+        "the Undo record has no durable worktree origin; automatic Undo is unavailable; preserve the record for manual recovery".to_owned()
+    ))?.verify(repo)?;
+    if record.refs.is_empty() {
+        return Err(Error::Refused(format!(
+            "the apply of rehearsal {} moved no branch, so there is nothing to put back.\n\
+             The record is {}; delete it if it is in your way.",
+            record.rehearsal, UNDO_FILE
+        )));
+    }
+
+    crate::worktree::check_occupancy(repo, record.refs.iter().map(|moved| moved.name.as_str()))?;
+    let now = branches(repo)?;
+    check_still_applied(record, &now)?;
+
+    match worktree_action(checkout, &record.refs) {
+        Worktree::Refuse(branch) => Err(refuse_deleting_the_checkout(&branch)),
+        Worktree::Reset(branch) => {
+            check_reset(repo, record, &branch)?;
+            Ok(Some(branch))
+        }
+        Worktree::Untouched => Ok(None),
+    }
+}
+
+/// Read-only availability for the last Apply in this worktree. This is a
+/// snapshot, never permission to skip the checks when Undo actually runs.
+#[derive(Debug, Clone)]
+pub struct Status {
+    pub rehearsal: Option<String>,
+    pub applied_at_unix: Option<u64>,
+    pub worktree: Option<PathBuf>,
+    pub available: bool,
+    pub reason: Option<String>,
+}
+
+pub fn status(repo: &Path, id: Option<&str>) -> Result<Status> {
+    let lock = recovery::acquire(repo)?;
+    let path = crate::worktree::Origin::capture(repo)?
+        .git_dir
+        .join(UNDO_FILE);
+    let mut status = Status {
+        rehearsal: None,
+        applied_at_unix: None,
+        worktree: None,
+        available: false,
+        reason: None,
+    };
+    let checked = (|| {
+        let text = fs::read_to_string(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                nothing_to_undo(&path)
+            } else {
+                Error::io(&path)(error)
+            }
+        })?;
+        let record = parse(&text, &path)?;
+        status.rehearsal = Some(record.rehearsal.clone());
+        status.applied_at_unix = Some(record.applied_at_unix);
+        status.worktree = record.origin.as_ref().map(|origin| origin.worktree.clone());
+        check_is_the_one_meant(&record, id)?;
+        // Do not reap a complete journal here: inspection never acknowledges
+        // an interrupted Undo, even if its worktree is already restored.
+        if recovery::path(repo)?.exists() {
+            return Err(Error::Refused("a recorded operation needs recovery acknowledgement; inspect `git rehearse recover` before Undo".to_owned()));
+        }
+        check_available(repo, &record, current_branch(repo).as_deref())?;
+        Ok::<(), Error>(())
+    })();
+    status.available = checked.is_ok();
+    status.reason = checked.err().map(|error| error.to_string());
+    drop(lock);
+    Ok(status)
 }
 
 fn abort_for_test(stage: &str) {
@@ -266,6 +356,11 @@ pub fn render(record: &Record) -> String {
     let _ = writeln!(text, "{VERSION_KEY} {RECORD_SCHEMA}");
     let _ = writeln!(text, "{REHEARSAL_KEY} {}", record.rehearsal);
     let _ = writeln!(text, "{APPLIED_AT_KEY} {}", record.applied_at_unix);
+    let _ = writeln!(
+        text,
+        "{ORIGIN_KEY} {}",
+        serde_json::to_string(&record.origin).expect("serializable origin")
+    );
     let _ = writeln!(
         text,
         "#\n\
@@ -314,7 +409,7 @@ pub fn parse(text: &str, path: &Path) -> Result<Record> {
         .ok_or_else(|| malformed(path, "it has no `version` line"))?
         .parse::<u32>()
         .map_err(|_| malformed(path, "its `version` is not a number"))?;
-    if version != RECORD_SCHEMA {
+    if version != 1 && version != RECORD_SCHEMA {
         return Err(malformed(
             path,
             &format!(
@@ -332,6 +427,14 @@ pub fn parse(text: &str, path: &Path) -> Result<Record> {
         .parse::<u64>()
         .map_err(|_| malformed(path, "its `applied-at` is not a number"))?;
 
+    let origin = if version == 1 {
+        None
+    } else {
+        serde_json::from_str(
+            field(text, ORIGIN_KEY).ok_or_else(|| malformed(path, "missing origin"))?,
+        )
+        .map_err(|_| malformed(path, "invalid origin"))?
+    };
     let mut refs = Vec::new();
     for line in body(text) {
         let mut fields = line.split_whitespace();
@@ -354,6 +457,7 @@ pub fn parse(text: &str, path: &Path) -> Result<Record> {
         rehearsal,
         applied_at_unix,
         refs,
+        origin,
     })
 }
 
@@ -376,7 +480,7 @@ fn body(text: &str) -> impl Iterator<Item = &str> {
     text.lines().map(str::trim).filter(|line| {
         !line.is_empty()
             && !line.starts_with('#')
-            && ![VERSION_KEY, REHEARSAL_KEY, APPLIED_AT_KEY]
+            && ![VERSION_KEY, REHEARSAL_KEY, APPLIED_AT_KEY, ORIGIN_KEY]
                 .iter()
                 .any(|key| line.starts_with(&format!("{key} ")))
     })
@@ -399,7 +503,7 @@ fn check_is_the_one_meant(record: &Record, id: Option<&str>) -> Result<()> {
     }
     Err(Error::Refused(format!(
         "the undo record is from the apply of rehearsal {}, not {id}.\n\
-         Only the most recent apply can be undone: there is one record per repository, and \
+         Only the most recent apply can be undone: there is one record per originating worktree, and \
          applying again overwrites it.",
         record.rehearsal
     )))
@@ -501,6 +605,19 @@ fn check_clean(repo: &Path) -> Result<()> {
     ))
 }
 
+/// Shared by availability and the final check while Git holds the ref locks.
+fn check_reset(repo: &Path, record: &Record, branch: &str) -> Result<()> {
+    check_clean(repo)?;
+    let reference = format!("refs/heads/{branch}");
+    let target = record
+        .refs
+        .iter()
+        .find(|moved| moved.name == reference)
+        .and_then(|moved| moved.before.as_deref())
+        .expect("reset target");
+    crate::collision::check_reset(repo, repo, target)
+}
+
 /// The restore itself: one transaction, all or nothing.
 fn restore(repo: &Path, record: &Record, checkout: Option<&str>, head: &str) -> Result<()> {
     let commands = restore_commands(&record.refs);
@@ -526,15 +643,7 @@ fn restore(repo: &Path, record: &Record, checkout: Option<&str>, head: &str) -> 
                 ));
             }
             if let Worktree::Reset(branch) = worktree_action(checkout, &record.refs) {
-                check_clean(repo)?;
-                let reference = format!("refs/heads/{branch}");
-                let target = record
-                    .refs
-                    .iter()
-                    .find(|reference_move| reference_move.name == reference)
-                    .and_then(|reference_move| reference_move.before.as_deref())
-                    .expect("reset target");
-                crate::collision::check_reset(repo, repo, target)?;
+                check_reset(repo, record, &branch)?;
             }
             Ok(())
         },
@@ -642,6 +751,7 @@ mod tests {
         Record {
             rehearsal: "1786248000-00".to_owned(),
             applied_at_unix: 1_786_248_000,
+            origin: None,
             refs: vec![
                 moved("refs/heads/main", Some("aaa"), Some("bbb")),
                 moved("refs/heads/spike", None, Some("ccc")),
@@ -696,10 +806,10 @@ mod tests {
 
     #[test]
     fn a_record_from_another_version_is_refused_rather_than_half_read() {
-        let text = render(&record()).replace("version 1", "version 2");
+        let text = render(&record()).replace("version 2", "version 99");
         let error = parse(&text, path()).expect_err("refused");
         let message = error.to_string();
-        assert!(message.contains("record version 2"), "{message}");
+        assert!(message.contains("record version 99"), "{message}");
         assert!(message.contains("upgrade git-rehearse"), "{message}");
         assert!(message.contains("rehearse-undo"), "{message}");
     }
