@@ -219,6 +219,8 @@ impl CarriedReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
     pub schema: u32,
+    /// Repository hooks are disabled for commands run by this tool.
+    pub repository_hooks: &'static str,
     /// The rehearsal id — an unambiguous prefix of it is what `continue`,
     /// `apply` and `discard` take.
     pub id: String,
@@ -374,6 +376,7 @@ pub struct Listing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApplyResult {
     pub schema: u32,
+    pub repository_hooks: &'static str,
     pub id: String,
     pub repository: String,
     pub exit_code: u8,
@@ -606,6 +609,7 @@ impl Report {
         let meta: &Meta = sandbox.meta();
         Self {
             schema: SCHEMA,
+            repository_hooks: "disabled",
             id: meta.id.clone(),
             repository: meta.repo_path.display().to_string(),
             origin_worktree: meta.repo_path.display().to_string(),
@@ -839,6 +843,7 @@ mod tests {
     fn report(outcome: &Outcome) -> Report {
         Report {
             schema: SCHEMA,
+            repository_hooks: "disabled",
             id: "1786281796-00".to_owned(),
             repository: "/repo".to_owned(),
             origin_worktree: "/repo".to_owned(),

@@ -18,6 +18,45 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use crate::{Error, Result};
 
+/// Every Git process, including nested Git commands, gets the same hook policy.
+/// Command-line config overrides repository, global and inherited config. Place
+/// it after the caller's global options so an explicit `-c` cannot undo it.
+/// Git documents `/dev/null` as the way to disable all hooks on every platform.
+fn command<I, S>(dir: &Path, args: I) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_owned())
+        .collect();
+    let mut boundary = 0;
+    while let Some(arg) = args.get(boundary) {
+        let arg = arg.to_string_lossy();
+        if !arg.starts_with('-')
+            || matches!(arg.as_ref(), "--" | "--version" | "-v" | "--help" | "-h")
+        {
+            break;
+        }
+        boundary += 1;
+        if matches!(
+            arg.as_ref(),
+            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+        ) {
+            boundary = (boundary + 1).min(args.len());
+        }
+    }
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(dir)
+        .args(&args[..boundary])
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(&args[boundary..]);
+    command
+}
+
 /// Runs `git -C <dir> <args...>` and returns its stdout, trailing newline
 /// trimmed.
 ///
@@ -75,10 +114,7 @@ where
         .into_iter()
         .map(|a| a.as_ref().to_os_string())
         .collect();
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(&args)
+    let output = command(dir, &args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -109,8 +145,7 @@ where
         .into_iter()
         .map(|a| a.as_ref().to_os_string())
         .collect();
-    let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(&args);
+    let mut command = command(dir, &args);
     for (key, _) in std::env::vars_os() {
         if probe_environment_key(&key) {
             command.env_remove(key);
@@ -193,8 +228,7 @@ where
         .map(|a| a.as_ref().to_os_string())
         .collect();
 
-    let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(&args);
+    let mut command = command(dir, &args);
     if clean_git_environment {
         for (key, _) in std::env::vars_os() {
             if probe_environment_key(&key) {
@@ -315,8 +349,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(dir).args(args);
+    let mut command = command(dir, args);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -445,15 +478,15 @@ pub(crate) fn ref_transaction(
     check: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     use std::io::BufRead as _;
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["update-ref", "--stdin", "-z", "--no-deref", "-m", message])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(Error::Spawn)?;
+    let mut child = command(
+        repo,
+        ["update-ref", "--stdin", "-z", "--no-deref", "-m", message],
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(Error::Spawn)?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = io::BufReader::new(child.stdout.take().expect("piped stdout"));
     let result = (|| {
