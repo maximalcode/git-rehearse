@@ -106,7 +106,8 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
 
     let worktree_before = git::run(repo, ["rev-parse", "HEAD"])?;
     let anchor = format!("refs/rehearse/{}/", meta.id);
-    let undo_record = Record::of_apply(meta.id.clone(), now_unix, &moved);
+    let mut undo_record = Record::of_apply(meta.id.clone(), now_unix, &moved);
+    undo_record.origin = Some(crate::undo::Origin::capture(repo)?);
     abort_for_test("before-journal");
     let journal = recovery::prepare_locked(
         repo,
