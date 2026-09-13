@@ -198,3 +198,46 @@ fn text_report_explains_the_hook_policy() {
     assert_eq!(code, 0, "{error}");
     assert!(report.contains("Repository hooks were not run"), "{report}");
 }
+
+#[test]
+fn git_aliases_cannot_inject_a_later_hook_override() {
+    for inherited in [false, true] {
+        let fixture = Fixture::new();
+        let hooks = hooks(&fixture);
+        let alias = format!(
+            "-c core.hooksPath='{}' commit --allow-empty -m aliased",
+            hooks.display()
+        );
+        let setting = format!("alias.save={alias}");
+        if inherited {
+            fixture.git(&[
+                "config",
+                "--file",
+                fixture.base().join("global-config").to_str().expect("path"),
+                "alias.save",
+                &alias,
+            ]);
+        }
+        let refs = fixture.refs();
+        let index = std::fs::read(fixture.repo().join(".git/index")).expect("index");
+        let content = std::fs::read(fixture.repo().join("file.txt")).expect("file");
+        let args = if inherited {
+            vec!["--", "save"]
+        } else {
+            vec!["--", "-c", &setting, "save"]
+        };
+        let (code, report) = run(&fixture, &hooks, "global", &args);
+        assert_eq!(code, 4, "{report}");
+        assert!(report.to_string().contains("alias"), "{report}");
+        assert_eq!(fixture.refs(), refs);
+        assert_eq!(
+            std::fs::read(fixture.repo().join(".git/index")).expect("index"),
+            index
+        );
+        assert_eq!(
+            std::fs::read(fixture.repo().join("file.txt")).expect("file"),
+            content
+        );
+        assert!(!fixture.base().join("sentinel").exists());
+    }
+}

@@ -18,6 +18,8 @@ use std::process::{Command, ExitStatus, Stdio};
 
 use crate::{Error, Result};
 
+mod arguments;
+
 /// Every Git process, including nested Git commands, gets the same hook policy.
 /// Command-line config overrides repository, global and inherited config. Place
 /// it after the caller's global options so an explicit `-c` cannot undo it.
@@ -31,22 +33,7 @@ where
         .into_iter()
         .map(|arg| arg.as_ref().to_owned())
         .collect();
-    let mut boundary = 0;
-    while let Some(arg) = args.get(boundary) {
-        let arg = arg.to_string_lossy();
-        if !arg.starts_with('-')
-            || matches!(arg.as_ref(), "--" | "--version" | "-v" | "--help" | "-h")
-        {
-            break;
-        }
-        boundary += 1;
-        if matches!(
-            arg.as_ref(),
-            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
-        ) {
-            boundary = (boundary + 1).min(args.len());
-        }
-    }
+    let boundary = arguments::command_boundary(&args);
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -55,6 +42,39 @@ where
         .args(["-c", "core.hooksPath=/dev/null"])
         .args(&args[boundary..]);
     command
+}
+
+/// Git expands aliases after processing our command-line configuration, so an
+/// alias can inject a later hook-path override. Refuse aliases at the execution
+/// boundary; builtins win over identically named aliases, as they do in Git.
+/// External programs remain outside the repository-hook guarantee.
+pub(crate) fn validate_hook_policy(dir: &Path, args: &[String]) -> Result<()> {
+    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let boundary = arguments::command_boundary(&args);
+    let Some(name) = args.get(boundary).and_then(|arg| arg.to_str()) else {
+        return Ok(());
+    };
+    if name.starts_with('-') {
+        return Ok(());
+    }
+    let mut query = args[..boundary].to_vec();
+    query.push(OsString::from("--list-cmds=builtins"));
+    if run(dir, &query)?.lines().any(|builtin| builtin == name) {
+        return Ok(());
+    }
+    query.pop();
+    query.extend([
+        OsString::from("config"),
+        OsString::from("--get"),
+        OsString::from(format!("alias.{name}")),
+    ]);
+    match run(dir, &query) {
+        Ok(_) => Err(Error::Refused(format!(
+            "Git alias `{name}` cannot be rehearsed with guaranteed hook suppression. Use its underlying Git command instead."
+        ))),
+        Err(Error::Git { code: Some(1), .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Runs `git -C <dir> <args...>` and returns its stdout, trailing newline

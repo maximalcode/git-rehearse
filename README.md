@@ -631,7 +631,9 @@ suppression, including creation, Continue, Apply, Undo and recovery and their
 Git subprocesses. Local, global, inherited and command-line `core.hooksPath`
 settings cannot enable hooks for these operations. There is no `--with-hooks`
 opt-in. Reports state “Repository hooks were not run”; JSON reports expose
-`"repository_hooks": "disabled"`.
+`"repository_hooks": "disabled"`. Git aliases are refused because their later
+configuration expansion can re-enable hooks; rehearse the underlying Git
+command instead.
 
 Signing settings and custom merge drivers remain effective. This is not an
 operating-system sandbox: signing programs, merge drivers, editors and arbitrary
