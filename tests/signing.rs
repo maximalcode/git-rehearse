@@ -19,6 +19,7 @@ fn run(fixture: &Fixture, args: &[&str]) -> (Output, Value) {
         .env("SSH_AUTH_SOCK", fixture.base().join("agent.sock"))
         // JSON operations must not launch the configured terminal editor.
         .env("GIT_EDITOR", "an-editor-that-does-not-exist")
+        .env("GIT_SEQUENCE_EDITOR", "an-editor-that-does-not-exist")
         .stdin(Stdio::null())
         .output()
         .expect("CLI runs");
@@ -305,4 +306,46 @@ fn openpgp_program_aliases_keep_their_original_precedence() {
             "{output:?}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn literal_backslashes_in_ssh_key_filenames_are_preserved() {
+    let fixture = Fixture::new();
+    fixture.sign_with_ssh();
+    for (source, target) in [
+        ("signing-key", "signing\\key"),
+        ("signing-key.pub", "signing\\key.pub"),
+    ] {
+        std::fs::copy(fixture.base().join(source), fixture.base().join(target)).expect("copy key");
+    }
+    fixture.git(&["config", "user.signingkey", "../signing\\key.pub"]);
+    let report = clean(&fixture, &["merge", "--no-ff", "feature"]);
+    verify_and_apply(&fixture, &report);
+}
+
+#[test]
+fn json_interactive_rebase_requires_a_todo_without_launching_a_sequence_editor() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "independent\n", "independent");
+    let (output, report) = run(&fixture, &["rebase", "-i", "feature"]);
+    assert!(!output.status.success(), "{report}");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("false"), "{error}");
+    assert!(!error.contains("an-editor-that-does-not-exist"), "{error}");
+    let todo = fixture.base().join("todo");
+    let commit = fixture.git(&["rev-parse", "HEAD"]);
+    std::fs::write(&todo, format!("pick {commit}\n")).expect("prepared todo");
+    fixture.sign_with_ssh();
+    let report = clean(
+        &fixture,
+        &[
+            "--todo",
+            todo.to_str().expect("todo path"),
+            "rebase",
+            "-i",
+            "feature",
+        ],
+    );
+    verify_and_apply(&fixture, &report);
 }

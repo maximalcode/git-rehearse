@@ -407,7 +407,7 @@ fn signing_key_path(repo: &Path, key: &str, value: String) -> Result<String> {
         return Ok(value);
     }
     let expanded = git::run(repo, ["config", "--path", "--get", key])?;
-    Ok(repo.join(expanded).to_string_lossy().replace('\\', "/"))
+    Ok(repo.join(expanded).to_string_lossy().into_owned())
 }
 
 /// Git treats these two names as aliases, so their configuration order matters.

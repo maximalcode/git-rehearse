@@ -640,8 +640,9 @@ cherry-pick and Continue use Git's effective signing policy, including SSH
 file keys and `gpg.ssh.defaultKeyCommand`. Missing keys or failing signing
 programs produce Git's error on stderr and a non-success result; there is no
 unsigned fallback. A stopped sequencer remains inspectable but cannot be
-applied. In JSON mode commit-message editors are suppressed; signing programs
-can still show their own system dialogs.
+applied. In JSON mode terminal editors are suppressed; interactive rebase
+requires a prepared `--todo` file. Signing programs can still show their own
+system dialogs.
 
 Rehearsal, Show and Continue JSON include `signatures`, an array of
 `{ "sha": "…", "present": true, "verification": "not_checked", "trust": "not_checked" }`.
