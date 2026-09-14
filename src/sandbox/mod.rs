@@ -32,6 +32,7 @@
 mod build;
 mod merge_config;
 mod meta;
+mod rerere;
 mod store;
 
 pub use build::create;
