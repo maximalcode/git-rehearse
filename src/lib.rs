@@ -25,6 +25,7 @@ pub mod preflight;
 pub mod recovery;
 pub mod report;
 pub mod sandbox;
+mod signatures;
 mod test_hooks;
 pub mod undo;
 pub mod worktree;

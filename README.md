@@ -635,8 +635,26 @@ opt-in. Reports state “Repository hooks were not run”; JSON reports expose
 configuration expansion can re-enable hooks; rehearse the underlying Git
 command instead.
 
-Signing settings and custom merge drivers remain effective. This is not an
-operating-system sandbox: signing programs, merge drivers, editors and arbitrary
+Signing settings and custom merge drivers remain effective. Merge, rebase,
+cherry-pick and Continue use Git's effective signing policy, including SSH
+file keys and `gpg.ssh.defaultKeyCommand`. Missing keys or failing signing
+programs produce Git's error on stderr and a non-success result; there is no
+unsigned fallback. A stopped sequencer remains inspectable but cannot be
+applied. In JSON mode commit-message editors are suppressed; signing programs
+can still show their own system dialogs.
+
+Rehearsal, Show and Continue JSON include `signatures`, an array of
+`{ "sha": "…", "present": true, "verification": "not_checked", "trust": "not_checked" }`.
+It covers the new tip and commits introduced relative to the old tip of each
+changed ref, deduplicated by object ID (including intermediate rewritten commits
+and commits brought in by a merge or fast-forward). Deleted refs contribute no
+commits; no changed refs means an empty array. Presence is read from the actual
+commit headers, not the signing configuration or commit message. No verifier is
+run: **presence does not establish validity or trust**. Verify independently in
+the sandbox if required. Show and Continue inspect the current result again.
+Apply transfers these exact objects without re-signing or rerunning the command.
+
+The sandbox does not provide operating-system isolation: signing programs, merge drivers, editors and arbitrary
 commands can still execute programs. Git commands you run yourself outside
 git-rehearse retain their normal hook behavior.
 

@@ -111,10 +111,13 @@ pub fn run_with(
     todo: Option<&Todo>,
     chatter: Chatter,
 ) -> Result<Outcome> {
-    let env = match todo {
+    let mut env = match todo {
         Some(todo) => vec![("GIT_SEQUENCE_EDITOR", sequence_editor(todo, command)?)],
         None => Vec::new(),
     };
+    if chatter == Chatter::ToStderr {
+        env.push(("GIT_EDITOR", OsString::from("true")));
+    }
     git::validate_hook_policy(worktree, command)?;
     let status = git::spawn_with(worktree, command, &env, chatter)?;
     classify(worktree, status)
@@ -298,7 +301,12 @@ pub fn resume_with(worktree: &Path, chatter: Chatter) -> Result<Outcome> {
         ));
     };
 
-    let status = git::spawn_with(worktree, [subcommand, "--continue"], &[], chatter)?;
+    let env = if chatter == Chatter::ToStderr {
+        vec![("GIT_EDITOR", OsString::from("true"))]
+    } else {
+        Vec::new()
+    };
+    let status = git::spawn_with(worktree, [subcommand, "--continue"], &env, chatter)?;
     classify(worktree, status)
 }
 

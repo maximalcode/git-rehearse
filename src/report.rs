@@ -171,6 +171,18 @@ pub fn render(meta: &Meta, analysis: &Analysis, outcome: &Outcome, graphs: &[Gra
     let _ = writeln!(out, "repository {}", meta.repo_path.display());
     let _ = writeln!(out, "rehearsal  {}", meta.id);
     let _ = writeln!(out, "Repository hooks were not run");
+    if !analysis.signatures.is_empty() {
+        let signed = analysis
+            .signatures
+            .iter()
+            .filter(|entry| entry.present)
+            .count();
+        let _ = writeln!(
+            out,
+            "Signatures: {signed}/{} result commits carry signatures (validity and trust not checked)",
+            analysis.signatures.len()
+        );
+    }
     let _ = writeln!(out);
 
     match outcome {
@@ -548,6 +560,7 @@ mod tests {
 
     fn analysis() -> Analysis {
         Analysis {
+            signatures: Vec::new(),
             ref_moves: vec![moved("refs/heads/feature")],
             stopped_at: None,
             conflicts: Vec::new(),
