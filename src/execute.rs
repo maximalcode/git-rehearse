@@ -115,6 +115,7 @@ pub fn run_with(
         Some(todo) => vec![("GIT_SEQUENCE_EDITOR", sequence_editor(todo, command)?)],
         None => Vec::new(),
     };
+    git::validate_hook_policy(worktree, command)?;
     let status = git::spawn_with(worktree, command, &env, chatter)?;
     classify(worktree, status)
 }

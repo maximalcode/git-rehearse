@@ -170,6 +170,7 @@ pub fn render(meta: &Meta, analysis: &Analysis, outcome: &Outcome, graphs: &[Gra
     let _ = writeln!(out, "rehearsed  git {}", meta.command.join(" "));
     let _ = writeln!(out, "repository {}", meta.repo_path.display());
     let _ = writeln!(out, "rehearsal  {}", meta.id);
+    let _ = writeln!(out, "Repository hooks were not run");
     let _ = writeln!(out);
 
     match outcome {

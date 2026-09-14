@@ -626,7 +626,19 @@ real repository's objects.
 
 Each sandbox is made **inert** at creation: remotes stripped, so an accidental
 `push` inside it has nowhere to go, and `core.hooksPath` pointed at an empty
-directory, so your `pre-commit` does not fire for a rehearsal.
+directory. Every Git command started by git-rehearse also enforces hook
+suppression, including creation, Continue, Apply, Undo and recovery and their
+Git subprocesses. Local, global, inherited and command-line `core.hooksPath`
+settings cannot enable hooks for these operations. There is no `--with-hooks`
+opt-in. Reports state “Repository hooks were not run”; JSON reports expose
+`"repository_hooks": "disabled"`. Git aliases are refused because their later
+configuration expansion can re-enable hooks; rehearse the underlying Git
+command instead.
+
+Signing settings and custom merge drivers remain effective. This is not an
+operating-system sandbox: signing programs, merge drivers, editors and arbitrary
+commands can still execute programs. Git commands you run yourself outside
+git-rehearse retain their normal hook behavior.
 
 Repository-local `merge.*` settings are carried alongside tracked
 `.gitattributes`, so custom merge drivers run as they do in the real repository.

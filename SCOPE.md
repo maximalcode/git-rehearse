@@ -78,8 +78,9 @@ git to pick it up as a subcommand anyway.
    real repo could diverge (timestamps, interactive input, hooks) and would discard any
    conflict resolution done in the sandbox. This is the core correctness invariant.
 3. **The sandbox is disposable and inert.** No remotes (stripped at creation — an
-   accidental `push` inside the sandbox must have nowhere to go), hooks disabled by
-   default (`--with-hooks` to opt in), lives under the user cache dir, auto-pruned.
+   accidental `push` inside the sandbox must have nowhere to go), repository hooks
+   disabled throughout rehearsal and Apply (no hook opt-in is available), lives
+   under the user cache dir, auto-pruned.
 4. **Zero telemetry, zero network, zero spend.** Matches every other maximalcode repo.
    The tool itself never phones anywhere; CI is GitHub Actions free tier.
 5. **Refuse loudly rather than guess.** Dirty worktree in v1.0 → refuse with a clear
