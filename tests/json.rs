@@ -227,24 +227,30 @@ fn an_explicitly_kept_initial_run_survives_interruption_and_age_pruning() {
     use std::time::Duration;
 
     let fixture = Fixture::new();
-    let marker = fixture.base().join("editor-started");
-    let editor = fixture.base().join("blocking-editor.sh");
+    let marker = fixture.base().join("signer-started");
+    let signer = fixture.base().join("blocking-signer.sh");
     let stderr = fixture.base().join("rehearsal-stderr");
-    // Git supplies the message path as an argument. A script ignores that
-    // argument instead of accidentally passing it on to sleep.
+    // Signing remains interactive in JSON mode. Block the signer so the
+    // interruption occurs while Git is constructing the result commit.
     std::fs::write(
-        &editor,
-        "#!/bin/sh\ntouch \"$EDITOR_MARKER\"\nexec sleep 60\n",
+        &signer,
+        "#!/bin/sh\ntouch \"$SIGNER_MARKER\"\nexec sleep 60\n",
     )
-    .expect("blocking editor script");
-    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755))
-        .expect("editor executable");
+    .expect("blocking signer script");
+    std::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755))
+        .expect("signer executable");
+    fixture.git(&["config", "commit.gpgsign", "true"]);
+    fixture.git(&["config", "gpg.format", "openpgp"]);
+    fixture.git(&[
+        "config",
+        "gpg.openpgp.program",
+        signer.to_str().expect("signer path"),
+    ]);
     let mut child = Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
         .args(["--json", "--keep", "merge", "--no-ff", "--edit", "feature"])
         .current_dir(fixture.repo())
         .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
-        .env("GIT_EDITOR", &editor)
-        .env("EDITOR_MARKER", &marker)
+        .env("SIGNER_MARKER", &marker)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&stderr).expect("rehearsal stderr"))
@@ -259,7 +265,7 @@ fn an_explicitly_kept_initial_run_survives_interruption_and_age_pruning() {
     }
     let was_running = child.try_wait().expect("check rehearsal status").is_none();
     // Kill the CLI first so Git's death cannot be recorded as a completed
-    // outcome. Then stop Git and its editor before any assertion can panic.
+    // outcome. Then stop Git and its signer before any assertion can panic.
     if was_running {
         child.kill().expect("interrupt rehearsal");
     }
@@ -272,7 +278,7 @@ fn an_explicitly_kept_initial_run_survives_interruption_and_age_pruning() {
     child.wait().expect("reap rehearsal");
     assert!(
         marker.exists(),
-        "the merge reached its editor: {}",
+        "the merge reached its signer: {}",
         std::fs::read_to_string(&stderr).expect("rehearsal stderr")
     );
     assert!(
@@ -318,6 +324,9 @@ fn a_killed_continuation_is_reported_incomplete_after_restart() {
     let fixture = Fixture::new();
     fixture.commit("four", "four\n");
     fixture.git(&["checkout", "feature"]);
+    // Rebase records its signing choice when the operation starts.
+    fixture.git(&["config", "commit.gpgsign", "true"]);
+    fixture.git(&["config", "gpg.format", "openpgp"]);
     let (code, out, err) = fixture.rehearse(&["--json", "--keep", "rebase", "main"]);
     assert_eq!(code, STOPPED, "{err}");
     let first = document(&out);
@@ -326,27 +335,36 @@ fn a_killed_continuation_is_reported_incomplete_after_restart() {
     std::fs::write(sandbox.join("file.txt"), "resolved\n").expect("resolve");
     fixture.git_in(&sandbox, &["add", "file.txt"]);
 
-    let editor = fixture.base().join("blocking-editor.sh");
-    let marker = fixture.base().join("editor-started");
-    let editor_pid = fixture.base().join("editor-pid");
+    let signer = fixture.base().join("blocking-signer.sh");
+    let marker = fixture.base().join("signer-started");
+    let signer_pid = fixture.base().join("signer-pid");
     std::fs::write(
-        &editor,
-        "#!/bin/sh\nprintf '%s' \"$$\" > \"$EDITOR_PID\"\ntouch \"$EDITOR_MARKER\"\nwhile :; do sleep 1; done\n",
+        &signer,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$SIGNER_PID\"\ntouch \"$SIGNER_MARKER\"\nwhile :; do sleep 1; done\n",
     )
-    .expect("editor script");
-    let mut permissions = std::fs::metadata(&editor)
-        .expect("editor metadata")
+    .expect("signer script");
+    let mut permissions = std::fs::metadata(&signer)
+        .expect("signer metadata")
         .permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(&editor, permissions).expect("editor executable");
+    std::fs::set_permissions(&signer, permissions).expect("signer executable");
 
+    fixture.git_in(&sandbox, &["config", "commit.gpgsign", "true"]);
+    fixture.git_in(&sandbox, &["config", "gpg.format", "openpgp"]);
+    fixture.git_in(
+        &sandbox,
+        &[
+            "config",
+            "gpg.openpgp.program",
+            signer.to_str().expect("signer path"),
+        ],
+    );
     let mut child = Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
         .args(["--json", "--keep", "continue", &id])
         .current_dir(fixture.repo())
         .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
-        .env("GIT_EDITOR", &editor)
-        .env("EDITOR_MARKER", &marker)
-        .env("EDITOR_PID", &editor_pid)
+        .env("SIGNER_MARKER", &marker)
+        .env("SIGNER_PID", &signer_pid)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -360,11 +378,11 @@ fn a_killed_continuation_is_reported_incomplete_after_restart() {
     }
     assert!(
         marker.exists(),
-        "the continuation reached the blocking editor"
+        "the continuation reached the blocking signer"
     );
 
     child.kill().expect("kill continuation");
-    let pid = std::fs::read_to_string(&editor_pid).expect("editor pid");
+    let pid = std::fs::read_to_string(&signer_pid).expect("signer pid");
     let status = Command::new("kill")
         .args(["-KILL", pid.trim()])
         .status()

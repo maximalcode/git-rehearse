@@ -111,13 +111,27 @@ pub fn run_with(
     todo: Option<&Todo>,
     chatter: Chatter,
 ) -> Result<Outcome> {
-    let env = match todo {
-        Some(todo) => vec![("GIT_SEQUENCE_EDITOR", sequence_editor(todo, command)?)],
-        None => Vec::new(),
-    };
+    let mut env = editor_env(chatter);
+    if let Some(todo) = todo {
+        env.push(("GIT_SEQUENCE_EDITOR", sequence_editor(todo, command)?));
+    }
     git::validate_hook_policy(worktree, command)?;
     let status = git::spawn_with(worktree, command, &env, chatter)?;
     classify(worktree, status)
+}
+
+/// JSON callers supply a todo instead of opening a sequence editor. A missing
+/// todo must fail visibly; automatically accepting Git's todo would invent a
+/// history-editing decision. Signing programs keep their normal environment.
+fn editor_env(chatter: Chatter) -> Vec<(&'static str, OsString)> {
+    if chatter == Chatter::ToStderr {
+        vec![
+            ("GIT_EDITOR", OsString::from("true")),
+            ("GIT_SEQUENCE_EDITOR", OsString::from("false")),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The `GIT_SEQUENCE_EDITOR` value that installs `todo`, after checking that
@@ -298,7 +312,8 @@ pub fn resume_with(worktree: &Path, chatter: Chatter) -> Result<Outcome> {
         ));
     };
 
-    let status = git::spawn_with(worktree, [subcommand, "--continue"], &[], chatter)?;
+    let env = editor_env(chatter);
+    let status = git::spawn_with(worktree, [subcommand, "--continue"], &env, chatter)?;
     classify(worktree, status)
 }
 

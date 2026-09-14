@@ -253,6 +253,8 @@ pub struct Report {
     /// Whether the stop involves unmerged paths. An interactive `break` stops
     /// without any, and calling that a conflict would be a lie.
     pub conflicted: bool,
+    /// Actual object signatures; verification and trust are explicitly unchecked.
+    pub signatures: Vec<SignatureReport>,
     pub refs: Vec<Ref>,
     /// The commit being replayed when the command stopped.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -628,6 +630,7 @@ impl Report {
                 Outcome::Clean | Outcome::Stopped { .. } => None,
             },
             conflicted: matches!(outcome, Outcome::Stopped { conflicts: true }),
+            signatures: analysis.signatures.iter().map(signature).collect(),
             refs: analysis.ref_moves.iter().map(reference).collect(),
             stopped_at: analysis.stopped_at.as_ref().map(commit),
             conflicts: analysis.conflicts.iter().map(conflict).collect(),
@@ -769,6 +772,7 @@ mod tests {
 
     fn analysis() -> Analysis {
         Analysis {
+            signatures: Vec::new(),
             ref_moves: Vec::new(),
             stopped_at: Some(Commit {
                 sha: "0a7bfa18".to_owned(),
@@ -867,6 +871,7 @@ mod tests {
                 Outcome::Clean | Outcome::Stopped { .. } => None,
             },
             conflicted: matches!(outcome, Outcome::Stopped { conflicts: true }),
+            signatures: Vec::new(),
             refs: Vec::new(),
             stopped_at: analysis().stopped_at.as_ref().map(super::commit),
             conflicts: analysis().conflicts.iter().map(super::conflict).collect(),
@@ -934,5 +939,23 @@ mod tests {
             serde_json::to_value(OutcomeKind::Clean).expect("serialises"),
             "clean"
         );
+    }
+}
+
+/// Presence does not imply cryptographic validity or a trusted signer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SignatureReport {
+    pub sha: String,
+    pub present: bool,
+    pub verification: &'static str,
+    pub trust: &'static str,
+}
+
+fn signature(found: &crate::signatures::Signature) -> SignatureReport {
+    SignatureReport {
+        sha: found.sha.clone(),
+        present: found.present,
+        verification: "not_checked",
+        trust: "not_checked",
     }
 }

@@ -724,6 +724,16 @@ fn normalised(text: &str) -> serde_json::Value {
             }
         }
     }
+    if let Some(signatures) = object
+        .get_mut("signatures")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for entry in signatures {
+            if let Some(entry) = entry.as_object_mut() {
+                entry.remove("sha");
+            }
+        }
+    }
     value
 }
 

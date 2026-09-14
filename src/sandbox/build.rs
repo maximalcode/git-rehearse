@@ -299,9 +299,8 @@ const CARRIED_CONFIG: &[&str] = &[
     "tag.gpgsign",
     "user.signingkey",
     "gpg.format",
-    "gpg.program",
-    "gpg.openpgp.program",
     "gpg.ssh.program",
+    "gpg.ssh.defaultKeyCommand",
     "gpg.x509.program",
 ];
 
@@ -320,12 +319,24 @@ const CARRIED_CONFIG: &[&str] = &[
 /// to commit without an identity.
 fn carry_config(repo: &Path, worktree: &Path) -> Result<()> {
     for key in CARRIED_CONFIG {
-        if let Ok(value) = git::run(repo, ["config", "--get", key])
-            && !value.is_empty()
-        {
-            git::run(worktree, ["config", key, &value])?;
+        // A present empty value can deliberately override global config.
+        // Only exit 1 means absent; other errors must never disable signing.
+        let mut query = vec!["config", "--null"];
+        if matches!(*key, "commit.gpgsign" | "tag.gpgsign") {
+            // A valueless boolean means true; an explicit empty string means
+            // false. Let Git distinguish them before writing the copy.
+            query.push("--type=bool");
         }
+        query.extend(["--get", key]);
+        let value = match git::run(repo, query) {
+            Ok(value) => value.strip_suffix('\0').unwrap_or(&value).to_owned(),
+            Err(Error::Git { code: Some(1), .. }) => continue,
+            Err(error) => return Err(error),
+        };
+        let value = signing_key_path(repo, key, value)?;
+        git::run(worktree, ["config", key, &value])?;
     }
+    carry_openpgp_program(repo, worktree)?;
     carry_merge_config(repo, worktree)?;
     Ok(())
 }
@@ -378,5 +389,47 @@ fn checkout(worktree: &Path, target: &super::Checkout) -> Result<()> {
             git::run(worktree, ["checkout", "--quiet", "--detach", sha, "--"])?
         }
     };
+    Ok(())
+}
+
+/// SSH file keys are resolved from the original checkout, including untracked
+/// keys outside the clone. Inline public keys remain Git's own syntax.
+fn signing_key_path(repo: &Path, key: &str, value: String) -> Result<String> {
+    if key != "user.signingkey"
+        || value.is_empty()
+        || value.starts_with("key::")
+        || value.starts_with("ssh-")
+        || git::run(repo, ["config", "--get", "gpg.format"])
+            .ok()
+            .as_deref()
+            != Some("ssh")
+    {
+        return Ok(value);
+    }
+    let expanded = git::run(repo, ["config", "--path", "--get", key])?;
+    Ok(repo.join(expanded).to_string_lossy().into_owned())
+}
+
+/// Git treats these two names as aliases, so their configuration order matters.
+/// Copying each name independently could select an older, different signer.
+fn carry_openpgp_program(repo: &Path, worktree: &Path) -> Result<()> {
+    let values = match git::run(
+        repo,
+        [
+            "config",
+            "--null",
+            "--get-regexp",
+            "^gpg\\.(program|openpgp\\.program)$",
+        ],
+    ) {
+        Ok(values) => values,
+        Err(Error::Git { code: Some(1), .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in values.split('\0').filter(|entry| !entry.is_empty()) {
+        let (_, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        // Write one canonical alias to preserve Git's last-value-wins behavior.
+        git::run(worktree, ["config", "gpg.openpgp.program", value])?;
+    }
     Ok(())
 }
