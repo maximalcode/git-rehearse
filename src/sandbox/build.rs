@@ -108,6 +108,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
     strip_remotes(&worktree)?;
     disable_hooks(&worktree, &hooks)?;
     carry_config(&plan.repo, &worktree)?;
+    super::rerere::copy(&plan.repo, &worktree)?;
     checkout(&worktree, &plan.checkout)?;
     // After the hooks are disabled, because this step runs git in the sandbox
     // and a rehearsal fires none of the user's hooks — and after the checkout,
@@ -280,6 +281,8 @@ fn disable_hooks(worktree: &Path, hooks: &Path) -> Result<()> {
 /// right way round: a loud exit 3 is recoverable, a quiet signature downgrade
 /// is not.
 ///
+/// - rerere booleans and cache retention settings: copied alongside an
+///   independent cache so existing resolutions and Git defaults remain effective.
 /// - the `merge.*` group: `.gitattributes` names a driver in tracked content,
 ///   but the driver's command and options live in local config, so every local
 ///   `merge.*` entry is carried as well. Git's NUL-delimited output keeps a
@@ -295,6 +298,10 @@ const CARRIED_CONFIG: &[&str] = &[
     "user.email",
     "core.autocrlf",
     "core.eol",
+    "rerere.enabled",
+    "rerere.autoupdate",
+    "gc.rerereResolved",
+    "gc.rerereUnresolved",
     "commit.gpgsign",
     "tag.gpgsign",
     "user.signingkey",
@@ -322,7 +329,10 @@ fn carry_config(repo: &Path, worktree: &Path) -> Result<()> {
         // A present empty value can deliberately override global config.
         // Only exit 1 means absent; other errors must never disable signing.
         let mut query = vec!["config", "--null"];
-        if matches!(*key, "commit.gpgsign" | "tag.gpgsign") {
+        if matches!(
+            *key,
+            "commit.gpgsign" | "tag.gpgsign" | "rerere.enabled" | "rerere.autoupdate"
+        ) {
             // A valueless boolean means true; an explicit empty string means
             // false. Let Git distinguish them before writing the copy.
             query.push("--type=bool");
