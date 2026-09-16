@@ -711,3 +711,15 @@ pull request.
 ## License
 
 [MIT](LICENSE)
+
+### Saved conflict resolutions (rerere)
+
+Rehearsals copy effective rerere settings and the existing `rr-cache` into an
+independent sandbox cache, including when starting from a linked worktree. A
+missing cache is normal; unreadable caches or unsupported cache entries stop
+creation with an error. New resolutions learned while resolving or continuing
+a rehearsal stay in the sandbox. Apply transfers the reviewed commits and files,
+but never copies those resolutions back to the original cache. Reports explain
+this limit; JSON exposes `"rerere_resolution_transfer": "sandbox_only"`.
+Custom merge drivers remain active; the sandbox does not isolate arbitrary
+programs those drivers execute.

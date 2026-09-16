@@ -171,6 +171,10 @@ pub fn render(meta: &Meta, analysis: &Analysis, outcome: &Outcome, graphs: &[Gra
     let _ = writeln!(out, "repository {}", meta.repo_path.display());
     let _ = writeln!(out, "rehearsal  {}", meta.id);
     let _ = writeln!(out, "Repository hooks were not run");
+    let _ = writeln!(
+        out,
+        "New rerere resolutions stay in the sandbox; Apply does not copy them back"
+    );
     if !analysis.signatures.is_empty() {
         let signed = analysis
             .signatures

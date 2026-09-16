@@ -870,6 +870,11 @@ fn act<W: Write>(choice: Choice, mut sandbox: Sandbox, output: &mut W) -> Result
 
 fn report_applied<W: Write>(applied: &apply::Applied, output: &mut W) -> Result<()> {
     writeln!(output, "Repository hooks were not run").map_err(Error::Spawn)?;
+    writeln!(
+        output,
+        "New rerere resolutions stay in the sandbox; Apply does not copy them back"
+    )
+    .map_err(Error::Spawn)?;
     writeln!(output, "applied:").map_err(Error::Spawn)?;
     for moved in &applied.moved {
         // HEAD followed its branch; saying so twice adds nothing.
@@ -1071,6 +1076,7 @@ fn apply_kept<W: Write>(
         let document = json::ApplyResult {
             schema: json::SCHEMA,
             repository_hooks: "disabled",
+            rerere_resolution_transfer: "sandbox_only",
             id: sandbox.id().to_owned(),
             repository: sandbox.meta().repo_path.display().to_string(),
             exit_code: exit::CLEAN,

@@ -219,6 +219,8 @@ impl CarriedReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
     pub schema: u32,
+    /// Newly learned resolutions are never copied back by Apply.
+    pub rerere_resolution_transfer: &'static str,
     /// Repository hooks are disabled for commands run by this tool.
     pub repository_hooks: &'static str,
     /// The rehearsal id — an unambiguous prefix of it is what `continue`,
@@ -378,6 +380,9 @@ pub struct Listing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApplyResult {
     pub schema: u32,
+    /// Newly learned resolutions are never copied back by Apply.
+    pub rerere_resolution_transfer: &'static str,
+    /// Repository hooks are disabled for commands run by this tool.
     pub repository_hooks: &'static str,
     pub id: String,
     pub repository: String,
@@ -611,6 +616,7 @@ impl Report {
         let meta: &Meta = sandbox.meta();
         Self {
             schema: SCHEMA,
+            rerere_resolution_transfer: "sandbox_only",
             repository_hooks: "disabled",
             id: meta.id.clone(),
             repository: meta.repo_path.display().to_string(),
@@ -847,6 +853,7 @@ mod tests {
     fn report(outcome: &Outcome) -> Report {
         Report {
             schema: SCHEMA,
+            rerere_resolution_transfer: "sandbox_only",
             repository_hooks: "disabled",
             id: "1786281796-00".to_owned(),
             repository: "/repo".to_owned(),
