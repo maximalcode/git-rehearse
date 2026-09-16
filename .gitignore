@@ -9,3 +9,5 @@
 .claude/agent-guard/__pycache__/
 .claude/agent-guard-receipt.json.tmp
 .claude/agent-guard-ledger.jsonl
+
+/dist/
