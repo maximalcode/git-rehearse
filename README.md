@@ -65,6 +65,9 @@ However you install it, you get a binary called `git-rehearse`. Because git
 treats any `git-<name>` on your `PATH` as a subcommand, that is all it takes
 for `git rehearse …` to work — no alias, no config.
 
+See [release artifacts](docs/releases.md) for the OS/architecture mapping,
+checksum verification, installation instructions, and non-publishing test builds.
+
 ## A real session
 
 Every transcript below is real captured output. The only thing edited is the
