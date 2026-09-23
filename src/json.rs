@@ -296,6 +296,9 @@ pub struct Entry {
     pub sandbox: String,
     /// `fresh` or `kept`, as recorded in the sandbox's own metadata.
     pub status: String,
+    /// Live process ownership, independent of the last recorded outcome.
+    /// Advisory only: discard performs an authoritative ownership check.
+    pub active: bool,
     /// Seconds since the Unix epoch.
     pub created_unix: u64,
     /// How the command ended, if it has run.
@@ -358,6 +361,7 @@ impl Entry {
                 Status::Kept => "kept",
             }
             .to_owned(),
+            active: sandbox.is_active(),
             created_unix: meta.created_unix,
             outcome: meta.result.as_ref().map(kind_of),
             execution: execution(meta),

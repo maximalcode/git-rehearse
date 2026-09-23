@@ -536,7 +536,7 @@ fn rehearse<W: Write>(
 ) -> Result<u8> {
     let plan = preflight::run(cwd)?.into_plan(command.to_vec());
     let cache_root = cache::root()?;
-    let mut sandbox = sandbox::create(&cache_root, &plan, now_unix())?;
+    let mut sandbox = sandbox::create_executing(&cache_root, &plan, now_unix())?;
     if decision == Decision::Keep {
         // Retention must survive a kill while Git or its editor is running.
         sandbox.keep()?;
@@ -578,6 +578,7 @@ fn resume<W: Write>(
     output: &mut W,
 ) -> Result<u8> {
     let mut sandbox = find(id, cwd)?;
+    sandbox.claim_execution()?;
     recovery::ensure_clear(&sandbox.meta().repo_path)?;
     let stopped_on_replay = carry::stopped_on_replay(sandbox.meta());
     if stopped_on_replay {
@@ -619,6 +620,7 @@ fn report_and_decide<W: Write>(
     exit_code: u8,
     output: &mut W,
 ) -> Result<()> {
+    crate::test_hooks::pause("GIT_REHEARSE_PAUSE_EXECUTION_AT", "report");
     let worktree = sandbox.worktree();
     let meta = sandbox.meta();
     let analysis = analyze::run(&worktree, &meta.pre_state, &meta.command, outcome)?;
@@ -943,7 +945,7 @@ fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
         .map_err(Error::Spawn)?;
         writeln!(
             output,
-            "  origin {}  checkout {:?}  execution {}  storage {}",
+            "  origin {}  checkout {:?}  execution {}  storage {}  active {}",
             meta.repo_path.display(),
             meta.checkout,
             meta.result
@@ -953,7 +955,8 @@ fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
                     Outcome::Stopped { .. } => "stopped",
                     Outcome::Failed { .. } => "failed",
                 }),
-            sandbox.root().display()
+            sandbox.root().display(),
+            sandbox.is_active()
         )
         .map_err(Error::Spawn)?;
         writeln!(
@@ -991,20 +994,33 @@ fn show<W: Write>(
     cwd: &Path,
     output: &mut W,
 ) -> Result<u8> {
-    let sandbox = find(id, cwd)?;
+    let mut sandbox = find(id, cwd)?;
+    let active = sandbox.is_active();
+    if !active {
+        // Recheck atomically and refresh metadata before analyzing. A Continue
+        // that won the race causes a refusal rather than a mixed report.
+        sandbox.claim_execution()?;
+    }
     let meta = sandbox.meta();
     // What the command did is remembered rather than re-derived; a rehearsal
     // that was never run is the only case with nothing to remember.
-    let Some(outcome) = meta.result.clone() else {
+    let Some(outcome) = meta.result.clone().filter(|_| !active) else {
         if format == Format::Json {
-            let document = json::Incomplete::of(&sandbox);
+            let mut document = json::Incomplete::of(&sandbox);
+            // Our read reservation is not another execution in progress.
+            document.entry.active = active;
             write_json(&document, output)?;
         } else {
             write_show_metadata(&sandbox, output)?;
             writeln!(
                 output,
-                "rehearsal {}: execution incomplete; its process ended before recording an execution result",
+                "rehearsal {}: {}",
                 meta.id,
+                if active {
+                    "execution active; another process owns this rehearsal"
+                } else {
+                    "execution incomplete; its process ended before recording an execution result"
+                },
             )
             .map_err(Error::Spawn)?;
         }
@@ -1070,7 +1086,8 @@ fn apply_kept<W: Write>(
     cwd: &Path,
     output: &mut W,
 ) -> Result<u8> {
-    let sandbox = find(id, cwd)?;
+    let mut sandbox = find(id, cwd)?;
+    sandbox.claim_execution()?;
     let applied = apply::run(&sandbox, now_unix())?;
     if format == Format::Json {
         let document = json::ApplyResult {

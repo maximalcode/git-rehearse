@@ -66,6 +66,9 @@ pub struct Applied {
 /// checkout changed. [`Error::Git`] or [`Error::Io`] if the transplant itself
 /// fails.
 pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
+    let mut owned = sandbox.clone();
+    owned.claim_execution()?;
+    let sandbox = &owned;
     let meta = sandbox.meta();
     let repo = meta.repo_path.as_path();
     let worktree = sandbox.worktree();

@@ -474,6 +474,16 @@ JSON reports `null`. A rehearsal whose process ended before writing a result
 is reported as `incomplete`; it is never treated as a clean rehearsal or made
 applyable by inference. Supplied management IDs must be exact or an unambiguous
 prefix; omitting the ID keeps the existing most-recent-rehearsal behavior.
+`list` also reports `active`: live process ownership is separate from the last
+recorded execution result. While a rehearsal is active, `show` returns its
+management metadata with `active: true` instead of analyzing a changing sandbox.
+Discard refuses active rehearsals (exit 4), and age pruning skips them. Ownership
+covers construction, Continue, analysis, and reporting, and the operating system
+releases it if the CLI exits or crashes. Other rehearsals remain usable. Inspection
+is advisory: always use discard's result as the authoritative cleanup decision.
+Recovery reservations still protect interrupted Apply operations. Small lock files
+remain in the cache after removal so concurrent processes always lock the same file.
+
 The added management fields are optional extensions to schema 1: consumers
 reading output from older versions must tolerate their absence.
 

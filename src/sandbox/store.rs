@@ -43,7 +43,11 @@ pub fn list(cache_root: &Path, repo_id: Option<&str>) -> Result<Vec<Sandbox>> {
         for root in subdirectories(&repo_dir)? {
             let metadata = root.join("meta.json");
             match Meta::read(&root) {
-                Ok(meta) => found.push(Sandbox { root, meta }),
+                Ok(meta) => found.push(Sandbox {
+                    root,
+                    meta,
+                    ownership: None,
+                }),
                 // A directory without metadata is a clone interrupted before
                 // the durable record was written. It is not a rehearsal the
                 // management API can identify, so leave it for prune.
@@ -139,6 +143,11 @@ pub fn prune(cache_root: &Path, now_unix: u64, max_age_secs: u64) -> Result<Vec<
     let mut removed = Vec::new();
     for repo_dir in subdirectories(cache_root)? {
         for root in subdirectories(&repo_dir)? {
+            // Includes construction before meta.json exists. Keep ownership
+            // through removal so a Continue cannot start after this check.
+            let Ok(_ownership) = super::ownership::Ownership::acquire(&root) else {
+                continue;
+            };
             let metadata = root.join("meta.json");
             let meta = match Meta::read(&root) {
                 Ok(meta) => Some(meta),
