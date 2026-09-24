@@ -32,10 +32,11 @@
 mod build;
 mod merge_config;
 mod meta;
+mod ownership;
 mod rerere;
 mod store;
 
-pub use build::create;
+pub use build::{create, create_executing};
 pub use meta::{Checkout, META_SCHEMA, Meta, Status};
 pub(crate) use store::matches_id;
 pub use store::{DEFAULT_TTL_SECS, find, list, prune};
@@ -85,9 +86,29 @@ pub struct Plan {
 pub struct Sandbox {
     root: PathBuf,
     meta: Meta,
+    ownership: Option<std::sync::Arc<ownership::Ownership>>,
 }
 
 impl Sandbox {
+    /// Claims this rehearsal before mutation and reloads metadata under ownership.
+    /// Ownership lasts through reporting and is released when this handle and its
+    /// clones are dropped. Competing management operations refuse immediately.
+    pub fn claim_execution(&mut self) -> Result<()> {
+        if self.ownership.is_none() {
+            let ownership = ownership::Ownership::acquire(&self.root)?;
+            self.meta = Meta::read(&self.root)?;
+            self.ownership = Some(std::sync::Arc::new(ownership));
+        }
+        Ok(())
+    }
+
+    /// Whether a process owns this rehearsal, or ownership cannot be inspected.
+    /// This is advisory; discard acquires ownership again to close inspection races.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.ownership.is_some() || ownership::Ownership::acquire(&self.root).is_err()
+    }
+
     /// The rehearsal id, as used by `git rehearse show|apply|discard`.
     #[must_use]
     pub fn id(&self) -> &str {
@@ -184,7 +205,8 @@ impl Sandbox {
     /// The lock must belong to this rehearsal's repository. Keeping it in the
     /// caller's scope through removal closes the window in which an Apply could
     /// mutate the repository while this sandbox is being destroyed.
-    pub fn discard_locked(self, lock: &crate::recovery::Lock) -> Result<()> {
+    pub fn discard_locked(mut self, lock: &crate::recovery::Lock) -> Result<()> {
+        self.claim_execution()?;
         // Let recovery reap a completed journal first, while preserving the
         // fail-closed reservation check for opaque or unreadable claims.
         let clearance = crate::recovery::ensure_clear_locked(&self.meta.repo_path, lock);

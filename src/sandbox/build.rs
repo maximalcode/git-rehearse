@@ -39,13 +39,27 @@ use crate::{Error, Result, cache, carry, git};
 /// exist, an unreadable repository), [`Error::Io`] for filesystem failures,
 /// [`Error::Sandbox`] if the sandbox cannot be made inert.
 pub fn create(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result<Sandbox> {
+    let mut sandbox = create_executing(cache_root, plan, now_unix)?;
+    sandbox.ownership = None;
+    Ok(sandbox)
+}
+
+/// Creates a sandbox and retains exclusive ownership through execution and report.
+///
+/// # Errors
+/// Returns the same construction errors as [`create`].
+pub fn create_executing(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result<Sandbox> {
     let repo_id = cache::repo_id(&plan.repo);
     let repo_dir = cache_root.join(&repo_id);
     fs::create_dir_all(&repo_dir).map_err(Error::io(&repo_dir))?;
 
-    let (id, root) = claim_directory(&repo_dir, &plan.repo, now_unix)?;
+    let (id, root, ownership) = claim_directory(&repo_dir, &plan.repo, now_unix)?;
     match build(&root, plan, &repo_id, id.clone(), now_unix) {
-        Ok(meta) => Ok(Sandbox { root, meta }),
+        Ok(meta) => Ok(Sandbox {
+            root,
+            meta,
+            ownership: Some(std::sync::Arc::new(ownership)),
+        }),
         Err(err) => {
             // Best effort: if cleanup also fails, the original failure is the
             // one worth reporting, and prune will collect the leftovers.
@@ -57,12 +71,16 @@ pub fn create(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result<Sandbox> 
 
 /// Claims the next free rehearsal directory and returns its id.
 ///
-/// Exclusive directory creation *is* the id allocator: no lock file, no
-/// randomness, and two rehearsals started in the same second cannot collide,
+/// Exclusive directory creation is the id allocator: no randomness, and
+/// two rehearsals started in the same second cannot collide,
 /// because whoever loses the `create_dir` race simply takes the next suffix.
 /// Applied rehearsals also reserve their ids through their retained object refs,
 /// even after their sandbox directory has been removed.
-fn claim_directory(repo_dir: &Path, repo: &Path, now_unix: u64) -> Result<(String, PathBuf)> {
+fn claim_directory(
+    repo_dir: &Path,
+    repo: &Path,
+    now_unix: u64,
+) -> Result<(String, PathBuf, super::ownership::Ownership)> {
     for attempt in 0..100 {
         let origin = crate::worktree::Origin::capture(repo)?;
         // A full main-worktree ID must never be a prefix of a linked ID.
@@ -78,8 +96,13 @@ fn claim_directory(repo_dir: &Path, repo: &Path, now_unix: u64) -> Result<(Strin
             continue;
         }
         let root = repo_dir.join(&id);
+        let ownership = match super::ownership::Ownership::acquire(&root) {
+            Ok(ownership) => ownership,
+            Err(Error::Refused(_)) => continue,
+            Err(error) => return Err(error),
+        };
         match fs::create_dir(&root) {
-            Ok(()) => return Ok((id, root)),
+            Ok(()) => return Ok((id, root, ownership)),
             // Taken already — try the next suffix.
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(Error::Io(root, err)),
@@ -99,6 +122,7 @@ fn claim_directory(repo_dir: &Path, repo: &Path, now_unix: u64) -> Result<(Strin
 /// would leave the sandbox holding line endings the real repository would
 /// never have produced.
 fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> Result<Meta> {
+    crate::test_hooks::pause("GIT_REHEARSE_PAUSE_EXECUTION_AT", "construction");
     let hooks = root.join(HOOKS_DIR);
     fs::create_dir(&hooks).map_err(Error::io(&hooks))?;
     let worktree = root.join(WORKTREE_DIR);
