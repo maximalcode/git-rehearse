@@ -221,9 +221,9 @@ pub fn prune(cache_root: &Path, now_unix: u64, max_age_secs: u64) -> Result<Vec<
                 removed.push(name.to_string_lossy().into_owned());
             }
         }
-        // A repository directory with nothing left in it is noise in the
-        // cache; it comes back by itself on the next rehearsal.
-        let _ = fs::remove_dir(&repo_dir);
+        // Keep the repository parent even when empty: a creator may have
+        // made it but not yet acquired its first rehearsal ownership lock.
+        // Removing it here would make that first lock fail with NotFound.
     }
     removed.sort();
     Ok(removed)

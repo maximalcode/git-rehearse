@@ -52,6 +52,7 @@ pub fn create_executing(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result
     let repo_id = cache::repo_id(&plan.repo);
     let repo_dir = cache_root.join(&repo_id);
     fs::create_dir_all(&repo_dir).map_err(Error::io(&repo_dir))?;
+    crate::test_hooks::pause("GIT_REHEARSE_PAUSE_EXECUTION_AT", "before-claim");
 
     let (id, root, ownership) = claim_directory(&repo_dir, &plan.repo, now_unix)?;
     match build(&root, plan, &repo_id, id.clone(), now_unix) {
