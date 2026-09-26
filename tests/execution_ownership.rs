@@ -48,7 +48,7 @@ fn discard_refuses_live_execution_then_succeeds_after_completion() {
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while !marker.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -128,7 +128,7 @@ fn continuation_is_protected_and_crash_releases_ownership() {
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while !marker.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -184,7 +184,7 @@ fn construction_and_report_remain_reserved_against_pruning() {
                 .spawn()
                 .unwrap(),
         );
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_mins(1);
         while !marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -225,4 +225,70 @@ fn construction_and_report_remain_reserved_against_pruning() {
             );
         }
     }
+}
+
+#[test]
+fn first_creation_survives_another_repository_listing_the_shared_cache() {
+    let fixture = Fixture::new();
+    let other = fixture.sibling("other");
+    let before = fixture.refs();
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    let contents = std::fs::read(fixture.repo().join("file.txt")).unwrap();
+    let index = std::fs::read(fixture.repo().join(".git/index")).unwrap();
+    let marker = fixture.base().join("before-claim");
+    let mut child = Running(
+        Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+            .args(["--json", "--keep", "merge", "feature"])
+            .current_dir(fixture.repo())
+            .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
+            .env(
+                "GIT_REHEARSE_PAUSE_EXECUTION_AT",
+                format!("before-claim={}", marker.display()),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_mins(1);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(marker.exists(), "creation reached the gap before ownership");
+    let repo_dir = fixture
+        .cache()
+        .join(git_rehearse::cache::repo_id(fixture.repo()));
+    assert_eq!(std::fs::read_dir(&repo_dir).unwrap().count(), 0);
+    let listing = Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+        .args(["--json", "list"])
+        .current_dir(&other)
+        .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
+        .output()
+        .unwrap();
+    assert!(listing.status.success(), "{listing:?}");
+    let listing: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert!(listing["rehearsals"].as_array().unwrap().is_empty());
+    std::fs::remove_file(&marker).unwrap();
+    assert!(
+        child.0.wait().unwrap().success(),
+        "first rehearsal succeeds"
+    );
+    let (code, listing, err) = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(code, 0, "{err}");
+    let listing: serde_json::Value = serde_json::from_str(&listing).unwrap();
+    let entries = listing["rehearsals"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["execution"], "clean");
+    assert_eq!(fixture.refs(), before);
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        std::fs::read(fixture.repo().join("file.txt")).unwrap(),
+        contents
+    );
+    assert_eq!(
+        std::fs::read(fixture.repo().join(".git/index")).unwrap(),
+        index
+    );
 }

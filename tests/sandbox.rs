@@ -292,8 +292,16 @@ fn rehearsals_started_in_the_same_second_do_not_collide() {
     let fixture = Fixture::new();
     let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
 
-    let first = sandbox::create(fixture.cache(), &plan, NOW).expect("first sandbox");
-    let second = sandbox::create(fixture.cache(), &plan, NOW).expect("second sandbox");
+    let barrier = std::sync::Barrier::new(2);
+    let (first, second) = std::thread::scope(|scope| {
+        let create = || {
+            barrier.wait();
+            sandbox::create(fixture.cache(), &plan, NOW).expect("concurrent sandbox")
+        };
+        let first = scope.spawn(create);
+        let second = scope.spawn(create);
+        (first.join().unwrap(), second.join().unwrap())
+    });
 
     assert_ne!(first.id(), second.id());
     assert_ne!(first.root(), second.root());
