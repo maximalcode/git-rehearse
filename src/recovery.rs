@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::analyze::RefMove;
 use crate::carry;
 use crate::collision;
+use crate::durable::sync_parent_directory;
 use crate::preflight::HEAD_KEY;
 use crate::{Error, Result, git};
 
@@ -1392,43 +1393,6 @@ fn atomic_bytes_at(path: &Path, bytes: &[u8], failure_stage: &str) -> Result<()>
     fail_storage_for_test(failure_stage, "sync", &tmp)?;
     fs::rename(&tmp, path).map_err(Error::io(path))?;
     sync_parent_directory(path)?;
-    Ok(())
-}
-
-/// Flushes the directory entry created by a publication or removed by cleanup.
-///
-/// Windows requires `FILE_FLAG_BACKUP_SEMANTICS` to obtain a directory handle,
-/// and `FlushFileBuffers` requires `GENERIC_WRITE`; `File::open` supplies
-/// neither. Rust's `File::sync_all` calls `FlushFileBuffers` on that handle, so
-/// keep the error visible instead of treating an unflushed directory as safe.
-fn sync_parent_directory(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        // FILE_FLAG_BACKUP_SEMANTICS from WinBase.h. CreateFileW requires it
-        // for directory handles; see the CreateFileW directory contract.
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(Error::io(parent))?;
-    }
-
-    #[cfg(not(windows))]
-    {
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(Error::io(parent))?;
-    }
-
     Ok(())
 }
 

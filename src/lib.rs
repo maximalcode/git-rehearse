@@ -17,6 +17,7 @@ pub mod cache;
 pub mod carry;
 pub mod cli;
 mod collision;
+mod durable;
 pub mod error;
 pub mod execute;
 pub mod git;

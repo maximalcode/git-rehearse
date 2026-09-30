@@ -11,9 +11,9 @@ import tempfile
 import tomllib
 
 
-def run(args, cwd, env=None):
+def run(args, cwd, env=None, expected_code=0):
     result = subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, timeout=120)
-    if result.returncode:
+    if result.returncode != expected_code:
         raise RuntimeError(f"{args} exited {result.returncode}\n{result.stdout}\n{result.stderr}")
     return result.stdout.strip()
 
@@ -33,8 +33,8 @@ def smoke(binary, version, root):
     def git(*args):
         return run(["git", *args], repo, env)
 
-    def rehearse(*args):
-        return json.loads(run([str(binary), "--json", *args], repo, env))
+    def rehearse(*args, expected_code=0):
+        return json.loads(run([str(binary), "--json", *args], repo, env, expected_code))
 
     observed_version = run([str(binary), "--version"], repo, env)
     if observed_version != f"git-rehearse {version}":
@@ -65,7 +65,53 @@ def smoke(binary, version, root):
         raise RuntimeError("Apply did not transplant the reviewed commit")
     if (repo / "file.txt").read_bytes() != b"after\n" or git("status", "--porcelain"):
         raise RuntimeError("Apply left unexpected files or index")
-    return {"version": observed_version, "git": git("--version"), "rehearsal_apply": "passed"}
+    # Build a real stopped merge and retain a user's edited resolution.
+    git("checkout", "-b", "conflicting")
+    (repo / "file.txt").write_bytes(b"other branch\n")
+    git("commit", "-am", "Other branch")
+    git("checkout", "main")
+    (repo / "file.txt").write_bytes(b"main branch\n")
+    git("commit", "-am", "Main branch")
+    stopped = rehearse("--keep", "merge", "conflicting", expected_code=2)
+    migration_smoke(stopped, rehearse)
+    return {"version": observed_version, "git": git("--version"),
+            "rehearsal_apply": "passed", "retained_metadata_migration": "passed"}
+
+
+def migration_smoke(preview, rehearse):
+    metadata = Path(preview["storage"]["metadata"])
+    backup = metadata.with_name("meta.json.bak")
+    edited = Path(preview["sandbox"]) / "file.txt"
+    edited.write_bytes(b"saved conflict resolution\n")
+    legacy = json.loads(metadata.read_bytes())
+    legacy["schema"] = 1
+    legacy.pop("carry", None)
+    legacy.pop("origin", None)
+    legacy["optional_annotation"] = {"notes": [1, None, True]}
+    original = (json.dumps(legacy, indent=2) + "\n").encode()
+    metadata.write_bytes(original)
+    backup.mkdir()
+    failure = rehearse("show", preview["id"], expected_code=4)
+    if "cannot preserve original metadata" not in failure["message"] or metadata.read_bytes() != original:
+        raise RuntimeError("Failed backup did not protect original metadata")
+    backup.rmdir()
+    for _ in range(2):
+        rehearse("show", preview["id"])
+        migrated = json.loads(metadata.read_bytes())
+        if migrated["schema"] != 3 or migrated["optional_annotation"] != legacy["optional_annotation"]:
+            raise RuntimeError("Migration lost optional metadata")
+        if backup.read_bytes() != original or edited.read_bytes() != b"saved conflict resolution\n":
+            raise RuntimeError("Migration lost original metadata or saved sandbox edits")
+    # Simulate retry after the original was preserved but migration did not commit.
+    metadata.write_bytes(original)
+    rehearse("show", preview["id"])
+    if backup.read_bytes() != original:
+        raise RuntimeError("Retry replaced the original backup")
+    incompatible = b'{"schema":999,"id":"preserve-me"}\n'
+    metadata.write_bytes(incompatible)
+    rehearse("show", preview["id"], expected_code=4)
+    if metadata.read_bytes() != incompatible or backup.read_bytes() != original or not edited.exists():
+        raise RuntimeError("Incompatible metadata was rewritten or removed")
 
 
 def main():
