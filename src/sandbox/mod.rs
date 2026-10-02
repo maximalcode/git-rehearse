@@ -96,7 +96,7 @@ impl Sandbox {
     pub fn claim_execution(&mut self) -> Result<()> {
         if self.ownership.is_none() {
             let ownership = ownership::Ownership::acquire(&self.root)?;
-            self.meta = Meta::read(&self.root)?;
+            self.meta = Meta::read_owned(&self.root)?;
             self.ownership = Some(std::sync::Arc::new(ownership));
         }
         Ok(())

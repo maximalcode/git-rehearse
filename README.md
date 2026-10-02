@@ -26,7 +26,8 @@ away. Your repository is not touched until you say so.
 ### Upgrading from v1.1.0
 
 Kept rehearsals from v1.1.0 are migrated when first read by v1.2.0. Metadata
-schema 1 is upgraded atomically to the current metadata schema, preserving the original
+schema 1 is upgraded atomically to the current metadata schema after durably saving
+the exact original bytes in `meta.json.bak` beside `meta.json`, preserving the original
 repository, checkout, refs and result. Unknown schemas and damaged metadata
 are refused and left in place so they can be recovered or diagnosed.
 
@@ -632,8 +633,13 @@ discard it. Retention is saved before the rehearsed Git command starts, so an
 interruption during execution or in its editor does not make it expire.
 Transient rehearsals and interrupted clone directories are pruned
 after seven days. Supported legacy metadata is migrated while preserving
-optional extension fields through later updates; unknown or damaged metadata and rehearsals reserved by an
-interrupted apply are preserved. A discarded one is gone immediately. The clone hardlinks your object store rather than copying it, so
+optional extension fields through later updates. Migration takes rehearsal ownership
+and never replaces an existing backup. If backup creation or flushing fails, migration
+is refused and the existing metadata and sandbox edits remain untouched. Check the
+reported permissions or free-space problem; preserve and compare any conflicting or
+partial backup before moving it aside and retrying. Unknown or damaged metadata and
+rehearsals reserved by an interrupted apply are preserved. A discarded one is gone
+immediately. The clone hardlinks your object store rather than copying it, so
 a sandbox costs almost nothing on disk, and deleting one can never touch your
 real repository's objects.
 

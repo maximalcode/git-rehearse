@@ -125,6 +125,15 @@ impl Meta {
 
     /// Reads and validates the `meta.json` in `root`.
     pub(super) fn read(root: &Path) -> Result<Self> {
+        Self::read_inner(root, false)
+    }
+
+    /// The caller already owns the rehearsal for execution or pruning.
+    pub(super) fn read_owned(root: &Path) -> Result<Self> {
+        Self::read_inner(root, true)
+    }
+
+    fn read_inner(root: &Path, owned: bool) -> Result<Self> {
         let path = root.join(META_FILE);
         let text = fs::read_to_string(&path).map_err(Error::io(&path))?;
         let mut document: Value =
@@ -140,6 +149,12 @@ impl Meta {
             })?;
 
         if schema == 1 {
+            if !owned {
+                let _ownership = super::ownership::Ownership::acquire(root)?;
+                // Reload after acquiring ownership: another invocation may have
+                // changed the record since the initial read.
+                return Self::read_owned(root);
+            }
             // Schema 1 predates dirty-worktree carrying. Its fields retain
             // their meanings, so the only safe migration is to add the
             // explicit empty carry record and write the current schema without
@@ -154,6 +169,7 @@ impl Meta {
             object.insert("carry".to_owned(), Value::Null);
             let meta: Self =
                 serde_json::from_value(document).map_err(|e| Error::Meta(path.clone(), e))?;
+            preserve_original(root, text.as_bytes())?;
             meta.write(root)?;
             return Ok(meta);
         }
@@ -174,6 +190,52 @@ impl Meta {
 
         serde_json::from_value(document).map_err(|e| Error::Meta(path, e))
     }
+}
+
+/// Create once, flush bytes and directory entry before allowing migration.
+/// An interrupted partial backup is never replaced: refuse with recovery guidance.
+fn preserve_original(root: &Path, original: &[u8]) -> Result<()> {
+    let backup = root.join("meta.json.bak");
+    let preserve = || -> Result<()> {
+        let file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(mut file) => {
+                file.write_all(original).map_err(Error::io(&backup))?;
+                file
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A retry can reuse only a complete, byte-identical regular file.
+                // Never follow a symlink or overwrite an earlier original.
+                if !fs::symlink_metadata(&backup)
+                    .map_err(Error::io(&backup))?
+                    .is_file()
+                    || fs::read(&backup).map_err(Error::io(&backup))? != original
+                {
+                    return Err(Error::Refused(
+                        "existing backup differs or is not a regular file".to_owned(),
+                    ));
+                }
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&backup)
+                    .map_err(Error::io(&backup))?
+            }
+            Err(error) => return Err(Error::Io(backup.clone(), error)),
+        };
+        file.sync_all().map_err(Error::io(&backup))?;
+        crate::durable::sync_parent_directory(&backup)
+    };
+    preserve().map_err(|error| {
+        Error::Refused(format!(
+            "cannot preserve original metadata at {}: {error}; migration was not written. \
+         Check directory permissions and free space. If a backup already exists, preserve it \
+         elsewhere and compare it with meta.json before moving it aside and retrying",
+            backup.display()
+        ))
+    })
 }
 
 #[cfg(test)]

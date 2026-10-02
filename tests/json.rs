@@ -464,6 +464,7 @@ fn optional_metadata_survives_migration_and_later_continuation() {
     let mut saved = document(&std::fs::read_to_string(metadata).expect("metadata"));
     saved["schema"] = serde_json::json!(1);
     saved.as_object_mut().expect("object").remove("carry");
+    saved.as_object_mut().expect("object").remove("origin");
     saved["optional_annotation"] = extension.clone();
     std::fs::write(
         metadata,
@@ -471,9 +472,37 @@ fn optional_metadata_survives_migration_and_later_continuation() {
     )
     .expect("save legacy record");
 
-    let (code, out, err) = fixture.rehearse(&["--json", "list"]);
+    let original = std::fs::read(metadata).expect("original bytes");
+    let backup = std::path::Path::new(metadata).with_file_name("meta.json.bak");
+    std::fs::write(worktree.join("file.txt"), "saved resolution\n").expect("saved edit");
+    // Fail the migration write after its backup succeeds, then retry normally.
+    let blocked_write = std::path::Path::new(metadata).with_file_name("meta.json.tmp");
+    std::fs::create_dir(&blocked_write).expect("block migration write");
+    let (code, out, err) = fixture.rehearse(&["--json", "show", id]);
+    assert_eq!(code, REFUSED, "{out}\n{err}");
+    assert_eq!(
+        std::fs::read(metadata).expect("unchanged metadata"),
+        original
+    );
+    assert_eq!(
+        std::fs::read(&backup).expect("backup before write"),
+        original
+    );
+    std::fs::remove_dir(&blocked_write).expect("unblock migration write");
+    for _ in 0..2 {
+        let (code, out, err) = fixture.rehearse(&["--json", "show", id]);
+        assert_eq!(code, CLEAN, "{out}\n{err}");
+        assert_eq!(std::fs::read(&backup).expect("backup"), original);
+        assert_eq!(
+            std::fs::read(worktree.join("file.txt")).expect("edit"),
+            b"saved resolution\n"
+        );
+    }
+    // A retry after restoring the original record reuses, never replaces, its backup.
+    std::fs::write(metadata, &original).expect("restore original");
+    let (code, out, err) = fixture.rehearse(&["--json", "show", id]);
     assert_eq!(code, CLEAN, "{out}\n{err}");
-    assert_eq!(document(&out)["rehearsals"][0]["id"], id);
+    assert_eq!(std::fs::read(&backup).expect("backup"), original);
     let migrated = document(&std::fs::read_to_string(metadata).expect("migrated metadata"));
     assert_eq!(migrated["schema"], git_rehearse::sandbox::META_SCHEMA);
     assert_eq!(migrated["optional_annotation"], extension);
@@ -484,6 +513,97 @@ fn optional_metadata_survives_migration_and_later_continuation() {
     assert_eq!(code, CLEAN, "{out}\n{err}");
     let continued = document(&std::fs::read_to_string(metadata).expect("continued metadata"));
     assert_eq!(continued["optional_annotation"], extension);
+    assert_eq!(
+        std::fs::read(&backup).expect("original backup after continuation"),
+        original
+    );
+}
+
+#[test]
+fn migration_backup_failure_preserves_metadata_and_saved_edits() {
+    for obstruction in ["directory", "different", "partial"] {
+        let fixture = Fixture::new();
+        let (code, out, err) =
+            fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "feature"]);
+        assert_eq!(code, CLEAN, "{out}\n{err}");
+        let report = document(&out);
+        let id = report["id"].as_str().expect("id");
+        let metadata =
+            std::path::Path::new(report["storage"]["metadata"].as_str().expect("metadata"));
+        let backup = metadata.with_file_name("meta.json.bak");
+        let worktree = std::path::Path::new(report["sandbox"].as_str().expect("sandbox"));
+        let mut legacy = document(&std::fs::read_to_string(metadata).expect("metadata"));
+        legacy["schema"] = serde_json::json!(1);
+        legacy.as_object_mut().expect("object").remove("carry");
+        legacy.as_object_mut().expect("object").remove("origin");
+        let original = serde_json::to_vec(&legacy).expect("legacy");
+        std::fs::write(metadata, &original).expect("legacy record");
+        std::fs::write(worktree.join("file.txt"), "saved edit\n").expect("edit");
+        if obstruction == "directory" {
+            std::fs::create_dir(&backup).expect("block backup");
+        } else {
+            std::fs::write(&backup, obstruction).expect("existing backup");
+        }
+        for _ in 0..2 {
+            let (code, out, err) = fixture.rehearse(&["--json", "show", id]);
+            assert_eq!(code, REFUSED, "{out}\n{err}");
+            assert!(
+                document(&out)["message"]
+                    .as_str()
+                    .expect("message")
+                    .contains("Check directory permissions and free space")
+            );
+            assert_eq!(std::fs::read(metadata).expect("metadata"), original);
+            assert_eq!(
+                std::fs::read(worktree.join("file.txt")).expect("edit"),
+                b"saved edit\n"
+            );
+            if obstruction != "directory" {
+                assert_eq!(
+                    std::fs::read(&backup).expect("backup"),
+                    obstruction.as_bytes()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn migration_waits_for_rehearsal_ownership() {
+    let fixture = Fixture::new();
+    let (code, out, err) = fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "feature"]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    let report = document(&out);
+    let id = report["id"].as_str().expect("id");
+    let metadata = std::path::Path::new(report["storage"]["metadata"].as_str().expect("metadata"));
+    let mut legacy = document(&std::fs::read_to_string(metadata).expect("metadata"));
+    legacy["schema"] = serde_json::json!(1);
+    let original = serde_json::to_vec(&legacy).expect("legacy");
+    std::fs::write(metadata, &original).expect("legacy metadata");
+    let lock_path = metadata.parent().expect("root").with_extension("lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .expect("lock");
+    lock.try_lock().expect("claim ownership");
+    let (code, out, err) = fixture.rehearse(&["--json", "show", id]);
+    assert_eq!(code, REFUSED, "{out}\n{err}");
+    assert!(
+        document(&out)["message"]
+            .as_str()
+            .expect("message")
+            .contains("active in another process")
+    );
+    assert_eq!(std::fs::read(metadata).expect("metadata"), original);
+    assert!(!metadata.with_file_name("meta.json.bak").exists());
+    drop(lock);
+    let (code, out, err) = fixture.rehearse(&["--json", "show", id]);
+    assert_eq!(code, CLEAN, "{out}\n{err}");
+    assert_eq!(
+        std::fs::read(metadata.with_file_name("meta.json.bak")).expect("backup"),
+        original
+    );
 }
 
 #[test]
@@ -508,10 +628,11 @@ fn unknown_metadata_is_a_json_refusal_without_deletion() {
             .expect("message")
             .contains("schema 999")
     );
-    assert!(
-        metadata.exists(),
-        "the unknown record remains available for diagnosis"
+    assert_eq!(
+        std::fs::read_to_string(&metadata).expect("unknown record"),
+        r#"{"schema":999,"id":"preserve-me"}"#
     );
+    assert!(!metadata.with_file_name("meta.json.bak").exists());
 }
 
 #[cfg(unix)]

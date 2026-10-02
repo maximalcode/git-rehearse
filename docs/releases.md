@@ -64,7 +64,11 @@ binary against a temporary real Git repository. A retained fast-forward merge
 must leave original HEAD, files and index unchanged; explicit Apply by rehearsal
 ID must install the exact reviewed commit and expected file bytes with a clean
 index. A failure prevents that target's upload and blocks release publication.
-The JSON evidence records the target, archive digest, tool/Git versions and result.
+The extracted binary also migrates a retained, edited conflicting merge: it must
+refuse a blocked backup, preserve the exact schema-1 bytes and optional annotation,
+keep saved sandbox edits across repeated reads and retries, and refuse incompatible
+metadata without rewriting or deletion. The JSON evidence records the target,
+archive digest, tool/Git versions and both test results.
 
 Only a push of a `v*` tag publishes a public release, after every target passes.
 The tag must match the Cargo package version. Implementing or manually testing

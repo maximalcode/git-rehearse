@@ -149,7 +149,7 @@ pub fn prune(cache_root: &Path, now_unix: u64, max_age_secs: u64) -> Result<Vec<
                 continue;
             };
             let metadata = root.join("meta.json");
-            let meta = match Meta::read(&root) {
+            let meta = match Meta::read_owned(&root) {
                 Ok(meta) => Some(meta),
                 // No metadata means a clone was interrupted before it could
                 // be identified. Age pruning is the only cleanup available.
