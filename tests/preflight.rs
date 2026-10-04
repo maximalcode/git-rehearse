@@ -8,8 +8,30 @@
 mod support;
 
 use git_rehearse::sandbox::{self, Checkout};
-use git_rehearse::{Error, preflight};
+use git_rehearse::{Error, preflight, recovery, undo};
+use std::process::Command;
 use support::Fixture;
+
+struct Running(Option<std::process::Child>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Running {
+    fn wait_with_output(mut self) -> std::process::Output {
+        self.0
+            .take()
+            .expect("running child exists")
+            .wait_with_output()
+            .expect("child finishes")
+    }
+}
 
 /// Unwraps a refusal, insisting it is one: an internal error dressed as a
 /// refusal (or the reverse) would exit with the wrong code, and exit codes are
@@ -269,4 +291,123 @@ fn a_dirty_worktree_does_not_get_a_structural_refusal_out_of_the_way() {
     // well as the original one: there is no point writing a snapshot of the
     // user's work into the object store for a rehearsal that cannot happen.
     assert!(message.contains("submodules"), "{message}");
+}
+
+#[test]
+fn concurrent_snapshots_share_recovery_ownership_but_mutation_waits() {
+    let fixture = Fixture::new();
+    let marker = fixture.scratch("snapshot-paused").join("marker");
+    let mut first = Command::new(env!("CARGO_BIN_EXE_git-rehearse"));
+    first
+        .current_dir(fixture.repo())
+        .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
+        .env(
+            "GIT_REHEARSE_PAUSE_RECOVERY_AT",
+            format!("after-shared-lock={}", marker.display()),
+        )
+        .args(["--json", "--keep", "merge", "--no-edit", "feature"]);
+    let first = Running(Some(first.spawn().expect("first preview starts")));
+    for _ in 0..6000 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        marker.exists(),
+        "first preview owns the shared snapshot guard"
+    );
+
+    let second = fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "feature"]);
+    assert_eq!(second.0, 0, "independent preview succeeds: {second:?}");
+
+    let blocked = fixture.rehearse(&["--json", "--apply", "merge", "--no-edit", "feature"]);
+    assert_eq!(blocked.0, 4, "mutation cannot enter a shared snapshot");
+    assert!(
+        blocked.2.contains("live apply journal"),
+        "shared ownership refusal is explained: {}",
+        blocked.2
+    );
+
+    std::fs::remove_file(&marker).expect("resume first preview");
+    let first = first.wait_with_output();
+    assert!(first.status.success(), "first preview succeeds: {first:?}");
+}
+
+#[test]
+fn snapshot_refuses_while_an_exclusive_recovery_owner_is_live() {
+    let fixture = Fixture::new();
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    let rehearsal = "exclusive-owner-test";
+    let record = undo::Record::of_apply(rehearsal.to_owned(), 0, &[]);
+    let journal = recovery::prepare(
+        fixture.repo(),
+        &record,
+        Some("main"),
+        &format!("refs/rehearse/{rehearsal}/"),
+        &head,
+    )
+    .expect("prepare an interrupted journal");
+    let marker = fixture.scratch("exclusive-paused").join("marker");
+    let mut owner = Command::new(env!("CARGO_BIN_EXE_git-rehearse"));
+    owner
+        .current_dir(fixture.repo())
+        .env(
+            "GIT_REHEARSE_PAUSE_RECOVERY_AT",
+            format!("after-lock={}", marker.display()),
+        )
+        .args(["--json", "recover"]);
+    let owner = Running(Some(
+        owner.spawn().expect("exclusive recovery owner starts"),
+    ));
+    for _ in 0..6000 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(marker.exists(), "recovery owns the exclusive lock");
+
+    let error = preflight::run(fixture.repo()).expect_err("snapshot is blocked");
+    let message = refusal(error);
+    assert!(message.contains("live apply journal"), "{message}");
+
+    std::fs::remove_file(&marker).expect("resume recovery owner");
+    let owner = owner.wait_with_output();
+    assert!(
+        owner.status.success(),
+        "recovery inspection succeeds: {owner:?}"
+    );
+    std::fs::remove_file(journal).expect("discard the test journal");
+}
+
+#[test]
+fn interrupted_and_damaged_journals_refuse_preflight_without_overwrite() {
+    let fixture = Fixture::new();
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+    let rehearsal = "interrupted-preflight-test";
+    let record = undo::Record::of_apply(rehearsal.to_owned(), 0, &[]);
+    let journal = recovery::prepare(
+        fixture.repo(),
+        &record,
+        Some("main"),
+        &format!("refs/rehearse/{rehearsal}/"),
+        &head,
+    )
+    .expect("prepare an interrupted journal");
+    let message = refusal(preflight::run(fixture.repo()).expect_err("interrupted journal refuses"));
+    assert!(message.contains("recovery is required"), "{message}");
+    std::fs::remove_file(&journal).expect("remove interrupted test journal");
+
+    let damaged = fixture
+        .repo()
+        .join(".git")
+        .join(git_rehearse::recovery::JOURNAL_FILE);
+    std::fs::write(&damaged, b"damaged journal").expect("damage journal");
+    let message = refusal(preflight::run(fixture.repo()).expect_err("damaged journal refuses"));
+    assert!(message.contains("damaged apply journal"), "{message}");
+    assert_eq!(
+        std::fs::read(&damaged).expect("damaged journal remains"),
+        b"damaged journal"
+    );
 }

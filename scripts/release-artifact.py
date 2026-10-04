@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 
 
@@ -52,6 +53,7 @@ def smoke(binary, version, root):
     git("commit", "-am", "Feature")
     expected = git("rev-parse", "HEAD")
     git("checkout", "main")
+    concurrent_worktree_smoke(binary, root, repo, expected, env, before)
     preview = rehearse("--keep", "merge", "--ff-only", "feature")
     if not preview["can_apply"] or preview["decision"] != "kept":
         raise RuntimeError(f"Rehearsal was not retained and applicable: {preview}")
@@ -75,7 +77,150 @@ def smoke(binary, version, root):
     stopped = rehearse("--keep", "merge", "conflicting", expected_code=2)
     migration_smoke(stopped, rehearse)
     return {"version": observed_version, "git": git("--version"),
-            "rehearsal_apply": "passed", "retained_metadata_migration": "passed"}
+            "rehearsal_apply": "passed", "retained_metadata_migration": "passed",
+            "concurrent_worktree_previews": "passed"}
+
+
+def concurrent_worktree_smoke(binary, root, repo, expected, env, expected_origin_head):
+    """Exercise simultaneous public-CLI previews from two worktree origins."""
+
+    linked = root / "linked"
+    run(["git", "worktree", "add", "-b", "linked-base", str(linked), "main"], repo, env)
+
+    def git_in(worktree, *args):
+        return run(["git", *args], worktree, env)
+
+    def admin_path(worktree):
+        return Path(git_in(worktree, "rev-parse", "--absolute-git-dir"))
+
+    def index_bytes(worktree):
+        return admin_path(worktree).joinpath("index").read_bytes()
+
+    origins = [repo, linked]
+    initial_heads = [git_in(worktree, "rev-parse", "HEAD") for worktree in origins]
+    if initial_heads != [expected_origin_head, expected_origin_head]:
+        raise RuntimeError(f"Concurrent fixture did not start from the same base: {initial_heads}")
+    initial_indexes = [index_bytes(worktree) for worktree in origins]
+    initial_files = [(worktree / "file.txt").read_bytes() for worktree in origins]
+    common_dir = Path(git_in(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    admin_paths = [admin_path(worktree) for worktree in origins]
+    all_ids = set()
+
+    # Repeating the pair makes startup lock contention observable while keeping
+    # every invocation a real, simultaneous public-CLI process.
+    for _ in range(3):
+        processes = []
+        streams = []
+        try:
+            for worktree in origins:
+                stdout = tempfile.TemporaryFile()
+                stderr = tempfile.TemporaryFile()
+                streams.append((stdout, stderr))
+                processes.append(subprocess.Popen(
+                    [str(binary), "--json", "--keep", "merge", "feature"],
+                    cwd=worktree,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                ))
+
+            deadline = time.monotonic() + 120
+            for process in processes:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, 120)
+                process.wait(timeout=remaining)
+
+            captures = []
+            for process, (stdout, stderr) in zip(processes, streams):
+                stdout.seek(0)
+                stderr.seek(0)
+                captures.append((
+                    stdout.read().decode("utf-8", errors="replace"),
+                    stderr.read().decode("utf-8", errors="replace"),
+                ))
+            failures = [
+                (process.returncode, out, err)
+                for process, (out, err) in zip(processes, captures)
+                if process.returncode != 0
+            ]
+            if failures:
+                raise RuntimeError(f"Concurrent preview failed: {failures}")
+            previews = [json.loads(out) for out, _ in captures]
+        finally:
+            # A timeout or startup failure must never leave a release-smoke
+            # child holding a repository/cache lock. Kill and reap every child
+            # before the temporary fixture can be removed.
+            for process in processes:
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except OSError:
+                    # It exited between poll and kill; wait below still reaps it.
+                    pass
+            for process in processes:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    process.wait(timeout=5)
+            for stdout, stderr in streams:
+                stdout.close()
+                stderr.close()
+
+        if len(previews) != len(origins):
+            raise RuntimeError(f"Expected one preview per worktree: {previews}")
+        ids = [preview.get("id") for preview in previews]
+        if any(not rehearsal_id for rehearsal_id in ids) or ids[0] == ids[1] or any(
+            rehearsal_id in all_ids for rehearsal_id in ids
+        ):
+            raise RuntimeError(f"Concurrent previews did not receive distinct IDs: {ids}")
+        all_ids.update(ids)
+
+        repository_ids = {preview.get("repository_id") for preview in previews}
+        if len(repository_ids) != 1 or None in repository_ids:
+            raise RuntimeError(f"Concurrent previews disagree on repository identity: {previews}")
+        for preview, worktree, admin in zip(previews, origins, admin_paths):
+            if (preview.get("outcome"), preview.get("decision"), preview.get("can_apply")) != (
+                "clean", "kept", True
+            ):
+                raise RuntimeError(f"Concurrent preview was not a retained clean result: {preview}")
+            if Path(preview["origin_worktree"]).resolve() != worktree.resolve():
+                raise RuntimeError(f"Concurrent preview has the wrong origin: {preview}")
+            metadata_path = Path(preview["storage"]["metadata"])
+            metadata = json.loads(metadata_path.read_bytes())
+            origin = metadata.get("origin")
+            if not origin or Path(origin["common_dir"]).resolve() != common_dir.resolve():
+                raise RuntimeError(f"Concurrent preview has the wrong common admin: {metadata}")
+            if Path(origin["git_dir"]).resolve() != admin.resolve():
+                raise RuntimeError(f"Concurrent preview has the wrong worktree admin: {metadata}")
+            sandbox = Path(preview["sandbox"])
+            if run(["git", "rev-parse", "HEAD"], sandbox, env) != expected:
+                raise RuntimeError(f"Concurrent preview produced the wrong sandbox commit: {preview}")
+            if (sandbox / "file.txt").read_bytes() != b"after\n":
+                raise RuntimeError("Concurrent preview produced the wrong sandbox file bytes")
+            shown = json.loads(run([str(binary), "--json", "show", preview["id"]], worktree, env))
+            if (
+                shown.get("id") != preview["id"]
+                or shown.get("decision") != "kept"
+                or shown.get("origin_worktree") != preview["origin_worktree"]
+                or shown.get("repository_id") != preview["repository_id"]
+            ):
+                raise RuntimeError(f"Retained concurrent preview was not visible via show: {shown}")
+
+    for worktree, head, index, file_bytes in zip(origins, initial_heads, initial_indexes, initial_files):
+        if git_in(worktree, "rev-parse", "HEAD") != head:
+            raise RuntimeError("Concurrent previews changed an original HEAD")
+        if (worktree / "file.txt").read_bytes() != file_bytes:
+            raise RuntimeError("Concurrent previews changed original file bytes")
+        if git_in(worktree, "status", "--porcelain"):
+            raise RuntimeError("Concurrent previews left an original worktree dirty")
+        if index_bytes(worktree) != index:
+            raise RuntimeError("Concurrent previews changed an original index")
 
 
 def migration_smoke(preview, rehearse):
