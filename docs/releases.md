@@ -60,17 +60,25 @@ Manual runs against tags also remain test builds.
 
 Every build packages first, verifies the checksum, extracts into a fresh
 folder, checks the packaged version and documents, then executes the extracted
-binary against a temporary real Git repository. A retained fast-forward merge
-must leave original HEAD, files and index unchanged; explicit Apply by rehearsal
-ID must install the exact reviewed commit and expected file bytes with a clean
-index. A failure prevents that target's upload and blocks release publication.
+binary against a temporary real Git repository. It starts simultaneous public
+`--json --keep merge` previews from main and a linked worktree on distinct
+branches sharing the same base; both must retain clean expected sandbox results,
+report the correct main/linked administrative identities and distinct IDs, leave
+both original HEADs, raw index bytes and file bytes unchanged, and remain visible
+through `show`. The smoke repeats that pair to exercise startup contention. A
+retained fast-forward merge must leave original HEAD, files and index unchanged;
+explicit Apply by rehearsal ID must install the exact reviewed commit and
+expected file bytes with a clean index. A failure prevents that target's upload
+and blocks release publication.
 The extracted binary also migrates a retained, edited conflicting merge: it must
 refuse a blocked backup, preserve the exact schema-1 bytes and optional annotation,
 keep saved sandbox edits across repeated reads and retries, and refuse incompatible
 metadata without rewriting or deletion. The JSON evidence records the target,
-archive digest, tool/Git versions and both test results.
+archive digest, tool/Git versions and all three smoke results.
 
-Only a push of a `v*` tag publishes a public release, after every target passes.
+The smoke evidence records `concurrent_worktree_previews: "passed"` alongside the
+Apply and retained-metadata migration checks. Only a push of a `v*` tag publishes
+a public release, after every target passes.
 The tag must match the Cargo package version. Implementing or manually testing
 this workflow does not create a tag or publish a release.
 

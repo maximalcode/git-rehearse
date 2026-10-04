@@ -178,24 +178,13 @@ pub struct Lock {
 
 impl Lock {
     fn for_journal(journal_path: &Path) -> Result<Self> {
-        let lock_path = lock_path(journal_path);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(Error::io(&lock_path))?;
+        let (file, lock_path) = open_lock_file(journal_path)?;
         match file.try_lock() {
             Ok(()) => Ok(Self {
                 file,
                 journal_path: journal_path.to_owned(),
             }),
-            Err(std::fs::TryLockError::WouldBlock) => Err(Error::Refused(format!(
-                "apply recovery is blocked: another process owns the live apply journal at {}; \
-                 no repository mutation was performed",
-                lock_path.display()
-            ))),
+            Err(std::fs::TryLockError::WouldBlock) => Err(lock_owned(&lock_path)),
             Err(std::fs::TryLockError::Error(error)) => Err(Error::io(&lock_path)(error)),
         }
     }
@@ -204,6 +193,33 @@ impl Lock {
 impl Drop for Lock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
+    }
+}
+
+/// Ownership held while preflight snapshots the repository.
+///
+/// A shared lock lets independent previews take their snapshots together, but
+/// it is deliberately a different type from [`Lock`]: mutation APIs can only
+/// be called with exclusive recovery ownership. If a journal is present, this
+/// guard instead owns a freshly acquired [`Lock`] after clearing or refusing
+/// the journal under that exclusive lock.
+pub(crate) struct SnapshotGuard {
+    kind: SnapshotGuardKind,
+}
+
+enum SnapshotGuardKind {
+    Shared(File),
+    Exclusive { _lock: Lock },
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        match &mut self.kind {
+            SnapshotGuardKind::Shared(file) => {
+                let _ = file.unlock();
+            }
+            SnapshotGuardKind::Exclusive { .. } => {}
+        }
     }
 }
 
@@ -220,6 +236,44 @@ pub fn acquire(repo: &Path) -> Result<Lock> {
         pause_for_test("after-lock");
     }
     Ok(lock)
+}
+
+/// Acquires recovery ownership appropriate for a preflight snapshot.
+///
+/// With no journal, ownership is shared for the whole snapshot so another
+/// independent preview can proceed. A journal changes that: release the
+/// shared lock, acquire exclusive ownership, and freshly check it before any
+/// snapshot object or ref is read or written.
+pub(crate) fn acquire_snapshot(repo: &Path) -> Result<SnapshotGuard> {
+    let journal_path = path(repo)?;
+    let (file, lock_path) = open_lock_file(&journal_path)?;
+    match file.try_lock_shared() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(lock_owned(&lock_path)),
+        Err(std::fs::TryLockError::Error(error)) => return Err(Error::io(&lock_path)(error)),
+    }
+    pause_for_test("after-shared-lock");
+
+    match journal_path.try_exists() {
+        Ok(false) => Ok(SnapshotGuard {
+            kind: SnapshotGuardKind::Shared(file),
+        }),
+        Ok(true) => {
+            // The exclusive acquisition is intentionally a new open after the
+            // shared guard is dropped. This closes the stale-decision window
+            // before ensure_clear_locked inspects or cleans the journal.
+            drop(file);
+            let lock = Lock::for_journal(&journal_path)?;
+            ensure_clear_locked(repo, &lock)?;
+            Ok(SnapshotGuard {
+                kind: SnapshotGuardKind::Exclusive { _lock: lock },
+            })
+        }
+        Err(error) => Err(Error::Refused(format!(
+            "apply recovery state at {} could not be checked: {error}; no repository mutation was performed",
+            journal_path.display()
+        ))),
+    }
 }
 
 /// Refuses a mutation while an unfinished apply needs a decision. A complete
@@ -1344,6 +1398,26 @@ fn write_owned(path: &Path, lock: &Lock, journal: &Journal, failure_stage: &str)
 
 fn lock_path(journal_path: &Path) -> PathBuf {
     journal_path.with_extension(LOCK_SUFFIX)
+}
+
+fn open_lock_file(journal_path: &Path) -> Result<(File, PathBuf)> {
+    let lock_path = lock_path(journal_path);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(Error::io(&lock_path))?;
+    Ok((file, lock_path))
+}
+
+fn lock_owned(lock_path: &Path) -> Error {
+    Error::Refused(format!(
+        "apply recovery is blocked: another process owns the live apply journal at {}; \
+         no repository mutation was performed",
+        lock_path.display()
+    ))
 }
 
 fn pause_for_test(stage: &str) {

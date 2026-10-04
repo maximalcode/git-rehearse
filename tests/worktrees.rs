@@ -54,6 +54,82 @@ fn rehearsals_from_both_worktrees_preserve_the_other_worktree() {
 }
 
 #[test]
+fn concurrent_kept_merges_from_main_and_linked_worktrees_are_independent() {
+    let f = Fixture::new();
+    let linked_path = f.scratch("linked");
+    f.git(&[
+        "worktree",
+        "add",
+        linked_path.to_str().unwrap(),
+        "-b",
+        "other",
+    ]);
+
+    let refs = f.refs();
+    let main_head = f.git(&["rev-parse", "HEAD"]);
+    let linked_head = f.git_in(&linked_path, &["rev-parse", "HEAD"]);
+    let main_index = f.git_in(f.repo(), &["write-tree"]);
+    let linked_index = f.git_in(&linked_path, &["write-tree"]);
+    let main_file = std::fs::read(f.repo().join("file.txt")).unwrap();
+    let linked_file = std::fs::read(linked_path.join("file.txt")).unwrap();
+
+    let spawn = |repo: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+            .current_dir(repo)
+            .args(["--json", "--keep", "merge", "feature"])
+            .env("GIT_REHEARSE_CACHE_DIR", f.cache())
+            .env("GIT_EDITOR", "true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("CLI starts")
+    };
+    let main_child = spawn(f.repo());
+    let linked_child = spawn(&linked_path);
+    let main = main_child.wait_with_output().expect("main CLI finishes");
+    let linked = linked_child
+        .wait_with_output()
+        .expect("linked CLI finishes");
+    assert_eq!(main.status.code(), Some(0), "main: {main:?}");
+    assert_eq!(linked.status.code(), Some(0), "linked: {linked:?}");
+    let main: serde_json::Value = serde_json::from_slice(&main.stdout).expect("main JSON");
+    let linked: serde_json::Value = serde_json::from_slice(&linked.stdout).expect("linked JSON");
+
+    for report in [&main, &linked] {
+        assert_eq!(report["decision"], "kept");
+        assert_eq!(report["lifecycle"], "kept");
+        assert_eq!(report["outcome"], "clean");
+        assert_eq!(report["execution"], "clean");
+        assert_eq!(report["command"], serde_json::json!(["merge", "feature"]));
+        assert_eq!(report["storage"]["exists"], true);
+    }
+    assert_ne!(main["id"], linked["id"]);
+    assert_ne!(main["origin_worktree"], linked["origin_worktree"]);
+    assert_eq!(main["repository_id"], linked["repository_id"]);
+    assert_eq!(
+        main["origin_worktree"],
+        f.repo().to_str().unwrap(),
+        "main report keeps its origin"
+    );
+    assert_eq!(
+        linked["origin_worktree"],
+        linked_path.to_str().unwrap(),
+        "linked report keeps its origin"
+    );
+    assert_eq!(f.refs(), refs, "previews do not move origin refs");
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), main_head);
+    assert_eq!(f.git_in(&linked_path, &["rev-parse", "HEAD"]), linked_head);
+    assert_eq!(f.git_in(f.repo(), &["write-tree"]), main_index);
+    assert_eq!(f.git_in(&linked_path, &["write-tree"]), linked_index);
+    assert_eq!(std::fs::read(f.repo().join("file.txt")).unwrap(), main_file);
+    assert_eq!(
+        std::fs::read(linked_path.join("file.txt")).unwrap(),
+        linked_file
+    );
+}
+
+#[test]
 fn a_branch_checked_out_elsewhere_after_preview_is_never_moved() {
     let f = Fixture::new();
     let (code, preview) = cli(
