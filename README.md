@@ -16,20 +16,30 @@ before/after graph, the conflicts, and a warning if replaying your commits
 quietly changed what they do. Then you choose: apply it, keep it, or throw it
 away. Your repository is not touched until you say so.
 
-> **Status: v1.2.0.** Everything on this page is in the release; every terminal
+> **Status: v1.3.0.** Everything on this page is in the release; every terminal
 > transcript here is real captured output. The command surface and the exit
 > codes are settled and will not shift under you.
 > [SCOPE.md](SCOPE.md) is the full plan.
 
 ## Install
 
-### Upgrading from v1.1.0
+### Upgrading from v1.2.0 (and older releases)
 
-Kept rehearsals from v1.1.0 are migrated when first read by v1.2.0. Metadata
-schema 1 is upgraded atomically to the current metadata schema after durably saving
-the exact original bytes in `meta.json.bak` beside `meta.json`, preserving the original
-repository, checkout, refs and result. Unknown schemas and damaged metadata
-are refused and left in place so they can be recovered or diagnosed.
+Kept rehearsals from v1.2.0 use metadata schema 2. They remain readable as
+reference material and their original `meta.json` is preserved unchanged, but
+they have no durable worktree origin, so v1.3.0 refuses automatic Apply.
+Create a new rehearsal before using automatic Apply.
+
+Older schema 1 metadata is migrated when first read. The migration saves the
+exact original bytes in `meta.json.bak` beside `meta.json` before atomically
+writing the current schema, but schema 1 also lacks a durable origin. The
+migrated rehearsal is therefore reference-only: create a new rehearsal before
+using automatic Apply. Unknown schemas and damaged metadata are refused and
+left in place so they can be recovered or diagnosed.
+
+Version 1 Undo records remain readable for manual recovery only because they
+lack durable origin information. Version 2 records include that origin and can
+be used by v1.3.0 when their worktree and repository still match.
 
 ### A prebuilt binary
 
@@ -39,19 +49,20 @@ check the sum, and put the `git-rehearse` inside on your `PATH`.
 
 | platform | archive |
 |---|---|
-| Linux, x86-64 | `git-rehearse-v1.2.0-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS, Apple silicon | `git-rehearse-v1.2.0-aarch64-apple-darwin.tar.gz` |
-| Windows, x86-64 | `git-rehearse-v1.2.0-x86_64-pc-windows-msvc.zip` |
+| Linux, x86-64 | `git-rehearse-v1.3.0-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS, Intel | `git-rehearse-v1.3.0-x86_64-apple-darwin.tar.gz` |
+| macOS, Apple silicon | `git-rehearse-v1.3.0-aarch64-apple-darwin.tar.gz` |
+| Windows, x86-64 | `git-rehearse-v1.3.0-x86_64-pc-windows-msvc.zip` |
 
-Intel macOS and ARM Linux are not built yet — [build from
-source](#from-source) there, which works fine.
+ARM Linux is not built yet — [build from source](#from-source) there, which
+works fine.
 
 ### From source
 
 Needs [Rust 1.97 or newer](https://rustup.rs) and `git` on your `PATH`.
 
 ```bash
-cargo install --git https://github.com/maximalcode/git-rehearse --tag v1.2.0
+cargo install --git https://github.com/maximalcode/git-rehearse --tag v1.3.0
 ```
 
 Or from a clone, to track `develop`:
@@ -618,9 +629,10 @@ Apply, Undo, or recovery. Mutation requires Git support
 for transactional symbolic-ref verification; older Git versions refuse safely
 and need upgrading.
 
-Older rehearsals and recovery journals without durable origin information remain
-readable but cannot authorize mutation. Keep their sandboxes for reference and
-create a new rehearsal; do not discard an unresolved recovery journal.
+Supported older rehearsals and recovery journals without durable origin
+information remain readable but cannot authorize mutation. Keep their sandboxes
+for reference and create a new rehearsal; do not discard an unresolved recovery
+journal.
 
 ## Where things live
 
@@ -632,14 +644,17 @@ A rehearsal explicitly kept with `--keep` is durable until you explicitly
 discard it. Retention is saved before the rehearsed Git command starts, so an
 interruption during execution or in its editor does not make it expire.
 Transient rehearsals and interrupted clone directories are pruned
-after seven days. Supported legacy metadata is migrated while preserving
-optional extension fields through later updates. Migration takes rehearsal ownership
-and never replaces an existing backup. If backup creation or flushing fails, migration
-is refused and the existing metadata and sandbox edits remain untouched. Check the
-reported permissions or free-space problem; preserve and compare any conflicting or
-partial backup before moving it aside and retrying. Unknown or damaged metadata and
-rehearsals reserved by an interrupted apply are preserved. A discarded one is gone
-immediately. The clone hardlinks your object store rather than copying it, so
+after seven days. Schema 1 metadata is migrated while preserving optional
+extension fields and the exact original bytes in `meta.json.bak`; schema 2
+metadata remains readable and unchanged, but both schemas lack durable origin
+and cannot authorize automatic Apply. Migration takes rehearsal ownership and
+never replaces an existing backup. If backup creation or flushing fails,
+migration is refused and the existing metadata and sandbox edits remain
+untouched. Check the reported permissions or free-space problem; preserve and
+compare any conflicting or partial backup before moving it aside and retrying.
+Unknown or damaged metadata and rehearsals reserved by an interrupted apply are
+preserved. A discarded one is gone immediately. The clone hardlinks your object
+store rather than copying it, so
 a sandbox costs almost nothing on disk, and deleting one can never touch your
 real repository's objects.
 
