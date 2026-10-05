@@ -23,7 +23,7 @@
 //! 5. Only then touch the worktree.
 //!
 //! Uncommitted work carried through the rehearsal is transplanted the same
-//! way and for the same reason: [`crate::carry::restore`] checks out the tree
+//! way and for the same reason: [`crate::carry::restore_snapshot`] checks out the trees
 //! the sandbox produced rather than merging the user's changes here for the
 //! first time. Principle 2 covers the worktree, not only the refs.
 
@@ -37,7 +37,7 @@ use crate::execute::Outcome;
 use crate::preflight::HEAD_KEY;
 use crate::sandbox::{Checkout, Sandbox};
 use crate::undo::{self, Record};
-use crate::{Error, Result, carry, collision, git};
+use crate::{Error, Result, carry, collision, git, recovery};
 
 /// What an apply did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,11 +66,19 @@ pub struct Applied {
 /// checkout changed. [`Error::Git`] or [`Error::Io`] if the transplant itself
 /// fails.
 pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
+    let mut owned = sandbox.clone();
+    owned.claim_execution()?;
+    let sandbox = &owned;
     let meta = sandbox.meta();
     let repo = meta.repo_path.as_path();
     let worktree = sandbox.worktree();
 
+    // An interrupted apply owns this repository until its real state has been
+    // classified and explicitly completed or rolled back.
+    let lock = recovery::acquire(repo)?;
+    recovery::ensure_clear_locked(repo, &lock)?;
     check_outcome(meta)?;
+    meta.origin.as_ref().ok_or_else(|| Error::Refused("the rehearsal has no durable origin; keep it for reference and rehearse again before applying".to_owned()))?.verify(repo)?;
     let rehearsed = state_of(&worktree)?;
     let moved = ref_moves(&meta.pre_state, &rehearsed);
     if moved.is_empty() {
@@ -81,12 +89,14 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         )));
     }
 
+    crate::worktree::check_occupancy(repo, moved.iter().map(|moved| moved.name.as_str()))?;
+    let basis = relevant_basis(meta, &moved);
     let now = state_of(repo)?;
     // Checkout first: switching branches also moves HEAD, and "you rehearsed
     // on main and are now on feature" is a better answer than "HEAD is now a
     // different commit".
     check_checkout(repo, &meta.checkout)?;
-    check_unchanged(&meta.pre_state, &now, &meta.id)?;
+    check_unchanged(&basis, &now, &meta.id)?;
     let reset = branch_to_reset(&meta.checkout, &moved);
     // Only the reset path cares about the worktree at all: if the checked-out
     // branch was not rewritten, nothing below touches a single file, and what
@@ -97,24 +107,67 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         None
     };
 
+    let worktree_before = git::run(repo, ["rev-parse", "HEAD"])?;
+    let anchor = format!("refs/rehearse/{}/", meta.id);
+    let mut undo_record = Record::of_apply(meta.id.clone(), now_unix, &moved);
+    undo_record.origin = Some(crate::undo::Origin::capture(repo)?);
+    abort_for_test("before-journal");
+    let journal = recovery::prepare_locked(
+        repo,
+        &lock,
+        &undo_record,
+        reset.as_deref(),
+        &anchor,
+        &worktree_before,
+    )?;
+    abort_for_test("after-journal");
+    recovery::set_worktree_after_locked(
+        &journal,
+        &lock,
+        carried.as_ref().map(|carried| carried.result),
+    )?;
+
     // Objects first: this adds nothing a user can see and leaves the
     // repository unchanged if it fails.
-    let anchor = format!("refs/rehearse/{}/", meta.id);
     fetch_objects(repo, &worktree, &anchor, &meta.id, carried.is_some())?;
 
-    let undo = undo::write(repo, &Record::of_apply(meta.id.clone(), now_unix, &moved))?;
+    let undo = undo::write(repo, &undo_record)?;
 
-    transplant(repo, &moved, &meta.id)?;
+    pause_for_test("before-ref-transaction");
+    crate::worktree::check_occupancy(repo, moved.iter().map(|moved| moved.name.as_str()))?;
+    check_checkout(repo, &meta.checkout)?;
+    check_unchanged(&basis, &state_of(repo)?, &meta.id)?;
+    if let Some(branch) = reset.as_ref() {
+        check_worktree(repo, &worktree, branch, meta.carry.as_ref(), &meta.id)?;
+    }
+    transplant(repo, &moved, &basis, &meta.id, || {
+        check_checkout(repo, &meta.checkout)?;
+        if let Some(branch) = reset.as_ref() {
+            check_worktree(repo, &worktree, branch, meta.carry.as_ref(), &meta.id)?;
+        }
+        Ok(())
+    })?;
+    abort_for_test("after-ref-transaction");
+    recovery::refs_applied_locked(&journal, &lock)?;
+    abort_for_test("after-refs-phase");
 
     if reset.is_some() {
+        recovery::check_update_locked(repo, &lock)?;
         // After the refs move, HEAD's branch points at the rehearsed commit
         // while the index and worktree still hold the old one. Resetting to
         // HEAD — not to a commit id — because HEAD is already right.
         git::run(repo, ["reset", "--hard", "--quiet"])?;
+        abort_for_test("after-reset-before-carried");
         if let Some(carried) = &carried {
-            carry::restore(repo, carried.result)?;
+            carry::restore_snapshot(repo, carried.result)?;
         }
+        abort_for_test("after-worktree-update");
+        recovery::worktree_updated_locked(&journal, &lock)?;
     }
+
+    recovery::complete_locked(&journal, &lock)?;
+    pause_for_test("after-complete");
+    recovery::forget_locked(&journal, &lock)?;
 
     Ok(Applied {
         moved,
@@ -123,6 +176,21 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         anchor,
         carried: carried.map(|carried| carried.paths.to_vec()),
     })
+}
+
+/// Test-only process interruption seams. Keeping them in the production path
+/// lets integration tests kill the actual CLI between the real mutation and
+/// its durable phase write; without that seam a crash test would only exercise
+/// a mocked or different implementation.
+fn abort_for_test(stage: &str) {
+    crate::test_hooks::abort("GIT_REHEARSE_ABORT_APPLY_AT", stage);
+}
+
+/// Test-only coordination seam for proving journal ownership across processes.
+/// The marker is created after the requested stage and the process continues
+/// only after the test removes it.
+fn pause_for_test(stage: &str) {
+    crate::test_hooks::pause("GIT_REHEARSE_PAUSE_APPLY_AT", stage);
 }
 
 /// Refuses to transplant a rehearsal whose command did not finish cleanly.
@@ -212,6 +280,46 @@ fn state_of(repo: &Path) -> Result<BTreeMap<String, String>> {
         refs.insert(HEAD_KEY.to_owned(), head);
     }
     Ok(refs)
+}
+
+/// A simple operation with one explicit local branch depends on that branch,
+/// the original checkout and the refs it changes. Complex revision expressions,
+/// implicit upstreams and arbitrary commands conservatively retain the full
+/// snapshot rather than guessing which refs Git consulted.
+fn relevant_basis(meta: &crate::sandbox::Meta, moved: &[RefMove]) -> BTreeMap<String, String> {
+    let simple = matches!(
+        meta.command.first().map(String::as_str),
+        Some("merge" | "rebase" | "cherry-pick")
+    );
+    let args: Vec<_> = meta
+        .command
+        .iter()
+        .skip(1)
+        .filter(|arg| !matches!(arg.as_str(), "--no-edit" | "--ff-only" | "--no-ff"))
+        .collect();
+    let target = args.first().map(|arg| format!("refs/heads/{arg}"));
+    if !simple
+        || args.len() != 1
+        || !target
+            .as_ref()
+            .is_some_and(|target| meta.pre_state.contains_key(target))
+    {
+        return meta.pre_state.clone();
+    }
+    let checkout = match &meta.checkout {
+        Checkout::Branch(branch) => format!("refs/heads/{branch}"),
+        Checkout::Detached(_) => HEAD_KEY.to_owned(),
+    };
+    meta.pre_state
+        .iter()
+        .filter(|(name, _)| {
+            name.as_str() == HEAD_KEY
+                || **name == checkout
+                || Some(*name) == target.as_ref()
+                || moved.iter().any(|reference| reference.name == **name)
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 /// Refuses if the repository is not where the rehearsal left it.
@@ -347,8 +455,19 @@ fn fetch_objects(
 /// race check a second time — atomically, inside the ref store, where no
 /// window exists between checking and writing. The earlier check exists to
 /// produce a message a human can act on; this one exists to be correct.
-fn transplant(repo: &Path, moved: &[RefMove], id: &str) -> Result<()> {
+fn transplant(
+    repo: &Path,
+    moved: &[RefMove],
+    basis: &BTreeMap<String, String>,
+    id: &str,
+    check: impl Fn() -> Result<()>,
+) -> Result<()> {
     let mut commands = String::new();
+    for (name, old) in basis {
+        if name != HEAD_KEY && !moved.iter().any(|reference| reference.name == *name) {
+            let _ = write!(commands, "verify {name}\0{old}\0");
+        }
+    }
     for moved in moved {
         // HEAD follows its branch; moving it directly would detach it.
         if moved.name == HEAD_KEY {
@@ -375,18 +494,15 @@ fn transplant(repo: &Path, moved: &[RefMove], id: &str) -> Result<()> {
     if commands.is_empty() {
         return Ok(());
     }
-    git::run_with_stdin(
+    crate::worktree::transact(
         repo,
-        [
-            "update-ref",
-            // The reflog is where someone looks when they want to know what
-            // happened to their branch; it should say.
-            "-m",
-            &format!("git-rehearse apply {id}"),
-            "--stdin",
-            "-z",
-        ],
-        Some(&commands),
+        &commands,
+        &moved
+            .iter()
+            .map(|reference| reference.name.as_str())
+            .collect::<Vec<_>>(),
+        &format!("git-rehearse apply {id}"),
+        check,
     )?;
     Ok(())
 }
@@ -407,6 +523,7 @@ mod tests {
             id: "1786248000-00".to_owned(),
             repo_id: "repo-0123456789abcdef".to_owned(),
             repo_path: PathBuf::from("/repos/example"),
+            origin: None,
             command: vec!["merge".to_owned(), "feature".to_owned()],
             checkout: Checkout::Branch("main".to_owned()),
             pre_state: BTreeMap::new(),
@@ -414,6 +531,7 @@ mod tests {
             created_unix: 1_786_248_000,
             status: Status::Kept,
             result,
+            extensions: BTreeMap::new(),
         }
     }
 

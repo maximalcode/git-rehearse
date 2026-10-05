@@ -220,6 +220,7 @@ fn work_that_conflicts_with_the_rehearsed_history_stops_the_rehearsal() {
     assert!(out.contains(&worktree.display().to_string()), "{out}");
     std::fs::write(worktree.join("notes.txt"), "resolved\n").expect("resolve");
     fixture.git_in(&worktree, &["add", "notes.txt"]);
+    let reviewed_index = fixture.git_in(&worktree, &["write-tree"]);
 
     let (code, out, err) = fixture.rehearse(&["--apply", "continue", &id]);
 
@@ -231,9 +232,10 @@ fn work_that_conflicts_with_the_rehearsed_history_stops_the_rehearsal() {
         std::fs::read_to_string(fixture.repo().join("notes.txt")).expect("worktree"),
         "resolved\n"
     );
+    assert_eq!(fixture.git(&["write-tree"]), reviewed_index);
     assert_eq!(
         fixture.git(&["status", "--porcelain", "--untracked-files=no"]),
-        " M notes.txt"
+        "M  notes.txt"
     );
 }
 
@@ -318,7 +320,8 @@ fn staged_and_unstaged_work_are_both_carried() {
     );
     // Both come back as worktree modifications, the same place `git stash pop`
     // without `--index` leaves them. A transplanted tree does not carry the
-    // staged/unstaged distinction, and inventing one would be guessing.
+    // staged/unstaged distinction from before replay. Apply preserves the
+    // index actually reviewed in the sandbox.
     assert_eq!(
         fixture.git(&["status", "--porcelain", "--untracked-files=no"]),
         " M file.txt\n M other.txt"

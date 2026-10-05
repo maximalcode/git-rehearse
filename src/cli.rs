@@ -23,6 +23,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::execute::{Outcome, SEQUENCE_EDITOR_ARG, Todo};
+use crate::recovery::{self, Action as RecoveryAction, State as RecoveryState};
 use crate::report::{Choice, Detail};
 use crate::sandbox::{DEFAULT_TTL_SECS, Sandbox, Status};
 use crate::{
@@ -77,12 +78,14 @@ usage:
   git rehearse show [<id>]
   git rehearse continue [<id>]
   git rehearse apply [<id>]
-  git rehearse undo [<id>]
+  git rehearse undo [<id>] [--check]
+  git rehearse recover [<id>]
+  git rehearse recover --complete|--rollback [<id>]
   git rehearse discard [<id>|--all]
 
 options (before the command; everything after it belongs to git):
   --apply           apply without asking
-  --keep            keep the rehearsal without asking
+  --keep            keep the rehearsal durably without asking
   --json            one JSON document on stdout instead of the report
   --stat-only       the report without the before/after graphs
   --todo <file>     drive an interactive rebase from a prepared todo
@@ -115,7 +118,9 @@ that document never carried the graphs to begin with.
 undo puts the refs back where the last apply found them, in one transaction and
 only if every one of them is still where that apply left it. One apply is
 undoable at a time: applying again overwrites the record, and a successful undo
-uses it up. Give it an id to insist on which apply you mean.
+uses it up. Records belong to the originating worktree. Give it the full rehearsal
+id to insist on which apply you mean. `undo --check` reports current availability
+without changing refs, files, or recovery records. Undo rechecks before mutation.
 
 Uncommitted changes to tracked files are carried through a rehearsal: they are
 snapshotted with `git stash create` (your stash list is never touched), the
@@ -185,10 +190,19 @@ pub enum Command {
     /// Put the refs back where the last apply found them.
     ///
     /// The id is optional and, unlike everywhere else, does not select
-    /// anything: there is one undo record per repository, so it is only a way
+    /// anything: there is one undo record per originating worktree, so it is only a way
     /// of insisting which apply is meant. See [`crate::undo`].
     Undo {
         id: Option<String>,
+    },
+    /// Inspect Undo availability without changing the repository.
+    UndoStatus {
+        id: Option<String>,
+    },
+    /// Inspect or resolve an interrupted apply.
+    Recover {
+        id: Option<String>,
+        action: RecoveryAction,
     },
     /// Throw one — or all — away.
     Discard {
@@ -291,7 +305,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 });
             }
             "apply" => parsed!(Command::Apply { id: id_from(rest) }),
-            "undo" => parsed!(Command::Undo { id: id_from(rest) }),
+            "undo" => parsed!(parse_undo(rest)?),
+            "recover" => parsed!(parse_recover(rest)?),
             "discard" => {
                 let arguments: Vec<&String> = rest.collect();
                 let all = arguments.iter().any(|arg| *arg == "--all");
@@ -359,9 +374,66 @@ pub fn wants_json(args: &[String]) -> bool {
     false
 }
 
+/// Reject misspelled inspection flags rather than accidentally executing Undo.
+fn parse_undo<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut check = false;
+    let mut id = None;
+    for arg in rest {
+        if arg == "--check" {
+            check = true;
+        } else if arg.starts_with('-') || id.is_some() {
+            return Err(Error::Refused(
+                "undo accepts one rehearsal ID and optional --check; no Undo was performed"
+                    .to_owned(),
+            ));
+        } else {
+            id = Some(arg.clone());
+        }
+    }
+    Ok(if check {
+        Command::UndoStatus { id }
+    } else {
+        Command::Undo { id }
+    })
+}
+
 /// The first non-flag argument left, if any.
 fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Option<String> {
     rest.into_iter().find(|arg| !arg.starts_with('-')).cloned()
+}
+
+fn parse_recover<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let arguments: Vec<&String> = rest.collect();
+    if let Some(option) = arguments
+        .iter()
+        .find(|arg| arg.starts_with('-') && !matches!(arg.as_str(), "--complete" | "--rollback"))
+    {
+        return Err(Error::Refused(format!(
+            "unknown recover option {option}; use --complete or --rollback, or omit both to inspect"
+        )));
+    }
+    if arguments.iter().any(|arg| *arg == "--complete")
+        && arguments.iter().any(|arg| *arg == "--rollback")
+    {
+        return Err(Error::Refused(
+            "recover accepts either --complete or --rollback, not both".to_owned(),
+        ));
+    }
+    let action = if arguments.iter().any(|arg| *arg == "--complete") {
+        RecoveryAction::Complete
+    } else if arguments.iter().any(|arg| *arg == "--rollback") {
+        RecoveryAction::Rollback
+    } else {
+        RecoveryAction::Inspect
+    };
+    let mut ids = arguments.into_iter().filter(|arg| !arg.starts_with('-'));
+    let id = ids.next().cloned();
+    if ids.next().is_some() {
+        return Err(Error::Refused(
+            "recover accepts at most one rehearsal ID; no recovery action was done".to_owned(),
+        ));
+    }
+    Ok(Command::Recover { id, action })
 }
 
 /// Runs a parsed command and returns the process exit code.
@@ -404,6 +476,8 @@ pub fn run<W: Write>(parsed: Parsed, cwd: &Path, output: &mut W) -> Result<u8> {
         }
         Command::Apply { id } => apply_kept(id.as_deref(), format, cwd, output),
         Command::Undo { id } => undo_apply(id.as_deref(), format, cwd, output),
+        Command::UndoStatus { id } => undo_status(id.as_deref(), format, cwd, output),
+        Command::Recover { id, action } => recover(id.as_deref(), action, format, cwd, output),
         Command::Discard { id, all } => discard(id.as_deref(), all, format, cwd, output),
     }
 }
@@ -462,7 +536,11 @@ fn rehearse<W: Write>(
 ) -> Result<u8> {
     let plan = preflight::run(cwd)?.into_plan(command.to_vec());
     let cache_root = cache::root()?;
-    let mut sandbox = sandbox::create(&cache_root, &plan, now_unix())?;
+    let mut sandbox = sandbox::create_executing(&cache_root, &plan, now_unix())?;
+    if decision == Decision::Keep {
+        // Retention must survive a kill while Git or its editor is running.
+        sandbox.keep()?;
+    }
 
     let todo = todo.map(Todo::new).transpose()?;
     let outcome = execute::run_with(
@@ -500,6 +578,15 @@ fn resume<W: Write>(
     output: &mut W,
 ) -> Result<u8> {
     let mut sandbox = find(id, cwd)?;
+    sandbox.claim_execution()?;
+    recovery::ensure_clear(&sandbox.meta().repo_path)?;
+    let stopped_on_replay = carry::stopped_on_replay(sandbox.meta());
+    if stopped_on_replay {
+        carry::validate_resume(&sandbox)?;
+    } else {
+        execute::validate_resume(&sandbox.worktree())?;
+    }
+    sandbox.begin_execution()?;
     // Which half stopped decides what carrying on means. A rehearsal waiting
     // on its replay has no operation for `git … --continue` to advance: what
     // it is waiting for is the resolution in the sandbox worktree, which
@@ -533,6 +620,7 @@ fn report_and_decide<W: Write>(
     exit_code: u8,
     output: &mut W,
 ) -> Result<()> {
+    crate::test_hooks::pause("GIT_REHEARSE_PAUSE_EXECUTION_AT", "report");
     let worktree = sandbox.worktree();
     let meta = sandbox.meta();
     let analysis = analyze::run(&worktree, &meta.pre_state, &meta.command, outcome)?;
@@ -565,7 +653,14 @@ fn report_and_decide<W: Write>(
         write_next_steps(&sandbox, &worktree, will_prompt, output)?;
     }
 
-    let choice = choose(decision, will_prompt, can_apply, outcome, output)?;
+    let choice = choose(
+        decision,
+        will_prompt,
+        sandbox.meta().status == Status::Kept,
+        can_apply,
+        outcome,
+        output,
+    )?;
     if choice == Choice::Apply && !can_apply {
         return Err(refuse_apply(sandbox, outcome));
     }
@@ -627,9 +722,11 @@ fn decide_as_json<W: Write>(
     can_apply: bool,
     output: &mut W,
 ) -> Result<()> {
+    let already_kept = sandbox.meta().status == Status::Kept;
     let choice = match decision {
         Decision::Apply => Choice::Apply,
         Decision::Keep => Choice::Keep,
+        Decision::Ask if already_kept => Choice::Keep,
         Decision::Ask => report::non_interactive(outcome),
     };
     if choice == Choice::Apply && !can_apply {
@@ -715,6 +812,7 @@ fn code_for_outcome(outcome: &Outcome) -> u8 {
 fn choose<W: Write>(
     decision: Decision,
     will_prompt: bool,
+    already_kept: bool,
     can_apply: bool,
     outcome: &Outcome,
     output: &mut W,
@@ -727,7 +825,11 @@ fn choose<W: Write>(
         // has to be announced, because nothing else in the output would reveal
         // that a question was skipped at all.
         Decision::Ask => {
-            let choice = report::non_interactive(outcome);
+            let choice = if already_kept {
+                Choice::Keep
+            } else {
+                report::non_interactive(outcome)
+            };
             let notice = if choice == Choice::Keep {
                 NOT_A_TERMINAL_STOPPED
             } else {
@@ -769,6 +871,12 @@ fn act<W: Write>(choice: Choice, mut sandbox: Sandbox, output: &mut W) -> Result
 }
 
 fn report_applied<W: Write>(applied: &apply::Applied, output: &mut W) -> Result<()> {
+    writeln!(output, "Repository hooks were not run").map_err(Error::Spawn)?;
+    writeln!(
+        output,
+        "New rerere resolutions stay in the sandbox; Apply does not copy them back"
+    )
+    .map_err(Error::Spawn)?;
     writeln!(output, "applied:").map_err(Error::Spawn)?;
     for moved in &applied.moved {
         // HEAD followed its branch; saying so twice adds nothing.
@@ -805,7 +913,7 @@ fn report_applied<W: Write>(applied: &apply::Applied, output: &mut W) -> Result<
     Ok(())
 }
 
-/// Lists this repository's rehearsals, pruning expired ones first.
+/// Lists this repository's rehearsals, pruning expired transient entries first.
 fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
     let cache_root = cache::root()?;
     let pruned = sandbox::prune(&cache_root, now_unix(), DEFAULT_TTL_SECS)?;
@@ -835,6 +943,32 @@ fn list<W: Write>(format: Format, cwd: &Path, output: &mut W) -> Result<u8> {
             meta.command.join(" ")
         )
         .map_err(Error::Spawn)?;
+        writeln!(
+            output,
+            "  origin {}  checkout {:?}  execution {}  storage {}  active {}",
+            meta.repo_path.display(),
+            meta.checkout,
+            meta.result
+                .as_ref()
+                .map_or("incomplete", |result| match result {
+                    Outcome::Clean => "clean",
+                    Outcome::Stopped { .. } => "stopped",
+                    Outcome::Failed { .. } => "failed",
+                }),
+            sandbox.root().display(),
+            sandbox.is_active()
+        )
+        .map_err(Error::Spawn)?;
+        writeln!(
+            output,
+            "  repository-id {}  lifecycle {:?}  pre-state refs {}",
+            json::repository_identity(meta)
+                .as_deref()
+                .unwrap_or("unavailable"),
+            meta.status,
+            meta.pre_state.len()
+        )
+        .map_err(Error::Spawn)?;
     }
     if !pruned.is_empty() {
         writeln!(
@@ -860,16 +994,38 @@ fn show<W: Write>(
     cwd: &Path,
     output: &mut W,
 ) -> Result<u8> {
-    let sandbox = find(id, cwd)?;
+    let mut sandbox = find(id, cwd)?;
+    let active = sandbox.is_active();
+    if !active {
+        // Recheck atomically and refresh metadata before analyzing. A Continue
+        // that won the race causes a refusal rather than a mixed report.
+        sandbox.claim_execution()?;
+    }
     let meta = sandbox.meta();
     // What the command did is remembered rather than re-derived; a rehearsal
     // that was never run is the only case with nothing to remember.
-    let outcome = meta.result.clone().ok_or_else(|| {
-        Error::Refused(format!(
-            "rehearsal {} never ran a command, so there is no report.",
-            meta.id
-        ))
-    })?;
+    let Some(outcome) = meta.result.clone().filter(|_| !active) else {
+        if format == Format::Json {
+            let mut document = json::Incomplete::of(&sandbox);
+            // Our read reservation is not another execution in progress.
+            document.entry.active = active;
+            write_json(&document, output)?;
+        } else {
+            write_show_metadata(&sandbox, output)?;
+            writeln!(
+                output,
+                "rehearsal {}: {}",
+                meta.id,
+                if active {
+                    "execution active; another process owns this rehearsal"
+                } else {
+                    "execution incomplete; its process ended before recording an execution result"
+                },
+            )
+            .map_err(Error::Spawn)?;
+        }
+        return Ok(exit::CLEAN);
+    };
     let analysis = analyze::run(
         &sandbox.worktree(),
         &meta.pre_state,
@@ -895,6 +1051,7 @@ fn show<W: Write>(
     }
 
     let graphs = report::graphs(&sandbox.worktree(), &analysis, detail)?;
+    write_show_metadata(&sandbox, output)?;
     write!(
         output,
         "{}",
@@ -904,6 +1061,24 @@ fn show<W: Write>(
     Ok(exit::CLEAN)
 }
 
+fn write_show_metadata<W: Write>(sandbox: &Sandbox, output: &mut W) -> Result<()> {
+    let meta = sandbox.meta();
+    writeln!(
+        output,
+        "origin worktree {}  repository-id {}  checkout {:?}  lifecycle {:?}  storage {}\n\
+         pre-state refs {}",
+        meta.repo_path.display(),
+        json::repository_identity(meta)
+            .as_deref()
+            .unwrap_or("unavailable"),
+        meta.checkout,
+        meta.status,
+        sandbox.root().display(),
+        meta.pre_state.len()
+    )
+    .map_err(Error::Spawn)
+}
+
 /// Applies a rehearsal that was kept.
 fn apply_kept<W: Write>(
     id: Option<&str>,
@@ -911,11 +1086,14 @@ fn apply_kept<W: Write>(
     cwd: &Path,
     output: &mut W,
 ) -> Result<u8> {
-    let sandbox = find(id, cwd)?;
+    let mut sandbox = find(id, cwd)?;
+    sandbox.claim_execution()?;
     let applied = apply::run(&sandbox, now_unix())?;
     if format == Format::Json {
         let document = json::ApplyResult {
             schema: json::SCHEMA,
+            repository_hooks: "disabled",
+            rerere_resolution_transfer: "sandbox_only",
             id: sandbox.id().to_owned(),
             repository: sandbox.meta().repo_path.display().to_string(),
             exit_code: exit::CLEAN,
@@ -926,6 +1104,39 @@ fn apply_kept<W: Write>(
         report_applied(&applied, output)?;
     }
     sandbox.discard()?;
+    Ok(exit::CLEAN)
+}
+
+/// Reports current Undo availability without acknowledging recovery.
+fn undo_status<W: Write>(
+    id: Option<&str>,
+    format: Format,
+    cwd: &Path,
+    output: &mut W,
+) -> Result<u8> {
+    let repo = repo_root(cwd)?;
+    let status = undo::status(&repo, id)?;
+    if format == Format::Json {
+        write_json(
+            &json::UndoStatusResult::new(repo.display().to_string(), &status),
+            output,
+        )?;
+    } else if status.available {
+        writeln!(
+            output,
+            "Undo available for Apply of rehearsal {} in {}",
+            status.rehearsal.as_deref().unwrap_or_default(),
+            status.worktree.as_deref().unwrap_or(cwd).display()
+        )
+        .map_err(Error::Spawn)?;
+    } else {
+        writeln!(
+            output,
+            "Undo unavailable: {}",
+            status.reason.as_deref().unwrap_or_default()
+        )
+        .map_err(Error::Spawn)?;
+    }
     Ok(exit::CLEAN)
 }
 
@@ -951,6 +1162,90 @@ fn undo_apply<W: Write>(
         report_undone(&undone, output)?;
     }
     Ok(exit::CLEAN)
+}
+
+fn recover<W: Write>(
+    id: Option<&str>,
+    action: RecoveryAction,
+    format: Format,
+    cwd: &Path,
+    output: &mut W,
+) -> Result<u8> {
+    let repo = repo_root(cwd)?;
+    let (inspection, recovered) = if action == RecoveryAction::Inspect {
+        let inspection = recovery::inspect(&repo)?;
+        if let Some(id) = id
+            && inspection
+                .as_ref()
+                .is_none_or(|found| !crate::sandbox::matches_id(&found.rehearsal, id))
+        {
+            return Err(Error::Refused(format!(
+                "the apply journal does not belong to rehearsal {id}; no recovery action was done"
+            )));
+        }
+        (inspection, None)
+    } else {
+        // Selection, inspection, and mutation share the ownership acquired
+        // by recover_for; an earlier unlocked selection could become stale.
+        (None, Some(recovery::recover_for(&repo, action, id)?))
+    };
+    let shown = recovered
+        .as_ref()
+        .map(|result| &result.inspection)
+        .or(inspection.as_ref());
+    if format == Format::Json {
+        // Successful mutations removed their journal while owning the lock.
+        // Report that resulting state, rather than offering the old actions.
+        let document =
+            json::RecoveryResult::new(repo.display().to_string(), inspection.as_ref(), action);
+        write_json(&document, output)?;
+    } else {
+        report_recovery(shown, action, output)?;
+    }
+    Ok(exit::CLEAN)
+}
+
+fn report_recovery<W: Write>(
+    inspection: Option<&recovery::Inspection>,
+    action: RecoveryAction,
+    output: &mut W,
+) -> Result<()> {
+    let Some(inspection) = inspection else {
+        writeln!(output, "no interrupted apply requires recovery").map_err(Error::Spawn)?;
+        return Ok(());
+    };
+    let state = match inspection.state {
+        RecoveryState::BeforeRefChange => "before ref change",
+        RecoveryState::AfterRefChange => "after ref change",
+        RecoveryState::Complete => "complete",
+        RecoveryState::RollingBack => "rolling back",
+        RecoveryState::Ambiguous => "ambiguous",
+    };
+    writeln!(
+        output,
+        "rehearsal {}: {} {state} (journal phase {:?})",
+        inspection.rehearsal,
+        inspection.operation.name(),
+        inspection.phase
+    )
+    .map_err(Error::Spawn)?;
+    match action {
+        RecoveryAction::Inspect => {
+            writeln!(
+                output,
+                "actions: complete={}, rollback={}",
+                inspection.can_complete, inspection.can_rollback
+            )
+            .map_err(Error::Spawn)?;
+        }
+        RecoveryAction::Complete => {
+            writeln!(output, "recovery completed").map_err(Error::Spawn)?;
+        }
+        RecoveryAction::Rollback => {
+            writeln!(output, "recovery rolled back").map_err(Error::Spawn)?;
+        }
+    }
+    Ok(())
 }
 
 fn report_undone<W: Write>(undone: &undo::Undone, output: &mut W) -> Result<()> {
@@ -991,9 +1286,10 @@ fn discard<W: Write>(
     let mut discarded = Vec::new();
     if all {
         let repo_id = repo_id(cwd)?;
+        let lock = recovery::acquire(&repo_root(cwd)?)?;
         for sandbox in sandbox::list(&cache_root, Some(&repo_id))? {
             discarded.push(sandbox.id().to_owned());
-            sandbox.discard()?;
+            sandbox.discard_locked(&lock)?;
         }
     } else {
         let sandbox = find(id, cwd)?;
@@ -1044,6 +1340,7 @@ fn repo_id(cwd: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{Command, Decision, Format, code_for, exit, wants_json};
+    use crate::recovery::Action as RecoveryAction;
     use crate::report::Detail;
     use crate::{Error, Result};
     use std::path::PathBuf;
@@ -1159,6 +1456,28 @@ mod tests {
                 all: false
             }
         );
+    }
+
+    #[test]
+    fn recovery_commands_have_query_complete_and_rollback_actions() {
+        let Command::Recover { id, action } = parse(&args(&["recover", "1786"])).expect("parses")
+        else {
+            panic!("expected recovery query");
+        };
+        assert_eq!(id.as_deref(), Some("1786"));
+        assert_eq!(action, RecoveryAction::Inspect);
+        let Command::Recover { action, .. } =
+            parse(&args(&["--json", "recover", "--rollback", "1786"])).expect("parses rollback")
+        else {
+            panic!("expected rollback");
+        };
+        assert_eq!(action, RecoveryAction::Rollback);
+        let Command::Recover { action, .. } =
+            parse(&args(&["recover", "--complete", "1786"])).expect("parses completion")
+        else {
+            panic!("expected completion");
+        };
+        assert_eq!(action, RecoveryAction::Complete);
     }
 
     #[test]

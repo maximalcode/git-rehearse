@@ -1,21 +1,10 @@
-# Builds the three platforms for a v* tag and attaches them to the release.
-#
-# SCOPE.md's checklist names cargo-dist for this. Hand-written instead, and
-# the reason is worth stating: what v0.1 needs is three binaries on a release
-# page, and this is that in sixty reviewable lines with every action pinned to
-# a commit. cargo-dist earns its keep when there are shell/PowerShell
-# installers, checksum manifests and a Homebrew tap to generate — none of
-# which v0.1 has. Swapping this file for `dist init` output when those are
-# wanted is a small change; carrying a generated multi-hundred-line workflow
-# before then is not.
-#
-# Uploading via the `gh` CLI rather than a release action keeps the
-# third-party surface at the two artifact actions GitHub itself publishes.
 name: release
 
 on:
   push:
     tags: ['v*']
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,12 +13,15 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
@@ -44,35 +36,27 @@ jobs:
           rustup default 1.97.1
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+      # PR/manual builds are test artifacts, even when dispatched against a tag.
+      - name: Package, verify checksum, and test the unpacked binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          staging="git-rehearse-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir "$staging"
-          cp target/${{ matrix.target }}/release/git-rehearse README.md LICENSE "$staging/"
-          tar czf "$staging.tar.gz" "$staging"
-          shasum -a 256 "$staging.tar.gz" > "$staging.tar.gz.sha256"
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        run: |
-          $staging = "git-rehearse-${{ github.ref_name }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/git-rehearse.exe", README.md, LICENSE $staging
-          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash | Out-File "$staging.zip.sha256"
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          label="v${version}-test-${GITHUB_SHA}"
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/tags/v* ]]; then
+            label="$GITHUB_REF_NAME"
+          fi
+          python3 scripts/release-artifact.py "$TARGET" "$label"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}
-          path: |
-            *.tar.gz
-            *.tar.gz.sha256
-            *.zip
-            *.zip.sha256
+          path: dist/*
           if-no-files-found: error
 
   publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     permissions:

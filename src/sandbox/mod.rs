@@ -32,10 +32,13 @@
 mod build;
 mod merge_config;
 mod meta;
+mod ownership;
+mod rerere;
 mod store;
 
-pub use build::create;
+pub use build::{create, create_executing};
 pub use meta::{Checkout, META_SCHEMA, Meta, Status};
+pub(crate) use store::matches_id;
 pub use store::{DEFAULT_TTL_SECS, find, list, prune};
 
 use std::collections::BTreeMap;
@@ -83,9 +86,29 @@ pub struct Plan {
 pub struct Sandbox {
     root: PathBuf,
     meta: Meta,
+    ownership: Option<std::sync::Arc<ownership::Ownership>>,
 }
 
 impl Sandbox {
+    /// Claims this rehearsal before mutation and reloads metadata under ownership.
+    /// Ownership lasts through reporting and is released when this handle and its
+    /// clones are dropped. Competing management operations refuse immediately.
+    pub fn claim_execution(&mut self) -> Result<()> {
+        if self.ownership.is_none() {
+            let ownership = ownership::Ownership::acquire(&self.root)?;
+            self.meta = Meta::read_owned(&self.root)?;
+            self.ownership = Some(std::sync::Arc::new(ownership));
+        }
+        Ok(())
+    }
+
+    /// Whether a process owns this rehearsal, or ownership cannot be inspected.
+    /// This is advisory; discard acquires ownership again to close inspection races.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.ownership.is_some() || ownership::Ownership::acquire(&self.root).is_err()
+    }
+
     /// The rehearsal id, as used by `git rehearse show|apply|discard`.
     #[must_use]
     pub fn id(&self) -> &str {
@@ -122,6 +145,16 @@ impl Sandbox {
         self.meta.write(&self.root)
     }
 
+    /// Invalidates the previous execution before a continuation starts.
+    ///
+    /// A continuation can be killed after Git has begun but before it returns
+    /// an outcome. Keeping the preceding `Stopped` result in that case would
+    /// make a later process report the interrupted attempt as if it completed.
+    pub fn begin_execution(&mut self) -> Result<()> {
+        self.meta.result = None;
+        self.meta.write(&self.root)
+    }
+
     /// Records what became of the carried uncommitted work.
     ///
     /// Separate from [`Sandbox::record`] because the two are answered at
@@ -140,8 +173,9 @@ impl Sandbox {
         self.meta.write(&self.root)
     }
 
-    /// Marks the rehearsal as one to keep, so `list` shows it and the prune
-    /// clock is the only thing that removes it.
+    /// Marks the rehearsal as one to keep, so `list` shows it until an
+    /// explicit discard. Kept rehearsals are durable across restarts and age
+    /// pruning.
     ///
     /// # Errors
     ///
@@ -162,6 +196,27 @@ impl Sandbox {
     ///
     /// [`Error::Io`](crate::Error::Io) if the directory cannot be removed.
     pub fn discard(self) -> Result<()> {
+        let lock = crate::recovery::acquire(&self.meta.repo_path)?;
+        self.discard_locked(&lock)
+    }
+
+    /// Deletes the rehearsal while the caller's recovery ownership remains held.
+    ///
+    /// The lock must belong to this rehearsal's repository. Keeping it in the
+    /// caller's scope through removal closes the window in which an Apply could
+    /// mutate the repository while this sandbox is being destroyed.
+    pub fn discard_locked(mut self, lock: &crate::recovery::Lock) -> Result<()> {
+        self.claim_execution()?;
+        // Let recovery reap a completed journal first, while preserving the
+        // fail-closed reservation check for opaque or unreadable claims.
+        let clearance = crate::recovery::ensure_clear_locked(&self.meta.repo_path, lock);
+        if store::is_recovery_reserved(&self.meta) {
+            return Err(crate::Error::Refused(format!(
+                "rehearsal {} is reserved by an interrupted apply; recover it before discarding",
+                self.id()
+            )));
+        }
+        clearance?;
         store::remove_rehearsal(&self.root)
     }
 }

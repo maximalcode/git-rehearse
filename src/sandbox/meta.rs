@@ -12,14 +12,17 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::carry::Carry;
 use crate::execute::Outcome;
 use crate::{Error, Result};
 
+/// Schema 3 adds durable worktree origin and makes older builds refuse it.
 /// Version of the `meta.json` document. Bump on any incompatible change; a
 /// build that meets an unfamiliar schema refuses the rehearsal rather than
 /// half-reading it.
@@ -28,7 +31,7 @@ use crate::{Error, Result};
 /// optional field: a rehearsal written by an older build carries no record of
 /// the uncommitted work it did *not* carry, and applying it with a build that
 /// now expects one would restore nothing while the report said otherwise.
-pub const META_SCHEMA: u32 = 2;
+pub const META_SCHEMA: u32 = 3;
 
 const META_FILE: &str = "meta.json";
 const META_TMP: &str = "meta.json.tmp";
@@ -53,7 +56,8 @@ pub enum Checkout {
 pub enum Status {
     /// Created by the current run; discarded unless the user says otherwise.
     Fresh,
-    /// Kept on purpose, listed by `git rehearse list` until it ages out.
+    /// Kept on purpose, listed by `git rehearse list` until explicitly
+    /// discarded.
     Kept,
 }
 
@@ -68,6 +72,9 @@ pub struct Meta {
     pub repo_id: String,
     /// Where the real repository is.
     pub repo_path: PathBuf,
+    /// Durable shared-repository and worktree administrative identity.
+    #[serde(default)]
+    pub origin: Option<crate::worktree::Origin>,
     /// The command being rehearsed.
     pub command: Vec<String>,
     /// What the sandbox has checked out.
@@ -83,7 +90,8 @@ pub struct Meta {
     pub carry: Option<Carry>,
     /// Creation time, seconds since the Unix epoch (see [`crate::now_unix`]).
     pub created_unix: u64,
-    /// Fresh or kept.
+    /// Fresh or explicitly kept. Kept metadata is durable and is not age
+    /// pruned; this makes `--keep` a reliable handoff across restarts.
     pub status: Status,
     /// How the rehearsed command ended, once it has run.
     ///
@@ -92,6 +100,9 @@ pub struct Meta {
     /// re-running anything, and re-deriving that from the sandbox's state
     /// would be guessing at what git did rather than remembering it.
     pub result: Option<Outcome>,
+    /// Optional extensions survive migration and later metadata updates.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 impl Meta {
@@ -106,25 +117,125 @@ impl Meta {
         let mut json =
             serde_json::to_string_pretty(self).map_err(|e| Error::Meta(path.clone(), e))?;
         json.push('\n');
-        fs::write(&tmp, json).map_err(Error::io(&tmp))?;
+        let mut file = fs::File::create(&tmp).map_err(Error::io(&tmp))?;
+        file.write_all(json.as_bytes()).map_err(Error::io(&tmp))?;
+        file.sync_all().map_err(Error::io(&tmp))?;
         fs::rename(&tmp, &path).map_err(Error::io(&path))
     }
 
     /// Reads and validates the `meta.json` in `root`.
     pub(super) fn read(root: &Path) -> Result<Self> {
+        Self::read_inner(root, false)
+    }
+
+    /// The caller already owns the rehearsal for execution or pruning.
+    pub(super) fn read_owned(root: &Path) -> Result<Self> {
+        Self::read_inner(root, true)
+    }
+
+    fn read_inner(root: &Path, owned: bool) -> Result<Self> {
         let path = root.join(META_FILE);
         let text = fs::read_to_string(&path).map_err(Error::io(&path))?;
-        let meta: Self = serde_json::from_str(&text).map_err(|e| Error::Meta(path.clone(), e))?;
-        if meta.schema != META_SCHEMA {
+        let mut document: Value =
+            serde_json::from_str(&text).map_err(|e| Error::Meta(path.clone(), e))?;
+        let schema = document
+            .get("schema")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                Error::Sandbox(format!(
+                    "{}: rehearsal metadata has no numeric schema",
+                    path.display()
+                ))
+            })?;
+
+        if schema == 1 {
+            if !owned {
+                let _ownership = super::ownership::Ownership::acquire(root)?;
+                // Reload after acquiring ownership: another invocation may have
+                // changed the record since the initial read.
+                return Self::read_owned(root);
+            }
+            // Schema 1 predates dirty-worktree carrying. Its fields retain
+            // their meanings, so the only safe migration is to add the
+            // explicit empty carry record and write the current schema without
+            // inventing an origin. Such a preview remains reference material.
+            let object = document.as_object_mut().ok_or_else(|| {
+                Error::Sandbox(format!(
+                    "{}: rehearsal metadata is not an object",
+                    path.display()
+                ))
+            })?;
+            object.insert("schema".to_owned(), Value::from(META_SCHEMA));
+            object.insert("carry".to_owned(), Value::Null);
+            let meta: Self =
+                serde_json::from_value(document).map_err(|e| Error::Meta(path.clone(), e))?;
+            preserve_original(root, text.as_bytes())?;
+            meta.write(root)?;
+            return Ok(meta);
+        }
+
+        if schema == 2 {
+            // Preserve older previews as reference material; their missing origin
+            // cannot authorize Apply, and the original file is not rewritten.
+            return serde_json::from_value(document).map_err(|e| Error::Meta(path, e));
+        }
+
+        if schema != u64::from(META_SCHEMA) {
             return Err(Error::Sandbox(format!(
-                "{}: rehearsal uses meta schema {}, this build understands {META_SCHEMA} — \
+                "{}: rehearsal uses meta schema {schema}, this build understands {META_SCHEMA} — \
                  upgrade git-rehearse, or discard the rehearsal",
-                path.display(),
-                meta.schema
+                path.display()
             )));
         }
-        Ok(meta)
+
+        serde_json::from_value(document).map_err(|e| Error::Meta(path, e))
     }
+}
+
+/// Create once, flush bytes and directory entry before allowing migration.
+/// An interrupted partial backup is never replaced: refuse with recovery guidance.
+fn preserve_original(root: &Path, original: &[u8]) -> Result<()> {
+    let backup = root.join("meta.json.bak");
+    let preserve = || -> Result<()> {
+        let file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(mut file) => {
+                file.write_all(original).map_err(Error::io(&backup))?;
+                file
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A retry can reuse only a complete, byte-identical regular file.
+                // Never follow a symlink or overwrite an earlier original.
+                if !fs::symlink_metadata(&backup)
+                    .map_err(Error::io(&backup))?
+                    .is_file()
+                    || fs::read(&backup).map_err(Error::io(&backup))? != original
+                {
+                    return Err(Error::Refused(
+                        "existing backup differs or is not a regular file".to_owned(),
+                    ));
+                }
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&backup)
+                    .map_err(Error::io(&backup))?
+            }
+            Err(error) => return Err(Error::Io(backup.clone(), error)),
+        };
+        file.sync_all().map_err(Error::io(&backup))?;
+        crate::durable::sync_parent_directory(&backup)
+    };
+    preserve().map_err(|error| {
+        Error::Refused(format!(
+            "cannot preserve original metadata at {}: {error}; migration was not written. \
+         Check directory permissions and free space. If a backup already exists, preserve it \
+         elsewhere and compare it with meta.json before moving it aside and retrying",
+            backup.display()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -140,6 +251,7 @@ mod tests {
             id: "1786248000-00".to_owned(),
             repo_id: "git-city-0123456789abcdef".to_owned(),
             repo_path: PathBuf::from("/repos/git-city"),
+            origin: None,
             command: vec!["rebase".to_owned(), "-i".to_owned(), "main".to_owned()],
             checkout: Checkout::Branch("feature".to_owned()),
             pre_state: BTreeMap::from([("refs/heads/main".to_owned(), "abc123".to_owned())]),
@@ -147,6 +259,7 @@ mod tests {
             created_unix: 1_786_248_000,
             status: Status::Fresh,
             result: None,
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -163,7 +276,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).expect("serialises");
         // Apply reads pre_state out of this file; the field names are part of
         // the on-disk contract that META_SCHEMA versions.
-        assert!(json.contains(r#""schema":2"#), "{json}");
+        assert!(json.contains(r#""schema":3"#), "{json}");
         assert!(
             json.contains(r#""pre_state":{"refs/heads/main":"abc123"}"#),
             "{json}"

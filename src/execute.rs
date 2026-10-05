@@ -111,12 +111,27 @@ pub fn run_with(
     todo: Option<&Todo>,
     chatter: Chatter,
 ) -> Result<Outcome> {
-    let env = match todo {
-        Some(todo) => vec![("GIT_SEQUENCE_EDITOR", sequence_editor(todo, command)?)],
-        None => Vec::new(),
-    };
+    let mut env = editor_env(chatter);
+    if let Some(todo) = todo {
+        env.push(("GIT_SEQUENCE_EDITOR", sequence_editor(todo, command)?));
+    }
+    git::validate_hook_policy(worktree, command)?;
     let status = git::spawn_with(worktree, command, &env, chatter)?;
     classify(worktree, status)
+}
+
+/// JSON callers supply a todo instead of opening a sequence editor. A missing
+/// todo must fail visibly; automatically accepting Git's todo would invent a
+/// history-editing decision. Signing programs keep their normal environment.
+fn editor_env(chatter: Chatter) -> Vec<(&'static str, OsString)> {
+    if chatter == Chatter::ToStderr {
+        vec![
+            ("GIT_EDITOR", OsString::from("true")),
+            ("GIT_SEQUENCE_EDITOR", OsString::from("false")),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The `GIT_SEQUENCE_EDITOR` value that installs `todo`, after checking that
@@ -280,6 +295,7 @@ pub fn resume(worktree: &Path) -> Result<Outcome> {
 ///
 /// As [`resume`].
 pub fn resume_with(worktree: &Path, chatter: Chatter) -> Result<Outcome> {
+    validate_resume(worktree)?;
     let Some(operation) = in_progress(worktree)? else {
         return Err(Error::Refused(
             "this rehearsal has nothing in progress — there is nothing to continue.\n\
@@ -296,6 +312,33 @@ pub fn resume_with(worktree: &Path, chatter: Chatter) -> Result<Outcome> {
         ));
     };
 
+    let env = editor_env(chatter);
+    let status = git::spawn_with(worktree, [subcommand, "--continue"], &env, chatter)?;
+    classify(worktree, status)
+}
+
+/// Checks that a continuation can start without changing the sandbox.
+///
+/// Callers that will invalidate recorded metadata must run this first. A
+/// refused continuation leaves the recorded outcome available for `show` and
+/// `apply` to report accurately.
+pub fn validate_resume(worktree: &Path) -> Result<()> {
+    let Some(operation) = in_progress(worktree)? else {
+        return Err(Error::Refused(
+            "this rehearsal has nothing in progress — there is nothing to continue.\n\
+             `git rehearse show` prints the report again; `apply` transplants it."
+                .to_owned(),
+        ));
+    };
+    if operation.subcommand().is_none() {
+        return Err(Error::Refused(
+            "this rehearsal stopped in a bisect, which cannot be continued for you.\n\
+             A bisect advances on your answer — mark the commit yourself inside the \
+             sandbox with `git bisect good|bad`."
+                .to_owned(),
+        ));
+    }
+
     // Refused before git is even started: `--continue` on an unresolved
     // conflict fails with git's own message about staging, which is correct
     // but arrives after the user has been told the rehearsal is resuming.
@@ -309,9 +352,7 @@ pub fn resume_with(worktree: &Path, chatter: Chatter) -> Result<Outcome> {
             unmerged.join("\n  ")
         )));
     }
-
-    let status = git::spawn_with(worktree, [subcommand, "--continue"], &[], chatter)?;
-    classify(worktree, status)
+    Ok(())
 }
 
 /// Turns git's exit status plus the state it left behind into an [`Outcome`].

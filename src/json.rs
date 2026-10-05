@@ -34,10 +34,12 @@ use crate::analyze::{Analysis, Commit, Conflict, Drift, FileChange, RefMove};
 // they were replayed, and what happened to the *carried changes*.
 use crate::analyze::Replay as CommitReplay;
 use crate::apply::Applied;
+use crate::cache;
 use crate::carry::{Carry, Replay};
 use crate::execute::Outcome;
+use crate::recovery::{Action as RecoveryAction, Inspection, Phase, State as RecoveryState};
 use crate::report::Choice;
-use crate::sandbox::{Meta, Sandbox, Status};
+use crate::sandbox::{Checkout, Meta, Sandbox, Status};
 use crate::undo::Undone;
 
 /// Version of the document below.
@@ -56,6 +58,9 @@ pub enum OutcomeKind {
     Stopped,
     /// Git refused the command outright.
     Failed,
+    /// The durable metadata has no result, which indicates the process was
+    /// interrupted before it could classify the Git command.
+    Incomplete,
 }
 
 /// What became of the rehearsal afterwards.
@@ -214,11 +219,27 @@ impl CarriedReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
     pub schema: u32,
+    /// Newly learned resolutions are never copied back by Apply.
+    pub rerere_resolution_transfer: &'static str,
+    /// Repository hooks are disabled for commands run by this tool.
+    pub repository_hooks: &'static str,
     /// The rehearsal id — an unambiguous prefix of it is what `continue`,
     /// `apply` and `discard` take.
     pub id: String,
     /// The real repository this was rehearsed against.
     pub repository: String,
+    /// The originating worktree. Kept separate from the repository identity
+    /// because one repository can have several checkouts.
+    pub origin_worktree: String,
+    /// Stable shared-repository identity, or `null` when the origin cannot be
+    /// inspected. A cache path hash is not a valid substitute.
+    pub repository_id: Option<String>,
+    pub checkout: Checkout,
+    pub pre_state: std::collections::BTreeMap<String, String>,
+    pub lifecycle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<Storage>,
+    pub execution: String,
     /// The sandbox worktree. Present whatever the decision, but only usable
     /// when `decision` is not `discarded`.
     pub sandbox: String,
@@ -234,6 +255,8 @@ pub struct Report {
     /// Whether the stop involves unmerged paths. An interactive `break` stops
     /// without any, and calling that a conflict would be a lie.
     pub conflicted: bool,
+    /// Actual object signatures; verification and trust are explicitly unchecked.
+    pub signatures: Vec<SignatureReport>,
     pub refs: Vec<Ref>,
     /// The commit being replayed when the command stopped.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,14 +286,58 @@ pub struct Report {
 pub struct Entry {
     pub id: String,
     pub command: Vec<String>,
+    pub repository: String,
+    pub origin_worktree: String,
+    /// Stable shared-repository identity, or `null` when the origin cannot be
+    /// inspected. A cache path hash is not a valid substitute.
+    pub repository_id: Option<String>,
+    pub checkout: Checkout,
+    pub pre_state: std::collections::BTreeMap<String, String>,
     pub sandbox: String,
     /// `fresh` or `kept`, as recorded in the sandbox's own metadata.
     pub status: String,
+    /// Live process ownership, independent of the last recorded outcome.
+    /// Advisory only: discard performs an authoritative ownership check.
+    pub active: bool,
     /// Seconds since the Unix epoch.
     pub created_unix: u64,
     /// How the command ended, if it has run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<OutcomeKind>,
+    /// `clean`, `stopped`, `failed`, or `incomplete` when the process ended
+    /// before it could record an outcome.
+    pub execution: String,
+    pub lifecycle: String,
+    pub storage: Storage,
+}
+
+/// The schema-versioned document returned by `show` when execution was
+/// interrupted before an outcome was recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Incomplete {
+    pub schema: u32,
+    #[serde(flatten)]
+    pub entry: Entry,
+}
+
+impl Incomplete {
+    /// Builds the incomplete `show` document from the durable entry.
+    #[must_use]
+    pub fn of(sandbox: &Sandbox) -> Self {
+        Self {
+            schema: SCHEMA,
+            entry: Entry::of(sandbox),
+        }
+    }
+}
+
+/// Durable paths and existence information for a rehearsal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Storage {
+    pub root: String,
+    pub sandbox: String,
+    pub metadata: String,
+    pub exists: bool,
 }
 
 impl Entry {
@@ -281,6 +348,11 @@ impl Entry {
         Self {
             id: meta.id.clone(),
             command: meta.command.clone(),
+            repository: meta.repo_path.display().to_string(),
+            origin_worktree: meta.repo_path.display().to_string(),
+            repository_id: repository_identity(meta),
+            checkout: meta.checkout.clone(),
+            pre_state: meta.pre_state.clone(),
             sandbox: sandbox.worktree().display().to_string(),
             // Spelled out rather than derived from `Status`: that enum is
             // `meta.json`'s, and a rename there must not reach the wire.
@@ -289,8 +361,12 @@ impl Entry {
                 Status::Kept => "kept",
             }
             .to_owned(),
+            active: sandbox.is_active(),
             created_unix: meta.created_unix,
             outcome: meta.result.as_ref().map(kind_of),
+            execution: execution(meta),
+            lifecycle: lifecycle(meta),
+            storage: storage(sandbox),
         }
     }
 }
@@ -308,6 +384,10 @@ pub struct Listing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApplyResult {
     pub schema: u32,
+    /// Newly learned resolutions are never copied back by Apply.
+    pub rerere_resolution_transfer: &'static str,
+    /// Repository hooks are disabled for commands run by this tool.
+    pub repository_hooks: &'static str,
     pub id: String,
     pub repository: String,
     pub exit_code: u8,
@@ -326,7 +406,7 @@ pub struct UndoResult {
     /// The rehearsal whose apply was taken back.
     pub rehearsal: String,
     /// When that apply happened, seconds since the Unix epoch. There is one
-    /// record per repository, so this is how a caller tells whether the apply
+    /// record per originating worktree, so this is how a caller tells whether the apply
     /// it undid is the one it made.
     pub applied_at_unix: u64,
     /// The refs that were put back, stated in the direction the undo moved
@@ -354,6 +434,38 @@ impl UndoResult {
     }
 }
 
+/// `git rehearse --json undo [<id>] --check`: a read-only availability snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UndoStatusResult {
+    pub schema: u32,
+    pub repository: String,
+    pub rehearsal: Option<String>,
+    pub applied_at_unix: Option<u64>,
+    pub worktree: Option<String>,
+    pub available: bool,
+    pub reason: Option<String>,
+    pub exit_code: u8,
+}
+
+impl UndoStatusResult {
+    #[must_use]
+    pub fn new(repository: String, status: &crate::undo::Status) -> Self {
+        Self {
+            schema: SCHEMA,
+            repository,
+            rehearsal: status.rehearsal.clone(),
+            applied_at_unix: status.applied_at_unix,
+            worktree: status
+                .worktree
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            available: status.available,
+            reason: status.reason.clone(),
+            exit_code: 0,
+        }
+    }
+}
+
 /// `git rehearse --json discard`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscardResult {
@@ -361,6 +473,90 @@ pub struct DiscardResult {
     /// The ids that are now gone.
     pub discarded: Vec<String>,
     pub exit_code: u8,
+}
+
+/// `git rehearse --json recover` and its explicit recovery actions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryResult {
+    pub schema: u32,
+    pub repository: String,
+    /// `none` when no interrupted apply is present.
+    pub state: String,
+    /// Which interrupted operation the available actions would finish or reverse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rehearsal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<&'static str>,
+    pub can_complete: bool,
+    pub can_rollback: bool,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal: Option<String>,
+}
+
+impl RecoveryResult {
+    /// Builds the public recovery document. The action is included so a
+    /// caller can distinguish a query from a mutation whose state was checked.
+    #[must_use]
+    pub fn new(
+        repository: String,
+        inspection: Option<&Inspection>,
+        action: RecoveryAction,
+    ) -> Self {
+        let action_name = match action {
+            RecoveryAction::Inspect => "inspect",
+            RecoveryAction::Complete => "complete",
+            RecoveryAction::Rollback => "rollback",
+        };
+        let (state, rehearsal, phase, can_complete, can_rollback, journal) =
+            inspection.map_or(("none", None, None, false, false, None), |found| {
+                (
+                    state_name(found.state),
+                    Some(found.rehearsal.clone()),
+                    Some(phase_name(found.phase)),
+                    found.can_complete,
+                    found.can_rollback,
+                    Some(found.journal.clone()),
+                )
+            });
+        Self {
+            schema: SCHEMA,
+            repository,
+            state: state.to_owned(),
+            operation: inspection.map(|found| match found.operation {
+                crate::recovery::Operation::Apply => "apply",
+                crate::recovery::Operation::Undo => "undo",
+            }),
+            rehearsal,
+            phase,
+            can_complete,
+            can_rollback,
+            action: action_name.to_owned(),
+            journal,
+        }
+    }
+}
+
+fn phase_name(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Prepared => "prepared",
+        Phase::RefsApplied => "refs_applied",
+        Phase::WorktreeUpdated => "worktree_updated",
+        Phase::Complete => "complete",
+        Phase::RollingBack => "rolling_back",
+    }
+}
+
+fn state_name(state: RecoveryState) -> &'static str {
+    match state {
+        RecoveryState::BeforeRefChange => "before_ref_change",
+        RecoveryState::AfterRefChange => "after_ref_change",
+        RecoveryState::Complete => "complete",
+        RecoveryState::RollingBack => "rolling_back",
+        RecoveryState::Ambiguous => "ambiguous",
+    }
 }
 
 /// Why a run failed.
@@ -424,8 +620,17 @@ impl Report {
         let meta: &Meta = sandbox.meta();
         Self {
             schema: SCHEMA,
+            rerere_resolution_transfer: "sandbox_only",
+            repository_hooks: "disabled",
             id: meta.id.clone(),
             repository: meta.repo_path.display().to_string(),
+            origin_worktree: meta.repo_path.display().to_string(),
+            repository_id: repository_identity(meta),
+            checkout: meta.checkout.clone(),
+            pre_state: meta.pre_state.clone(),
+            lifecycle: lifecycle(meta),
+            storage: (choice == Choice::Keep).then(|| storage(sandbox)),
+            execution: kind_of(outcome).as_str().to_owned(),
             sandbox: sandbox.worktree().display().to_string(),
             command: meta.command.clone(),
             outcome: kind_of(outcome),
@@ -435,6 +640,7 @@ impl Report {
                 Outcome::Clean | Outcome::Stopped { .. } => None,
             },
             conflicted: matches!(outcome, Outcome::Stopped { conflicts: true }),
+            signatures: analysis.signatures.iter().map(signature).collect(),
             refs: analysis.ref_moves.iter().map(reference).collect(),
             stopped_at: analysis.stopped_at.as_ref().map(commit),
             conflicts: analysis.conflicts.iter().map(conflict).collect(),
@@ -459,6 +665,50 @@ fn kind_of(outcome: &Outcome) -> OutcomeKind {
         Outcome::Stopped { .. } => OutcomeKind::Stopped,
         Outcome::Failed { .. } => OutcomeKind::Failed,
     }
+}
+
+impl OutcomeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+fn execution(meta: &Meta) -> String {
+    meta.result
+        .as_ref()
+        .map_or("incomplete", |outcome| kind_of(outcome).as_str())
+        .to_owned()
+}
+
+fn lifecycle(meta: &Meta) -> String {
+    match meta.status {
+        Status::Fresh => "fresh",
+        Status::Kept => "kept",
+    }
+    .to_owned()
+}
+
+fn storage(sandbox: &Sandbox) -> Storage {
+    Storage {
+        root: sandbox.root().display().to_string(),
+        sandbox: sandbox.worktree().display().to_string(),
+        metadata: sandbox.root().join("meta.json").display().to_string(),
+        exists: sandbox.root().exists(),
+    }
+}
+
+/// Stable identity for the shared Git repository, separate from the
+/// worktree-specific cache key. Linked worktrees report the same common Git
+/// directory here while retaining separate rehearsal storage roots.
+pub(crate) fn repository_identity(meta: &Meta) -> Option<String> {
+    let origin = meta.origin.as_ref()?;
+    origin.verify(&meta.repo_path).ok()?;
+    Some(cache::repo_id(&origin.common_dir))
 }
 
 fn reference(moved: &RefMove) -> Ref {
@@ -532,6 +782,7 @@ mod tests {
 
     fn analysis() -> Analysis {
         Analysis {
+            signatures: Vec::new(),
             ref_moves: Vec::new(),
             stopped_at: Some(Commit {
                 sha: "0a7bfa18".to_owned(),
@@ -606,8 +857,22 @@ mod tests {
     fn report(outcome: &Outcome) -> Report {
         Report {
             schema: SCHEMA,
+            rerere_resolution_transfer: "sandbox_only",
+            repository_hooks: "disabled",
             id: "1786281796-00".to_owned(),
             repository: "/repo".to_owned(),
+            origin_worktree: "/repo".to_owned(),
+            repository_id: Some("repo-id".to_owned()),
+            checkout: crate::sandbox::Checkout::Branch("main".to_owned()),
+            pre_state: std::collections::BTreeMap::new(),
+            lifecycle: "kept".to_owned(),
+            storage: Some(super::Storage {
+                root: "/cache/id".to_owned(),
+                sandbox: "/cache/id/sandbox".to_owned(),
+                metadata: "/cache/id/meta.json".to_owned(),
+                exists: true,
+            }),
+            execution: super::kind_of(outcome).as_str().to_owned(),
             sandbox: "/cache/1786281796-00/sandbox".to_owned(),
             command: vec!["rebase".to_owned(), "main".to_owned()],
             outcome: super::kind_of(outcome),
@@ -617,6 +882,7 @@ mod tests {
                 Outcome::Clean | Outcome::Stopped { .. } => None,
             },
             conflicted: matches!(outcome, Outcome::Stopped { conflicts: true }),
+            signatures: Vec::new(),
             refs: Vec::new(),
             stopped_at: analysis().stopped_at.as_ref().map(super::commit),
             conflicts: analysis().conflicts.iter().map(super::conflict).collect(),
@@ -684,5 +950,23 @@ mod tests {
             serde_json::to_value(OutcomeKind::Clean).expect("serialises"),
             "clean"
         );
+    }
+}
+
+/// Presence does not imply cryptographic validity or a trusted signer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SignatureReport {
+    pub sha: String,
+    pub present: bool,
+    pub verification: &'static str,
+    pub trust: &'static str,
+}
+
+fn signature(found: &crate::signatures::Signature) -> SignatureReport {
+    SignatureReport {
+        sha: found.sha.clone(),
+        present: found.present,
+        verification: "not_checked",
+        trust: "not_checked",
     }
 }

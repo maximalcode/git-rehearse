@@ -33,6 +33,8 @@ use crate::{Result, git};
 pub struct Analysis {
     /// Refs whose commit changed, sorted by name.
     pub ref_moves: Vec<RefMove>,
+    /// Signature presence on commits introduced by each changed ref.
+    pub signatures: Vec<crate::signatures::Signature>,
     /// The commit the command stopped on, if it stopped.
     pub stopped_at: Option<Commit>,
     /// Unmerged paths and their conflict-hunk counts.
@@ -176,6 +178,7 @@ pub fn run(
     };
 
     Ok(Analysis {
+        signatures: crate::signatures::inspect(worktree, &ref_moves)?,
         drift: drift(worktree, &ref_moves)?,
         drift_expected_empty: preserves_content(command),
         ref_moves,

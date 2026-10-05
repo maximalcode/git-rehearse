@@ -170,6 +170,23 @@ pub fn render(meta: &Meta, analysis: &Analysis, outcome: &Outcome, graphs: &[Gra
     let _ = writeln!(out, "rehearsed  git {}", meta.command.join(" "));
     let _ = writeln!(out, "repository {}", meta.repo_path.display());
     let _ = writeln!(out, "rehearsal  {}", meta.id);
+    let _ = writeln!(out, "Repository hooks were not run");
+    let _ = writeln!(
+        out,
+        "New rerere resolutions stay in the sandbox; Apply does not copy them back"
+    );
+    if !analysis.signatures.is_empty() {
+        let signed = analysis
+            .signatures
+            .iter()
+            .filter(|entry| entry.present)
+            .count();
+        let _ = writeln!(
+            out,
+            "Signatures: {signed}/{} result commits carry signatures (validity and trust not checked)",
+            analysis.signatures.len()
+        );
+    }
     let _ = writeln!(out);
 
     match outcome {
@@ -513,6 +530,7 @@ mod tests {
             id: "1786248000-00".to_owned(),
             repo_id: "app-0123456789abcdef".to_owned(),
             repo_path: PathBuf::from("/repos/app"),
+            origin: None,
             command: command.iter().map(|arg| (*arg).to_owned()).collect(),
             checkout: Checkout::Branch("feature".to_owned()),
             pre_state: BTreeMap::new(),
@@ -520,6 +538,7 @@ mod tests {
             created_unix: 1_786_248_000,
             status: Status::Fresh,
             result: None,
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -545,6 +564,7 @@ mod tests {
 
     fn analysis() -> Analysis {
         Analysis {
+            signatures: Vec::new(),
             ref_moves: vec![moved("refs/heads/feature")],
             stopped_at: None,
             conflicts: Vec::new(),

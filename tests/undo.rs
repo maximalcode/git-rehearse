@@ -334,7 +334,7 @@ fn a_record_from_a_version_this_build_does_not_know_is_refused() {
     let after = branches(&fixture);
 
     let record = std::fs::read_to_string(&applied.undo).expect("the record exists");
-    std::fs::write(&applied.undo, record.replace("version 1", "version 99")).expect("rewrite");
+    std::fs::write(&applied.undo, record.replace("version 2", "version 99")).expect("rewrite");
 
     let message = refusal(undo::run(fixture.repo(), None).expect_err("refused"));
 

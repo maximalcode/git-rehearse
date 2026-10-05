@@ -380,6 +380,7 @@ fn moves_the_worktree(worktree: &Path, meta: &Meta) -> bool {
 /// [`Error::Refused`] if paths are still unmerged, or if there is nothing
 /// waiting. [`Error::Git`] if the sandbox cannot be read.
 pub fn resume(sandbox: &mut Sandbox) -> Result<Outcome> {
+    validate_resume(sandbox)?;
     let worktree = sandbox.worktree();
     let waiting = sandbox
         .meta()
@@ -390,23 +391,9 @@ pub fn resume(sandbox: &mut Sandbox) -> Result<Outcome> {
         .cloned();
 
     let replay = match waiting {
-        Some(Replay::Conflicted { .. }) => {
-            // Refused before anything is captured, and with the same words
-            // `continue` uses for a stopped command: a stash commit made over
-            // unmerged entries would bake the conflict markers in.
-            let unmerged = execute::unmerged(&worktree)?;
-            if !unmerged.is_empty() {
-                return Err(Error::Refused(format!(
-                    "{} path(s) are still unmerged in the sandbox:\n  {}\n\
-                     Resolve them and `git add` them there, then continue.",
-                    unmerged.len(),
-                    unmerged.join("\n  ")
-                )));
-            }
-            Replay::Restored {
-                result: capture(&worktree)?,
-            }
-        }
+        Some(Replay::Conflicted { .. }) => Replay::Restored {
+            result: capture(&worktree)?,
+        },
         Some(Replay::Refused { .. }) => replay(&worktree)?,
         Some(Replay::Restored { .. } | Replay::NotNeeded) | None => {
             return Err(Error::Refused(
@@ -420,6 +407,37 @@ pub fn resume(sandbox: &mut Sandbox) -> Result<Outcome> {
     let outcome = replay.outcome();
     sandbox.record_replay(replay)?;
     Ok(outcome)
+}
+
+/// Checks that carried work is waiting for a continuation without changing
+/// the sandbox metadata or worktree.
+pub fn validate_resume(sandbox: &Sandbox) -> Result<()> {
+    let waiting = sandbox
+        .meta()
+        .carry
+        .as_ref()
+        .and_then(|carry| carry.replay.as_ref())
+        .filter(|replay| replay.is_unfinished());
+    match waiting {
+        Some(Replay::Conflicted { .. }) => {
+            let unmerged = execute::unmerged(&sandbox.worktree())?;
+            if !unmerged.is_empty() {
+                return Err(Error::Refused(format!(
+                    "{} path(s) are still unmerged in the sandbox:\n  {}\n\
+                     Resolve them and `git add` them there, then continue.",
+                    unmerged.len(),
+                    unmerged.join("\n  ")
+                )));
+            }
+            Ok(())
+        }
+        Some(Replay::Refused { .. }) => Ok(()),
+        Some(Replay::Restored { .. } | Replay::NotNeeded) | None => Err(Error::Refused(
+            "this rehearsal has nothing in progress — there is nothing to continue.\n\
+             `git rehearse show` prints the report again; `apply` transplants it."
+                .to_owned(),
+        )),
+    }
 }
 
 /// Captures the sandbox worktree as a commit, parked so nothing collects it.
@@ -467,7 +485,7 @@ pub fn result_of(carry: &Carry) -> Option<&str> {
 /// Compared by tree rather than by commit id, because `git stash create` stamps
 /// a commit time and so never produces the same id twice. Both trees are
 /// compared — the worktree's and the index's — so that restaging counts as a
-/// change too, since the restore cannot preserve what was staged.
+/// change too: only the original staging that was rehearsed may be replaced.
 ///
 /// # Errors
 ///
@@ -501,7 +519,7 @@ fn trees_of(repo: &Path, commit: &str) -> Result<(String, Option<String>)> {
     Ok((worktree, index))
 }
 
-/// Puts the rehearsed result into the worktree, after the reset.
+/// Restores the worktree endpoint recorded by legacy apply journals.
 ///
 /// Not a merge, and not a `git stash apply`: `result` is a tree that was
 /// produced in the sandbox and inspected in the report, and this checks it
@@ -522,6 +540,25 @@ pub fn restore(repo: &Path, result: &str) -> Result<()> {
         ["read-tree", "-u", "--reset", &format!("{result}^{{tree}}")],
     )?;
     git::run(repo, ["reset", "--mixed", "--quiet", "HEAD"])?;
+    Ok(())
+}
+
+/// Transplants both trees of a protected stash snapshot, including staging.
+/// The intermediate index equals the worktree tree and is recognizable after
+/// interruption; no merge or replay is performed in the original repository.
+pub fn restore_snapshot(repo: &Path, snapshot: &str) -> Result<()> {
+    git::run(
+        repo,
+        [
+            "read-tree",
+            "-u",
+            "--reset",
+            &format!("{snapshot}^{{tree}}"),
+        ],
+    )?;
+    crate::test_hooks::abort("GIT_REHEARSE_ABORT_APPLY_AT", "after-carry-files");
+    crate::test_hooks::abort("GIT_REHEARSE_ABORT_RECOVERY_AT", "after-carry-files");
+    git::run(repo, ["read-tree", &format!("{snapshot}^2^{{tree}}")])?;
     Ok(())
 }
 

@@ -292,8 +292,16 @@ fn rehearsals_started_in_the_same_second_do_not_collide() {
     let fixture = Fixture::new();
     let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
 
-    let first = sandbox::create(fixture.cache(), &plan, NOW).expect("first sandbox");
-    let second = sandbox::create(fixture.cache(), &plan, NOW).expect("second sandbox");
+    let barrier = std::sync::Barrier::new(2);
+    let (first, second) = std::thread::scope(|scope| {
+        let create = || {
+            barrier.wait();
+            sandbox::create(fixture.cache(), &plan, NOW).expect("concurrent sandbox")
+        };
+        let first = scope.spawn(create);
+        let second = scope.spawn(create);
+        (first.join().unwrap(), second.join().unwrap())
+    });
 
     assert_ne!(first.id(), second.id());
     assert_ne!(first.root(), second.root());
@@ -373,6 +381,174 @@ fn prune_removes_what_has_expired_and_keeps_what_has_not() {
 }
 
 #[test]
+fn explicitly_kept_rehearsals_are_durable_beyond_the_ttl() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+    let mut kept = sandbox::create(fixture.cache(), &plan, NOW).expect("kept rehearsal");
+    kept.keep().expect("mark it kept");
+
+    let removed = sandbox::prune(
+        fixture.cache(),
+        NOW + DEFAULT_TTL_SECS + 1,
+        DEFAULT_TTL_SECS,
+    )
+    .expect("prune runs");
+
+    assert!(
+        removed.is_empty(),
+        "durable rehearsal was pruned: {removed:?}"
+    );
+    assert!(
+        kept.root().exists(),
+        "the kept sandbox remains discoverable"
+    );
+    assert_eq!(
+        sandbox::list(fixture.cache(), None)
+            .expect("list runs")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn schema_one_metadata_is_migrated_and_remains_findable() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox");
+    let metadata = sandbox.root().join("meta.json");
+    let mut old: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&metadata).expect("metadata")).expect("json");
+    old["schema"] = serde_json::json!(1);
+    old.as_object_mut().expect("object").remove("carry");
+    std::fs::write(&metadata, serde_json::to_vec(&old).expect("old metadata"))
+        .expect("write old metadata");
+
+    let found = sandbox::list(fixture.cache(), None).expect("old metadata is supported");
+    assert_eq!(found.len(), 1);
+    let migrated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&metadata).expect("migrated metadata"))
+            .expect("migrated json");
+    assert_eq!(migrated["schema"], serde_json::json!(sandbox::META_SCHEMA));
+    assert!(
+        migrated.get("carry").is_some(),
+        "migration records absent carry"
+    );
+}
+
+#[test]
+fn unknown_metadata_is_preserved_and_fails_closed() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox");
+    let metadata = sandbox.root().join("meta.json");
+    let original = serde_json::json!({"schema": 999, "keep": "this"});
+    std::fs::write(
+        &metadata,
+        serde_json::to_vec(&original).expect("unknown metadata"),
+    )
+    .expect("write unknown metadata");
+
+    let error = sandbox::list(fixture.cache(), None).expect_err("unknown schema is refused");
+    assert!(error.to_string().contains("schema 999"), "{error}");
+    let after = std::fs::read_to_string(&metadata).expect("unknown metadata remains");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after).expect("json"),
+        original
+    );
+    assert!(sandbox.root().exists(), "unknown rehearsal was not deleted");
+    assert!(
+        sandbox::prune(
+            fixture.cache(),
+            NOW + DEFAULT_TTL_SECS + 1,
+            DEFAULT_TTL_SECS
+        )
+        .expect("prune protects unknown metadata")
+        .is_empty()
+    );
+}
+
+#[test]
+fn discard_protects_a_rehearsal_claimed_by_an_apply_journal() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox");
+    std::fs::write(
+        fixture.repo().join(".git/rehearse-apply"),
+        serde_json::json!({"rehearsal": sandbox.id(), "phase": "refs_applied"}).to_string(),
+    )
+    .expect("apply journal");
+
+    let error = sandbox
+        .discard()
+        .expect_err("recovery-owned sandbox is protected");
+    assert!(
+        error
+            .to_string()
+            .contains("reserved by an interrupted apply"),
+        "{error}"
+    );
+}
+
+#[test]
+fn discard_protects_a_rehearsal_when_the_apply_claim_is_unreadable() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox");
+    std::fs::write(
+        fixture.repo().join(".git/rehearse-apply"),
+        serde_json::json!({"phase": "refs_applied", "rehearsal": null}).to_string(),
+    )
+    .expect("damaged apply journal");
+
+    let error = sandbox
+        .discard()
+        .expect_err("unreadable recovery ownership is protected");
+    assert!(
+        error
+            .to_string()
+            .contains("reserved by an interrupted apply"),
+        "{error}"
+    );
+}
+
+#[test]
+fn discard_protects_a_rehearsal_when_the_apply_journal_is_a_directory() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox");
+    std::fs::create_dir(fixture.repo().join(".git/rehearse-apply"))
+        .expect("directory-shaped apply journal");
+
+    let error = sandbox
+        .discard()
+        .expect_err("unknown recovery ownership is protected");
+    assert!(
+        error
+            .to_string()
+            .contains("reserved by an interrupted apply"),
+        "{error}"
+    );
+}
+
+#[test]
+fn prune_protects_a_rehearsal_when_the_apply_journal_is_a_directory() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(&["merge", "feature"], Checkout::Branch("main".to_owned()));
+    let sandbox = sandbox::create(fixture.cache(), &plan, NOW).expect("sandbox");
+    std::fs::create_dir(fixture.repo().join(".git/rehearse-apply"))
+        .expect("directory-shaped apply journal");
+
+    let removed = sandbox::prune(
+        fixture.cache(),
+        NOW + DEFAULT_TTL_SECS + 1,
+        DEFAULT_TTL_SECS,
+    )
+    .expect("prune runs");
+    assert!(removed.is_empty(), "{removed:?}");
+    assert!(sandbox.root().exists(), "the rehearsal remains recoverable");
+}
+
+#[test]
 fn prune_collects_a_directory_that_never_got_a_meta_file() {
     let fixture = Fixture::new();
     // What a run killed mid-clone leaves behind: no meta.json, so nothing but
@@ -409,5 +585,77 @@ fn an_empty_cache_is_an_empty_listing_not_an_error() {
     assert_eq!(
         sandbox::prune(&missing, NOW, DEFAULT_TTL_SECS).expect("no cache is fine"),
         Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_full_main_worktree_id_never_selects_a_linked_rehearsal_from_the_same_second() {
+    let fixture = Fixture::new();
+    let linked = fixture.scratch("linked");
+    fixture.git(&["worktree", "add", linked.to_str().unwrap(), "-b", "other"]);
+    let command = vec!["merge".to_owned(), "feature".to_owned()];
+    let main_plan = git_rehearse::preflight::run(fixture.repo())
+        .unwrap()
+        .into_plan(command.clone());
+    let linked_plan = git_rehearse::preflight::run(&linked)
+        .unwrap()
+        .into_plan(command);
+    let main = sandbox::create(fixture.cache(), &main_plan, NOW).unwrap();
+    let linked = sandbox::create(fixture.cache(), &linked_plan, NOW).unwrap();
+    assert!(
+        sandbox::find(fixture.cache(), &linked.meta().repo_id, Some(main.id())).is_err(),
+        "a complete main-worktree ID must not select a linked rehearsal created in the same second"
+    );
+    assert_eq!(
+        sandbox::find(fixture.cache(), &linked.meta().repo_id, Some(linked.id()))
+            .unwrap()
+            .id(),
+        linked.id()
+    );
+    assert_eq!(
+        sandbox::find(fixture.cache(), &linked.meta().repo_id, Some("1786248000"))
+            .unwrap()
+            .id(),
+        linked.id()
+    );
+}
+
+#[test]
+fn legacy_linked_ids_do_not_accept_a_complete_main_id_as_a_prefix() {
+    let fixture = Fixture::new();
+    let linked_path = fixture.scratch("linked");
+    fixture.git(&[
+        "worktree",
+        "add",
+        linked_path.to_str().unwrap(),
+        "-b",
+        "other",
+    ]);
+    let plan = git_rehearse::preflight::run(&linked_path)
+        .unwrap()
+        .into_plan(vec!["merge".to_owned(), "feature".to_owned()]);
+    let linked = sandbox::create(fixture.cache(), &plan, NOW).unwrap();
+    let main_id = format!("{NOW}-00");
+    let legacy_id = format!("{main_id}-linked-0123456789abcdef");
+    let metadata = linked.root().join("meta.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+    document["id"] = serde_json::json!(legacy_id);
+    std::fs::write(&metadata, serde_json::to_vec(&document).unwrap()).unwrap();
+    let legacy_root = linked.root().parent().unwrap().join(&legacy_id);
+    std::fs::rename(linked.root(), &legacy_root).unwrap();
+
+    assert!(sandbox::find(fixture.cache(), &linked.meta().repo_id, Some(&main_id)).is_err());
+    assert_eq!(
+        sandbox::find(fixture.cache(), &linked.meta().repo_id, Some(&legacy_id))
+            .unwrap()
+            .id(),
+        legacy_id
+    );
+    assert_eq!(
+        sandbox::find(fixture.cache(), &linked.meta().repo_id, Some("1786248000"))
+            .unwrap()
+            .id(),
+        legacy_id
     );
 }

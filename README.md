@@ -16,19 +16,30 @@ before/after graph, the conflicts, and a warning if replaying your commits
 quietly changed what they do. Then you choose: apply it, keep it, or throw it
 away. Your repository is not touched until you say so.
 
-> **Status: v1.2.0.** Everything on this page is in the release; every terminal
+> **Status: v1.3.0.** Everything on this page is in the release; every terminal
 > transcript here is real captured output. The command surface and the exit
 > codes are settled and will not shift under you.
 > [SCOPE.md](SCOPE.md) is the full plan.
 
 ## Install
 
-### Upgrading from v1.1.0
+### Upgrading from v1.2.0 (and older releases)
 
-Kept rehearsals from v1.1.0 are not loaded by v1.2.0, which uses sandbox
-metadata schema 2 to record carried work. Save any work you need from old
-sandboxes before upgrading, then create fresh rehearsals. Do not edit their
-metadata to force compatibility.
+Kept rehearsals from v1.2.0 use metadata schema 2. They remain readable as
+reference material and their original `meta.json` is preserved unchanged, but
+they have no durable worktree origin, so v1.3.0 refuses automatic Apply.
+Create a new rehearsal before using automatic Apply.
+
+Older schema 1 metadata is migrated when first read. The migration saves the
+exact original bytes in `meta.json.bak` beside `meta.json` before atomically
+writing the current schema, but schema 1 also lacks a durable origin. The
+migrated rehearsal is therefore reference-only: create a new rehearsal before
+using automatic Apply. Unknown schemas and damaged metadata are refused and
+left in place so they can be recovered or diagnosed.
+
+Version 1 Undo records remain readable for manual recovery only because they
+lack durable origin information. Version 2 records include that origin and can
+be used by v1.3.0 when their worktree and repository still match.
 
 ### A prebuilt binary
 
@@ -38,19 +49,20 @@ check the sum, and put the `git-rehearse` inside on your `PATH`.
 
 | platform | archive |
 |---|---|
-| Linux, x86-64 | `git-rehearse-v1.2.0-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS, Apple silicon | `git-rehearse-v1.2.0-aarch64-apple-darwin.tar.gz` |
-| Windows, x86-64 | `git-rehearse-v1.2.0-x86_64-pc-windows-msvc.zip` |
+| Linux, x86-64 | `git-rehearse-v1.3.0-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS, Intel | `git-rehearse-v1.3.0-x86_64-apple-darwin.tar.gz` |
+| macOS, Apple silicon | `git-rehearse-v1.3.0-aarch64-apple-darwin.tar.gz` |
+| Windows, x86-64 | `git-rehearse-v1.3.0-x86_64-pc-windows-msvc.zip` |
 
-Intel macOS and ARM Linux are not built yet — [build from
-source](#from-source) there, which works fine.
+ARM Linux is not built yet — [build from source](#from-source) there, which
+works fine.
 
 ### From source
 
 Needs [Rust 1.97 or newer](https://rustup.rs) and `git` on your `PATH`.
 
 ```bash
-cargo install --git https://github.com/maximalcode/git-rehearse --tag v1.2.0
+cargo install --git https://github.com/maximalcode/git-rehearse --tag v1.3.0
 ```
 
 Or from a clone, to track `develop`:
@@ -64,6 +76,9 @@ Not on crates.io yet.
 However you install it, you get a binary called `git-rehearse`. Because git
 treats any `git-<name>` on your `PATH` as a subcommand, that is all it takes
 for `git rehearse …` to work — no alias, no config.
+
+See [release artifacts](docs/releases.md) for the OS/architecture mapping,
+checksum verification, installation instructions, and non-publishing test builds.
 
 ## A real session
 
@@ -132,6 +147,22 @@ from the apply of rehearsal 1786178829-00 at 1786178954 (unix time).
 The record is used up — one apply is undoable at a time.
 ```
 
+`git rehearse --json undo --check` reports `rehearsal`, `applied_at_unix`,
+`worktree`, `available`, and an explanatory `reason` (null when available).
+The full rehearsal ID identifies the concrete Apply: a rehearsal cannot be
+applied again after a completed Apply. Pass that ID to `undo <id> --check`
+and then `undo <id>` to prevent a later Apply from silently changing the target.
+Inspection exits 0 even when unavailable; malformed/unreadable records are
+reported as unavailable, while inability to acquire the repository lock is a
+refusal. Availability is a snapshot; Undo repeats the checks under the shared
+repository lock before moving refs.
+
+Each worktree owns its last Apply record. The record stores both its worktree
+path and Git administrative identity; moving/copying the record to another
+worktree cannot authorize Undo there. Version 1 records remain readable for
+manual recovery but cannot authorize automatic Undo because they lack durable
+origin. Version 2 records require a compatible git-rehearse version.
+
 Undo is the apply run backwards, out of a record written **before** the apply
 moved anything — so it survives a crash, and it works after the rehearsal
 itself has been discarded or pruned. It is one transaction, and it refuses
@@ -141,7 +172,7 @@ away to be convenient.
 
 Three properties worth knowing before you rely on it:
 
-- **One level deep.** There is one record per repository, so applying again
+- **One level deep.** There is one record per originating worktree, so applying again
   overwrites it and a successful undo uses it up. `git rehearse undo <id>`
   refuses if the record is not the apply you meant — which is the only warning
   you can get, since a second `undo` has nothing left to work from.
@@ -149,10 +180,48 @@ Three properties worth knowing before you rely on it:
   commits it moved away from are unreferenced, not deleted, and your reflog
   keeps them for weeks. The rehearsed commits are kept too, under
   `refs/rehearse/<id>/*`, so undoing does not orphan them.
-- **The record is a file you can use yourself.** Every line in
+- **The record is a file you can use yourself.** Every ref line in
   `.git/rehearse-undo` is a complete `git update-ref` argument list — paste one
   after `git update-ref` and that ref goes back, with git refusing if it has
   moved on since.
+
+### If Apply is interrupted
+
+Apply writes a durable, synced journal in `.git/rehearse-apply` before it
+fetches objects or changes a ref. If the process is killed, inspect the real
+state without repeating Apply. The JSON in this example is abbreviated to
+show only the recovery state and available actions:
+
+```console
+$ git rehearse --json recover
+{"state":"after_ref_change","can_complete":true,"can_rollback":true}
+$ git rehearse recover --complete 1786178829-00
+```
+
+Use `--rollback` when the status shows a safe ref-applied endpoint. A journal
+whose refs, index, or files no longer match either endpoint is reported as
+ambiguous; Apply, Undo, and further rehearsal mutations remain refused until
+the state is resolved by hand. A damaged journal is likewise preserved and
+blocked rather than overwritten.
+The journal includes an integrity checksum; edits to its recorded recovery
+data are refused even when the file still contains valid JSON. Successful
+JSON recovery actions report `state: "none"` with both actions disabled.
+Pending recovery identifies `operation: "apply"` or `operation: "undo"`:
+completion finishes that operation, while rollback reverses it.
+An externally changed Undo record also blocks recovery and is preserved.
+
+Rollback also records its intent before changing refs. If rollback is
+interrupted, recovery reports `rolling_back`; use `recover --rollback` again
+to finish from the verified state. Changed files or refs still block recovery.
+
+Interrupted Apply also protects the original and reviewed snapshots of tracked
+files and the index. `recover --complete` transplants the reviewed carry result;
+`recover --rollback` restores the original file contents and staging. Recovery
+recognizes the gap after the branch reset and between restoring files and the
+index. Snapshots remain protected until recovery finishes. Later external edits
+or untracked/ignored collisions block recovery; partial file writes that do not
+match a recorded state remain ambiguous. Older journals without an original
+local snapshot cannot roll back carried work automatically.
 
 ### When it conflicts
 
@@ -255,12 +324,13 @@ carried  1 uncommitted path(s): config.toml
 Four things worth knowing:
 
 - **Untracked files are left alone** — not carried, not touched. They are not in
-  a stash without `-u`, and git was never going to destroy them.
+  a stash without `-u`. Apply and recovery refuse untracked or ignored paths
+  that a checkout would replace.
 - **Apply refuses if your worktree has changed since.** What the report promised
   to put back was rehearsed; anything you typed afterwards was not.
-- **Everything comes back unstaged**, in your worktree, exactly where
-  `git stash pop` without `--index` would leave it. A transplanted tree does not
-  carry the staged/unstaged distinction.
+- **Apply preserves the reviewed sandbox index and file contents.** The initial
+  replay normally leaves carried changes unstaged. If you stage a conflict
+  resolution before Continue, Apply preserves that reviewed staging too.
 - **`undo` refuses while those changes are in the way**, because rewinding the
   branch means `git reset --hard` and that would eat them. Stash them, undo,
   put them back.
@@ -299,18 +369,24 @@ git rehearse show [<id>]          print a rehearsal's report again
 git rehearse continue [<id>]      carry on a stopped one, once it is resolved
 git rehearse apply [<id>]         transplant a rehearsal into the real repo
 git rehearse undo [<id>]          put the refs back where the last apply found them
+git rehearse undo [<id>] --check  inspect current Undo availability without mutation
+git rehearse recover [<id>]       inspect an interrupted apply or undo
+git rehearse recover --complete|--rollback [<id>]
+                                 finish or roll back the recorded operation
 git rehearse discard [<id>|--all] throw one, or all, away
 ```
 
 `<id>` can be any unambiguous prefix. Leave it out and the most recent
 rehearsal is meant. `undo` is the exception: it takes an id only to insist
-which apply you mean, because there is one undo record per repository and it
+which apply you mean, because there is one undo record per originating worktree and it
 always describes the most recent one.
+`recover` uses the repository's current recovery journal; its optional id
+checks which rehearsal that journal belongs to.
 
 | option | |
 |---|---|
 | `--apply` | apply without asking |
-| `--keep` | keep without asking |
+| `--keep` | keep durably without asking |
 | `--json` | one JSON document on stdout instead of the report |
 | `--stat-only` | the report without the before/after graphs |
 | `--todo <file>` | drive an interactive rebase from a prepared todo |
@@ -402,6 +478,27 @@ So the loop a program runs is `rehearse` → read `conflicts` → resolve them u
 `sandbox` → `continue` → read `drift_unexpected` → `apply`, with the real
 repository untouched until that last step.
 
+`list` and `show` include the exact rehearsal id, originating worktree,
+repository identity, checkout and pre-state refs, lifecycle, storage paths,
+and execution state. Text and JSON output use the same shared-repository
+identity; if the origin cannot be resolved, text reports `unavailable` and
+JSON reports `null`. A rehearsal whose process ended before writing a result
+is reported as `incomplete`; it is never treated as a clean rehearsal or made
+applyable by inference. Supplied management IDs must be exact or an unambiguous
+prefix; omitting the ID keeps the existing most-recent-rehearsal behavior.
+`list` also reports `active`: live process ownership is separate from the last
+recorded execution result. While a rehearsal is active, `show` returns its
+management metadata with `active: true` instead of analyzing a changing sandbox.
+Discard refuses active rehearsals (exit 4), and age pruning skips them. Ownership
+covers construction, Continue, analysis, and reporting, and the operating system
+releases it if the CLI exits or crashes. Other rehearsals remain usable. Inspection
+is advisory: always use discard's result as the authoritative cleanup decision.
+Recovery reservations still protect interrupted Apply operations. Small lock files
+remain in the cache after removal so concurrent processes always lock the same file.
+
+The added management fields are optional extensions to schema 1: consumers
+reading output from older versions must tolerate their absence.
+
 ## For coding agents
 
 The tools that stop an agent wrecking your history all work by **blocking**:
@@ -491,8 +588,8 @@ Principle 5 is *refuse loudly rather than guess*. All of these exit `4` with an
 explanation rather than doing something approximate:
 
 a bare repository · a shallow clone · a repository with submodules · one using
-Git LFS · one with multiple worktrees · one with no commits yet · and, at apply
-time, a repository whose refs have moved since the rehearsal, or whose worktree
+Git LFS · one with no commits yet · and, at apply
+time, a repository whose relevant refs have moved since the rehearsal, or whose worktree
 no longer holds the uncommitted changes the rehearsal carried.
 
 A dirty worktree used to head that list. It is now carried through the
@@ -503,20 +600,98 @@ different apply than the one you named, a ref that has moved since that apply,
 a worktree with uncommitted changes it would have to rewind, and a branch that
 undoing would delete while you are standing on it.
 
+## Multiple worktrees
+
+Rehearse from the main worktree or a linked worktree using the same commands.
+Each worktree retains its own rehearsal list and Undo record. Opening another
+worktree does not reassign a rehearsal; Apply always targets its recorded origin.
+The JSON repository identity is shared, while the origin worktree remains explicit.
+
+Apply, Undo, and recovery refuse to move a branch checked out in another worktree.
+This includes branches retained by a paused rebase or bisect. They recheck
+occupancy before mutation and refuse missing or ambiguous worktree
+registrations. Other worktrees' files and indices are left alone. Rehearsals may
+run independently; shared mutations use one repository lock. An interrupted Apply
+or Undo blocks further mutations across the repository until recovery is performed
+from its original worktree.
+
+Simple merge, rebase, and cherry-pick operations with one explicit local branch
+check that branch, the original checkout, and all changed branches. Independent
+results can therefore be applied in sequence; an overlapping result becomes stale
+and stays available for reference. Complex revision expressions and arbitrary
+commands conservatively check every recorded branch. Git checks expected old ref
+values in the transaction, including unchanged branch dependencies; external Git
+processes are also checked before updating the origin's files. Prepared Git
+transactions lock existing worktree HEADs during the final occupancy checks;
+observed changes to the worktree registry also cause refusal. Git has no shared
+lock for new worktree registrations, so avoid adding or removing worktrees during
+Apply, Undo, or recovery. Mutation requires Git support
+for transactional symbolic-ref verification; older Git versions refuse safely
+and need upgrading.
+
+Supported older rehearsals and recovery journals without durable origin
+information remain readable but cannot authorize mutation. Keep their sandboxes
+for reference and create a new rehearsal; do not discard an unresolved recovery
+journal.
+
 ## Where things live
 
 Sandboxes go in your cache directory — `~/Library/Caches/git-rehearse` on
 macOS, `%LOCALAPPDATA%\git-rehearse` on Windows, `$XDG_CACHE_HOME` or
 `~/.cache/git-rehearse` elsewhere. Override with `GIT_REHEARSE_CACHE_DIR`.
 
-A kept rehearsal is pruned after seven days. A discarded one is gone
-immediately. The clone hardlinks your object store rather than copying it, so
+A rehearsal explicitly kept with `--keep` is durable until you explicitly
+discard it. Retention is saved before the rehearsed Git command starts, so an
+interruption during execution or in its editor does not make it expire.
+Transient rehearsals and interrupted clone directories are pruned
+after seven days. Schema 1 metadata is migrated while preserving optional
+extension fields and the exact original bytes in `meta.json.bak`; schema 2
+metadata remains readable and unchanged, but both schemas lack durable origin
+and cannot authorize automatic Apply. Migration takes rehearsal ownership and
+never replaces an existing backup. If backup creation or flushing fails,
+migration is refused and the existing metadata and sandbox edits remain
+untouched. Check the reported permissions or free-space problem; preserve and
+compare any conflicting or partial backup before moving it aside and retrying.
+Unknown or damaged metadata and rehearsals reserved by an interrupted apply are
+preserved. A discarded one is gone immediately. The clone hardlinks your object
+store rather than copying it, so
 a sandbox costs almost nothing on disk, and deleting one can never touch your
 real repository's objects.
 
 Each sandbox is made **inert** at creation: remotes stripped, so an accidental
 `push` inside it has nowhere to go, and `core.hooksPath` pointed at an empty
-directory, so your `pre-commit` does not fire for a rehearsal.
+directory. Every Git command started by git-rehearse also enforces hook
+suppression, including creation, Continue, Apply, Undo and recovery and their
+Git subprocesses. Local, global, inherited and command-line `core.hooksPath`
+settings cannot enable hooks for these operations. There is no `--with-hooks`
+opt-in. Reports state “Repository hooks were not run”; JSON reports expose
+`"repository_hooks": "disabled"`. Git aliases are refused because their later
+configuration expansion can re-enable hooks; rehearse the underlying Git
+command instead.
+
+Signing settings and custom merge drivers remain effective. Merge, rebase,
+cherry-pick and Continue use Git's effective signing policy, including SSH
+file keys and `gpg.ssh.defaultKeyCommand`. Missing keys or failing signing
+programs produce Git's error on stderr and a non-success result; there is no
+unsigned fallback. A stopped sequencer remains inspectable but cannot be
+applied. In JSON mode terminal editors are suppressed; interactive rebase
+requires a prepared `--todo` file. Signing programs can still show their own
+system dialogs.
+
+Rehearsal, Show and Continue JSON include `signatures`, an array of
+`{ "sha": "…", "present": true, "verification": "not_checked", "trust": "not_checked" }`.
+It covers the new tip and commits introduced relative to the old tip of each
+changed ref, deduplicated by object ID (including intermediate rewritten commits
+and commits brought in by a merge or fast-forward). Deleted refs contribute no
+commits; no changed refs means an empty array. Presence is read from the actual
+commit headers, not the signing configuration or commit message. No verifier is
+run: **presence does not establish validity or trust**. Verify independently in
+the sandbox if required. Show and Continue inspect the current result again.
+Apply transfers these exact objects without re-signing or rerunning the command.
+
+The sandbox does not provide operating-system isolation: signing programs, merge drivers, editors and arbitrary
+commands can still execute programs. Git commands you run yourself outside
+git-rehearse retain their normal hook behavior.
 
 Repository-local `merge.*` settings are carried alongside tracked
 `.gitattributes`, so custom merge drivers run as they do in the real repository.
@@ -570,3 +745,15 @@ pull request.
 ## License
 
 [MIT](LICENSE)
+
+### Saved conflict resolutions (rerere)
+
+Rehearsals copy effective rerere settings and the existing `rr-cache` into an
+independent sandbox cache, including when starting from a linked worktree. A
+missing cache is normal; unreadable caches or unsupported cache entries stop
+creation with an error. New resolutions learned while resolving or continuing
+a rehearsal stay in the sandbox. Apply transfers the reviewed commits and files,
+but never copies those resolutions back to the original cache. Reports explain
+this limit; JSON exposes `"rerere_resolution_transfer": "sandbox_only"`.
+Custom merge drivers remain active; the sandbox does not isolate arbitrary
+programs those drivers execute.

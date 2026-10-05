@@ -78,8 +78,9 @@ git to pick it up as a subcommand anyway.
    real repo could diverge (timestamps, interactive input, hooks) and would discard any
    conflict resolution done in the sandbox. This is the core correctness invariant.
 3. **The sandbox is disposable and inert.** No remotes (stripped at creation — an
-   accidental `push` inside the sandbox must have nowhere to go), hooks disabled by
-   default (`--with-hooks` to opt in), lives under the user cache dir, auto-pruned.
+   accidental `push` inside the sandbox must have nowhere to go), repository hooks
+   disabled throughout rehearsal and Apply (no hook opt-in is available), lives
+   under the user cache dir, auto-pruned.
 4. **Zero telemetry, zero network, zero spend.** Matches every other maximalcode repo.
    The tool itself never phones anywhere; CI is GitHub Actions free tier.
 5. **Refuse loudly rather than guess.** Dirty worktree in v1.0 → refuse with a clear
@@ -272,6 +273,46 @@ interactive rebase to a real repo with zero surprises.
    one place a program is reading. Enforced in a single guard inside `report::graphs`, so
    no caller can spawn the walks by forgetting. Report paging and colour config are still
    unbuilt.
+
+5. **Clean Apply recovery: BUILT** (#88). A durable, atomically published phase
+   journal records origin, old/new refs, worktree endpoints, and previous/new Undo data
+   before mutations. `git rehearse recover [<id>]` reports observed progress from
+   the journal and actual refs/index/files; `--complete` and `--rollback` act only
+   on a verified endpoint and never repeat the rehearsed command. Rollback records
+   its direction before changing refs so another interruption can also be resumed.
+   Apply, Undo, snapshotting, and sandbox removal share repository ownership;
+   unresolved recovery blocks affected mutations and preserves the journal and
+   sandbox beyond the normal cache lifetime. Changed state, corrupt journals, and
+   storage failures produce explained refusals. Undo uses the same journal protocol.
+   Public JSON exposes recovery state and available actions.
+6. **Carried-work recovery: BUILT** (#89). Protected stash snapshots retain the
+   original and reviewed index and tracked-file trees. Completion transplants the
+   reviewed trees; rollback restores the original staging and file bytes. Recovery
+   recognizes the reset and carry-checkout boundaries, including interruptions of
+   rollback itself, and refuses external edits or untracked/ignored collisions.
+   Snapshots are retained until completion; unknown partial writes stay blocked.
+
+7. **Multiple worktrees: BUILT** (#90). This supersedes the v1.0 blanket refusal.
+   Rehearsals retain their worktree-specific storage and durable administrative
+   origin, with a separate shared-repository identity. Apply, Undo and recovery
+   coordinate through one common-directory lock/journal and refuse foreign branch
+   occupancy or lost origin. Simple explicit single-branch operations validate
+   their relevant branches; complex commands retain the conservative full branch
+   snapshot. Dependency refs and changed refs are checked in the Git transaction.
+   Independent results remain usable; overlapping results are preserved but refused.
+   Older metadata without durable origin cannot authorize Apply or recovery.
+
+8. **Bound Undo and crash recovery: BUILT** (#91). Undo records name the concrete
+   Apply by its rehearsal ID and timestamp, with durable worktree path and shared
+   repository/administrative identity. `undo [<id>] --check` exposes current
+   availability without acknowledging recovery; execution rechecks origin, branch
+   occupancy, expected refs, tracked work and untracked/ignored collisions.
+   Version 1 records remain available for manual recovery but do not authorize
+   automatic mutation. Undo journal transitions cover ref restoration, worktree
+   updates, durable record removal and completion; already restored endpoints are
+   acknowledged without repeating the inverse transaction. Real JSON CLI tests
+   cover main/linked origins, every Undo boundary, interrupted rollback, external
+   work and competing Apply processes.
 
 ## v2.0 — agent mode (the strategic release)
 

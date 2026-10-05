@@ -6,7 +6,11 @@
 
 mod support;
 
+use git_rehearse::cache;
+use git_rehearse::execute::Outcome;
+use git_rehearse::preflight;
 use git_rehearse::sandbox;
+use std::process::Command;
 use support::Fixture;
 
 /// 0 clean, 1 internal, 2 stopped, 3 failed, 4 refused.
@@ -29,6 +33,45 @@ fn a_clean_rehearsal_prints_a_report_and_exits_zero() {
     );
     assert!(out.contains("refs/heads/main"), "{out}");
     assert!(out.contains("graph  refs/heads/main"), "{out}");
+}
+
+#[test]
+fn listing_from_an_unrelated_repo_keeps_an_unavailable_origin_and_prunes_others() {
+    let fixture = Fixture::new();
+    let original_plan = fixture.plan(
+        &["merge", "feature"],
+        git_rehearse::sandbox::Checkout::Branch("main".to_owned()),
+    );
+    let unavailable = sandbox::create(fixture.cache(), &original_plan, 1_786_248_000)
+        .expect("old sandbox is created");
+    let unavailable_root = unavailable.root().to_owned();
+
+    let unrelated = fixture.sibling("unrelated");
+    let unrelated_plan = preflight::run(&unrelated)
+        .expect("unrelated repository passes preflight")
+        .into_plan(vec![
+            "branch".to_owned(),
+            "cache-only".to_owned(),
+            "main".to_owned(),
+        ]);
+    let available = sandbox::create(fixture.cache(), &unrelated_plan, 1_786_248_000)
+        .expect("another old sandbox is created");
+    let available_root = available.root().to_owned();
+
+    let moved_original = fixture.base().join("original-moved");
+    std::fs::rename(fixture.repo(), &moved_original).expect("origin repository is moved");
+    let output = Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
+        .current_dir(&unrelated)
+        .env("GIT_REHEARSE_CACHE_DIR", fixture.cache())
+        .args(["--json", "list"])
+        .output()
+        .expect("list process runs");
+
+    assert_eq!(output.status.code(), Some(0), "list succeeds: {output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("listing JSON");
+    assert_eq!(document["pruned"], serde_json::json!([available.id()]));
+    assert!(unavailable_root.exists(), "unavailable origin is retained");
+    assert!(!available_root.exists(), "available origin is still pruned");
 }
 
 #[test]
@@ -268,6 +311,27 @@ fn an_unknown_command_is_refused_with_a_way_forward() {
 }
 
 #[test]
+fn an_unknown_recovery_option_is_refused_with_an_explanation() {
+    let fixture = Fixture::new();
+
+    let (code, _, err) = fixture.rehearse(&["recover", "--complet"]);
+
+    assert_eq!(code, REFUSED);
+    assert!(err.contains("--complet"), "{err}");
+}
+
+#[test]
+fn recovery_actions_without_a_journal_are_explained_refusals() {
+    let fixture = Fixture::new();
+
+    for action in ["--complete", "--rollback"] {
+        let (code, _, err) = fixture.rehearse(&["recover", action]);
+        assert_eq!(code, REFUSED, "{action}: {err}");
+        assert!(err.contains("no interrupted apply"), "{action}: {err}");
+    }
+}
+
+#[test]
 fn without_a_terminal_a_rehearsal_is_discarded_unless_asked_otherwise() {
     let fixture = Fixture::new();
     fixture.commit_file("other.txt", "other\n", "four");
@@ -492,6 +556,42 @@ fn discard_all_empties_the_cache_for_this_repository() {
     assert!(listed.contains("no rehearsals"), "{listed}");
 }
 
+#[test]
+fn discarding_one_id_leaves_other_retained_rehearsals_intact() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let (_, first_out, first_err) = fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+    let first = first_out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("first rehearsal id")
+        .to_owned();
+    let (_, second_out, second_err) =
+        fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+    let second = second_out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("second rehearsal id")
+        .to_owned();
+    assert_ne!(
+        first, second,
+        "retained rehearsals need distinct ids: {first_err}{second_err}"
+    );
+
+    let (code, _, err) = fixture.rehearse(&["discard", &first]);
+    assert_eq!(code, CLEAN, "{err}");
+    let (code, listed, err) = fixture.rehearse(&["list"]);
+    assert_eq!(code, CLEAN, "{err}");
+    assert!(
+        !listed.contains(&first),
+        "selected rehearsal remains: {listed}"
+    );
+    assert!(
+        listed.contains(&second),
+        "other rehearsal was removed: {listed}"
+    );
+}
+
 /// Every `git log --graph` the run spawned, counted off git's own trace.
 fn graph_walks(trace: &str) -> usize {
     trace
@@ -621,6 +721,16 @@ fn normalised(text: &str) -> serde_json::Value {
         for entry in refs {
             if let Some(entry) = entry.as_object_mut() {
                 entry.remove("after");
+            }
+        }
+    }
+    if let Some(signatures) = object
+        .get_mut("signatures")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for entry in signatures {
+            if let Some(entry) = entry.as_object_mut() {
+                entry.remove("sha");
             }
         }
     }
@@ -882,4 +992,24 @@ fn continuing_something_that_is_not_stopped_is_refused() {
 
     assert_eq!(code, REFUSED, "{err}");
     assert!(err.contains("nothing in progress"), "{err}");
+}
+
+#[test]
+fn refusing_to_continue_preserves_the_completed_result() {
+    let fixture = Fixture::new();
+    fixture.commit_file("other.txt", "other\n", "four");
+    let (_, out, _) = fixture.rehearse(&["--keep", "merge", "--no-edit", "feature"]);
+    let id = out
+        .lines()
+        .find_map(|line| line.strip_prefix("rehearsal  "))
+        .expect("the report names the rehearsal")
+        .to_owned();
+
+    let (code, _, err) = fixture.rehearse(&["continue", &id]);
+
+    assert_eq!(code, REFUSED, "{err}");
+    assert!(err.contains("nothing in progress"), "{err}");
+    let sandbox = sandbox::find(fixture.cache(), &cache::repo_id(fixture.repo()), Some(&id))
+        .expect("the completed rehearsal remains findable");
+    assert_eq!(sandbox.meta().result, Some(Outcome::Clean));
 }

@@ -39,13 +39,28 @@ use crate::{Error, Result, cache, carry, git};
 /// exist, an unreadable repository), [`Error::Io`] for filesystem failures,
 /// [`Error::Sandbox`] if the sandbox cannot be made inert.
 pub fn create(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result<Sandbox> {
+    let mut sandbox = create_executing(cache_root, plan, now_unix)?;
+    sandbox.ownership = None;
+    Ok(sandbox)
+}
+
+/// Creates a sandbox and retains exclusive ownership through execution and report.
+///
+/// # Errors
+/// Returns the same construction errors as [`create`].
+pub fn create_executing(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result<Sandbox> {
     let repo_id = cache::repo_id(&plan.repo);
     let repo_dir = cache_root.join(&repo_id);
     fs::create_dir_all(&repo_dir).map_err(Error::io(&repo_dir))?;
+    crate::test_hooks::pause("GIT_REHEARSE_PAUSE_EXECUTION_AT", "before-claim");
 
-    let (id, root) = claim_directory(&repo_dir, now_unix)?;
+    let (id, root, ownership) = claim_directory(&repo_dir, &plan.repo, now_unix)?;
     match build(&root, plan, &repo_id, id.clone(), now_unix) {
-        Ok(meta) => Ok(Sandbox { root, meta }),
+        Ok(meta) => Ok(Sandbox {
+            root,
+            meta,
+            ownership: Some(std::sync::Arc::new(ownership)),
+        }),
         Err(err) => {
             // Best effort: if cleanup also fails, the original failure is the
             // one worth reporting, and prune will collect the leftovers.
@@ -57,15 +72,38 @@ pub fn create(cache_root: &Path, plan: &Plan, now_unix: u64) -> Result<Sandbox> 
 
 /// Claims the next free rehearsal directory and returns its id.
 ///
-/// Exclusive directory creation *is* the id allocator: no lock file, no
-/// randomness, and two rehearsals started in the same second cannot collide,
+/// Exclusive directory creation is the id allocator: no randomness, and
+/// two rehearsals started in the same second cannot collide,
 /// because whoever loses the `create_dir` race simply takes the next suffix.
-fn claim_directory(repo_dir: &Path, now_unix: u64) -> Result<(String, PathBuf)> {
+/// Applied rehearsals also reserve their ids through their retained object refs,
+/// even after their sandbox directory has been removed.
+fn claim_directory(
+    repo_dir: &Path,
+    repo: &Path,
+    now_unix: u64,
+) -> Result<(String, PathBuf, super::ownership::Ownership)> {
     for attempt in 0..100 {
-        let id = format!("{now_unix}-{attempt:02}");
+        let origin = crate::worktree::Origin::capture(repo)?;
+        // A full main-worktree ID must never be a prefix of a linked ID.
+        let id = if origin.git_dir == origin.common_dir {
+            format!("{now_unix}-{attempt:02}")
+        } else {
+            format!(
+                "{now_unix}-w{}-{attempt:02}",
+                crate::cache::repo_id(&origin.git_dir)
+            )
+        };
+        if !git::refs(repo, &format!("refs/rehearse/{id}/"), 0)?.is_empty() {
+            continue;
+        }
         let root = repo_dir.join(&id);
+        let ownership = match super::ownership::Ownership::acquire(&root) {
+            Ok(ownership) => ownership,
+            Err(Error::Refused(_)) => continue,
+            Err(error) => return Err(error),
+        };
         match fs::create_dir(&root) {
-            Ok(()) => return Ok((id, root)),
+            Ok(()) => return Ok((id, root, ownership)),
             // Taken already — try the next suffix.
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(Error::Io(root, err)),
@@ -85,6 +123,7 @@ fn claim_directory(repo_dir: &Path, now_unix: u64) -> Result<(String, PathBuf)> 
 /// would leave the sandbox holding line endings the real repository would
 /// never have produced.
 fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> Result<Meta> {
+    crate::test_hooks::pause("GIT_REHEARSE_PAUSE_EXECUTION_AT", "construction");
     let hooks = root.join(HOOKS_DIR);
     fs::create_dir(&hooks).map_err(Error::io(&hooks))?;
     let worktree = root.join(WORKTREE_DIR);
@@ -94,6 +133,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
     strip_remotes(&worktree)?;
     disable_hooks(&worktree, &hooks)?;
     carry_config(&plan.repo, &worktree)?;
+    super::rerere::copy(&plan.repo, &worktree)?;
     checkout(&worktree, &plan.checkout)?;
     // After the hooks are disabled, because this step runs git in the sandbox
     // and a rehearsal fires none of the user's hooks — and after the checkout,
@@ -108,6 +148,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
         id,
         repo_id: repo_id.to_owned(),
         repo_path: plan.repo.clone(),
+        origin: Some(crate::worktree::Origin::capture(&plan.repo)?),
         command: plan.command.clone(),
         checkout: plan.checkout.clone(),
         pre_state: plan.pre_state.clone(),
@@ -115,6 +156,7 @@ fn build(root: &Path, plan: &Plan, repo_id: &str, id: String, now_unix: u64) -> 
         created_unix: now_unix,
         status: super::Status::Fresh,
         result: None,
+        extensions: std::collections::BTreeMap::new(),
     };
     meta.write(root)?;
     Ok(meta)
@@ -264,6 +306,8 @@ fn disable_hooks(worktree: &Path, hooks: &Path) -> Result<()> {
 /// right way round: a loud exit 3 is recoverable, a quiet signature downgrade
 /// is not.
 ///
+/// - rerere booleans and cache retention settings: copied alongside an
+///   independent cache so existing resolutions and Git defaults remain effective.
 /// - the `merge.*` group: `.gitattributes` names a driver in tracked content,
 ///   but the driver's command and options live in local config, so every local
 ///   `merge.*` entry is carried as well. Git's NUL-delimited output keeps a
@@ -279,13 +323,16 @@ const CARRIED_CONFIG: &[&str] = &[
     "user.email",
     "core.autocrlf",
     "core.eol",
+    "rerere.enabled",
+    "rerere.autoupdate",
+    "gc.rerereResolved",
+    "gc.rerereUnresolved",
     "commit.gpgsign",
     "tag.gpgsign",
     "user.signingkey",
     "gpg.format",
-    "gpg.program",
-    "gpg.openpgp.program",
     "gpg.ssh.program",
+    "gpg.ssh.defaultKeyCommand",
     "gpg.x509.program",
 ];
 
@@ -304,12 +351,27 @@ const CARRIED_CONFIG: &[&str] = &[
 /// to commit without an identity.
 fn carry_config(repo: &Path, worktree: &Path) -> Result<()> {
     for key in CARRIED_CONFIG {
-        if let Ok(value) = git::run(repo, ["config", "--get", key])
-            && !value.is_empty()
-        {
-            git::run(worktree, ["config", key, &value])?;
+        // A present empty value can deliberately override global config.
+        // Only exit 1 means absent; other errors must never disable signing.
+        let mut query = vec!["config", "--null"];
+        if matches!(
+            *key,
+            "commit.gpgsign" | "tag.gpgsign" | "rerere.enabled" | "rerere.autoupdate"
+        ) {
+            // A valueless boolean means true; an explicit empty string means
+            // false. Let Git distinguish them before writing the copy.
+            query.push("--type=bool");
         }
+        query.extend(["--get", key]);
+        let value = match git::run(repo, query) {
+            Ok(value) => value.strip_suffix('\0').unwrap_or(&value).to_owned(),
+            Err(Error::Git { code: Some(1), .. }) => continue,
+            Err(error) => return Err(error),
+        };
+        let value = signing_key_path(repo, key, value)?;
+        git::run(worktree, ["config", key, &value])?;
     }
+    carry_openpgp_program(repo, worktree)?;
     carry_merge_config(repo, worktree)?;
     Ok(())
 }
@@ -362,5 +424,47 @@ fn checkout(worktree: &Path, target: &super::Checkout) -> Result<()> {
             git::run(worktree, ["checkout", "--quiet", "--detach", sha, "--"])?
         }
     };
+    Ok(())
+}
+
+/// SSH file keys are resolved from the original checkout, including untracked
+/// keys outside the clone. Inline public keys remain Git's own syntax.
+fn signing_key_path(repo: &Path, key: &str, value: String) -> Result<String> {
+    if key != "user.signingkey"
+        || value.is_empty()
+        || value.starts_with("key::")
+        || value.starts_with("ssh-")
+        || git::run(repo, ["config", "--get", "gpg.format"])
+            .ok()
+            .as_deref()
+            != Some("ssh")
+    {
+        return Ok(value);
+    }
+    let expanded = git::run(repo, ["config", "--path", "--get", key])?;
+    Ok(repo.join(expanded).to_string_lossy().into_owned())
+}
+
+/// Git treats these two names as aliases, so their configuration order matters.
+/// Copying each name independently could select an older, different signer.
+fn carry_openpgp_program(repo: &Path, worktree: &Path) -> Result<()> {
+    let values = match git::run(
+        repo,
+        [
+            "config",
+            "--null",
+            "--get-regexp",
+            "^gpg\\.(program|openpgp\\.program)$",
+        ],
+    ) {
+        Ok(values) => values,
+        Err(Error::Git { code: Some(1), .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in values.split('\0').filter(|entry| !entry.is_empty()) {
+        let (_, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        // Write one canonical alias to preserve Git's last-value-wins behavior.
+        git::run(worktree, ["config", "gpg.openpgp.program", value])?;
+    }
     Ok(())
 }
