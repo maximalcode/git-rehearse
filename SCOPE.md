@@ -329,11 +329,20 @@ codes and `--todo` stable.
   stderr, because `Auto-merging …` on stdout breaks the one-document rule; and `--json`
   never prompts, so `decision` records which unattended answer was given. Every command
   takes it, not just rehearsals. **There is no
-  separate "apply token"**; an earlier draft listed one and never said what it was. The
-  sandbox id already names a rehearsal, and the refs-moved race check reads the
-  pre-state out of `meta.json` itself. Handing the caller a fingerprint to pass back to
-  `apply` would move that check out of the tool and into the agent, which is the
-  opposite of principle 5.
+  separate "apply token"**; an earlier draft listed one and never said what it was. U1
+  supersedes that undefined wording with a reviewed-result contract: finished retained
+  JSON includes an opaque versioned `result_revision` (`rr1:<git-object-id>`) and
+  authoritative `result_endpoints` for the originating worktree, checkout, frozen
+  pre-state, resulting refs, and carried objects. `apply --expected-result-revision`
+  acquires ownership, calculates the candidate once, compares it, and transplants that
+  same candidate. Missing, malformed or changed revisions refuse before refs, files,
+  recovery journal or retained lifecycle changes. Existing unconditional `apply` syntax
+  remains compatible and is not revision-bound. Cooperating git-rehearse processes
+  respect ownership; arbitrary filesystem writes that bypass it are outside this
+  concurrency boundary. Active, incomplete, stopped or failed entries, and
+  entries with unreadable carried endpoints, omit the revision/endpoints and
+  publish `result_unavailable`; listing claims and reloads rehearsal ownership
+  before calculating a revision.
 - **MCP server:** `git-rehearse mcp` (stdio). Tools: `rehearse(command, repo)`,
   `inspect(id)`, `resolve_file(id, path, content)`, `continue(id)`, `apply(id)`,
   `discard(id)` — mirroring the CLI, `continue` included, since a stopped rehearsal is

@@ -279,6 +279,15 @@ pub struct Report {
     /// Present only when `decision` is `applied`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied: Option<AppliedReport>,
+    /// Opaque revision binding this report to the exact retained result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_revision: Option<String>,
+    /// Frozen, public content endpoints for the reviewed result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_endpoints: Option<crate::result::EndpointDescriptors>,
+    /// Why a revision/endpoints could not be published for this entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_unavailable: Option<String>,
 }
 
 /// One entry of `git rehearse --json list`.
@@ -309,6 +318,15 @@ pub struct Entry {
     pub execution: String,
     pub lifecycle: String,
     pub storage: Storage,
+    /// Opaque revision binding this listing entry to its retained result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_revision: Option<String>,
+    /// Frozen, public content endpoints for the retained result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_endpoints: Option<crate::result::EndpointDescriptors>,
+    /// Why a revision/endpoints could not be published for this entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_unavailable: Option<String>,
 }
 
 /// The schema-versioned document returned by `show` when execution was
@@ -344,7 +362,27 @@ impl Entry {
     /// One listing entry for a rehearsal in the cache.
     #[must_use]
     pub fn of(sandbox: &Sandbox) -> Self {
-        let meta = sandbox.meta();
+        // A listing races with a command that may be recording its result.
+        // Claim a cloned handle before deriving any authoritative revision;
+        // when another process owns the rehearsal, describe it but omit the
+        // revision and endpoints rather than treating an unlocked read as a
+        // frozen result.
+        let initially_active = sandbox.is_active();
+        let mut owned = sandbox.clone();
+        let owns_rehearsal = owned.claim_execution().is_ok();
+        let view = if owns_rehearsal { &owned } else { sandbox };
+        let meta = view.meta();
+        let (candidate, result_unavailable) = if owns_rehearsal {
+            match crate::result::calculate(view) {
+                Ok(candidate) => (Some(candidate), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (
+                None,
+                Some("result unavailable while the rehearsal is active".to_owned()),
+            )
+        };
         Self {
             id: meta.id.clone(),
             command: meta.command.clone(),
@@ -353,7 +391,7 @@ impl Entry {
             repository_id: repository_identity(meta),
             checkout: meta.checkout.clone(),
             pre_state: meta.pre_state.clone(),
-            sandbox: sandbox.worktree().display().to_string(),
+            sandbox: view.worktree().display().to_string(),
             // Spelled out rather than derived from `Status`: that enum is
             // `meta.json`'s, and a rename there must not reach the wire.
             status: match meta.status {
@@ -361,12 +399,17 @@ impl Entry {
                 Status::Kept => "kept",
             }
             .to_owned(),
-            active: sandbox.is_active(),
+            active: initially_active,
             created_unix: meta.created_unix,
             outcome: meta.result.as_ref().map(kind_of),
             execution: execution(meta),
             lifecycle: lifecycle(meta),
-            storage: storage(sandbox),
+            storage: storage(view),
+            result_revision: candidate
+                .as_ref()
+                .map(|candidate| candidate.revision.clone()),
+            result_endpoints: candidate.map(|candidate| candidate.endpoints),
+            result_unavailable,
         }
     }
 }
@@ -392,6 +435,8 @@ pub struct ApplyResult {
     pub repository: String,
     pub exit_code: u8,
     pub applied: AppliedReport,
+    pub result_revision: String,
+    pub result_endpoints: crate::result::EndpointDescriptors,
 }
 
 /// `git rehearse --json undo`.
@@ -618,6 +663,10 @@ impl Report {
         applied: Option<&Applied>,
     ) -> Self {
         let meta: &Meta = sandbox.meta();
+        let (candidate, result_unavailable) = match crate::result::calculate(sandbox) {
+            Ok(candidate) => (Some(candidate), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         Self {
             schema: SCHEMA,
             rerere_resolution_transfer: "sandbox_only",
@@ -654,6 +703,11 @@ impl Report {
                 Choice::Discard => Decision::Discarded,
             },
             applied: applied.map(applied_report),
+            result_revision: candidate
+                .as_ref()
+                .map(|candidate| candidate.revision.clone()),
+            result_endpoints: candidate.map(|candidate| candidate.endpoints),
+            result_unavailable,
         }
     }
 }
@@ -892,6 +946,9 @@ mod tests {
             can_apply: false,
             decision: Decision::Kept,
             applied: None,
+            result_revision: None,
+            result_endpoints: None,
+            result_unavailable: None,
         }
     }
 
