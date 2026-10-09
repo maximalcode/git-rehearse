@@ -253,6 +253,14 @@ fn global_expected_revision_refuses_non_apply_before_effects() {
             "continue",
             &id,
         ],
+        vec![
+            "--json",
+            "--apply",
+            "continue",
+            &id,
+            "--expected-result-revision",
+            "bad",
+        ],
     ] {
         let output = fixture.rehearse(&arguments);
         assert_eq!(output.0, 4, "stdout={} stderr={}", output.1, output.2);

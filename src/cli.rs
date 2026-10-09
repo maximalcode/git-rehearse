@@ -324,10 +324,10 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 });
             }
             "list" => parsed!(Command::List),
-            "show" => parsed!(Command::Show { id: id_from(rest) }),
+            "show" => parsed!(Command::Show { id: id_from(rest)? }),
             "continue" => {
                 parsed!(Command::Continue {
-                    id: id_from(rest),
+                    id: id_from(rest)?,
                     decision,
                 });
             }
@@ -438,8 +438,30 @@ fn parse_undo<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Command> {
 }
 
 /// The first non-flag argument left, if any.
-fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Option<String> {
-    rest.into_iter().find(|arg| !arg.starts_with('-')).cloned()
+fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Option<String>> {
+    let arguments: Vec<&String> = rest.collect();
+    if let Some(index) = arguments
+        .iter()
+        .position(|arg| arg.as_str() == "--expected-result-revision")
+    {
+        let revision = arguments
+            .get(index + 1)
+            .copied()
+            .filter(|arg| !arg.starts_with('-'));
+        if revision.is_none() {
+            return Err(Error::Refused(
+                "--expected-result-revision needs a revision".to_owned(),
+            ));
+        }
+        return Err(Error::Refused(
+            "--expected-result-revision is only valid with an explicit apply command".to_owned(),
+        ));
+    }
+    Ok(arguments
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .copied()
+        .cloned())
 }
 
 /// Parses the management-command arguments after `apply`.
@@ -1588,6 +1610,13 @@ mod tests {
                 "--apply",
                 "continue",
                 "1786",
+            ][..],
+            &[
+                "--apply",
+                "continue",
+                "1786",
+                "--expected-result-revision",
+                "bad",
             ][..],
         ] {
             let error =
