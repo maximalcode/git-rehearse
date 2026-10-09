@@ -437,31 +437,22 @@ fn parse_undo<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Command> {
     })
 }
 
-/// The first non-flag argument left, if any.
+/// Parses the optional ID accepted by `show` and `continue`.
 fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Option<String>> {
-    let arguments: Vec<&String> = rest.collect();
-    if let Some(index) = arguments
-        .iter()
-        .position(|arg| arg.as_str() == "--expected-result-revision")
-    {
-        let revision = arguments
-            .get(index + 1)
-            .copied()
-            .filter(|arg| !arg.starts_with('-'));
-        if revision.is_none() {
+    let mut id = None;
+    for arg in rest {
+        if arg.starts_with('-') {
             return Err(Error::Refused(
-                "--expected-result-revision needs a revision".to_owned(),
+                "show and continue accept zero or one rehearsal ID".to_owned(),
             ));
         }
-        return Err(Error::Refused(
-            "--expected-result-revision is only valid with an explicit apply command".to_owned(),
-        ));
+        if id.replace(arg.clone()).is_some() {
+            return Err(Error::Refused(
+                "show and continue accept zero or one rehearsal ID".to_owned(),
+            ));
+        }
     }
-    Ok(arguments
-        .iter()
-        .find(|arg| !arg.starts_with('-'))
-        .copied()
-        .cloned())
+    Ok(id)
 }
 
 /// Parses the management-command arguments after `apply`.
@@ -1557,6 +1548,19 @@ mod tests {
             Command::Show { id: None }
         );
         assert_eq!(
+            parse(&args(&["show", "1786248000-00"])).expect("parses"),
+            Command::Show {
+                id: Some("1786248000-00".to_owned())
+            }
+        );
+        assert_eq!(
+            parse(&args(&["continue", "1786248000-00"])).expect("parses"),
+            Command::Continue {
+                id: Some("1786248000-00".to_owned()),
+                decision: Decision::Ask,
+            }
+        );
+        assert_eq!(
             parse(&args(&["apply", "1786248000-00"])).expect("parses"),
             Command::Apply {
                 id: Some("1786248000-00".to_owned()),
@@ -1595,6 +1599,26 @@ mod tests {
     }
 
     #[test]
+    fn show_and_continue_reject_unknown_flags_and_extra_arguments() {
+        for arguments in [
+            &["show", "--unknown"][..],
+            &["show", "1786", "--unknown"][..],
+            &["continue", "--expected-result-revision=bad", "1786"][..],
+            &["continue", "1786", "--expected-result-revision=bad"][..],
+            &["continue", "extra", "1786"][..],
+            &["continue", "1786", "extra"][..],
+        ] {
+            let error = parse(&args(arguments)).expect_err("extra management arguments refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("accept zero or one rehearsal ID"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn expected_revision_cannot_downgrade_rehearsal_or_continue() {
         for arguments in [
             &[
@@ -1621,10 +1645,10 @@ mod tests {
         ] {
             let error =
                 parse(&args(arguments)).expect_err("conditional mode is explicit apply only");
+            let message = error.to_string();
             assert!(
-                error
-                    .to_string()
-                    .contains("only valid with an explicit apply command"),
+                message.contains("only valid with an explicit apply command")
+                    || message.contains("accept zero or one rehearsal ID"),
                 "{error}"
             );
         }
