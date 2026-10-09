@@ -77,7 +77,7 @@ usage:
   git rehearse list
   git rehearse show [<id>]
   git rehearse continue [<id>]
-  git rehearse apply [<id>]
+  git rehearse apply [--expected-result-revision <revision>] [<id>]
   git rehearse undo [<id>] [--check]
   git rehearse recover [<id>]
   git rehearse recover --complete|--rollback [<id>]
@@ -89,6 +89,8 @@ options (before the command; everything after it belongs to git):
   --json            one JSON document on stdout instead of the report
   --stat-only       the report without the before/after graphs
   --todo <file>     drive an interactive rebase from a prepared todo
+  --expected-result-revision <revision>
+                    require Apply to use the exact reviewed result
   -h, --help        this text
   -V, --version     version
 
@@ -186,6 +188,7 @@ pub enum Command {
     /// Apply a rehearsal.
     Apply {
         id: Option<String>,
+        expected_result_revision: Option<String>,
     },
     /// Put the refs back where the last apply found them.
     ///
@@ -233,23 +236,32 @@ pub enum Decision {
 ///
 /// [`Error::Refused`] with a message worth printing, for anything that is not
 /// a command this version understands.
+#[allow(clippy::too_many_lines)]
 pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut format = Format::Text;
     let mut detail = Detail::Full;
     let mut decision = Decision::Ask;
     let mut todo = None;
+    let mut expected_result_revision = None;
     let mut rest = args.iter();
 
     // Every `return` below goes through this, so the format and the detail
     // reach the caller whichever branch the command falls into.
     macro_rules! parsed {
-        ($command:expr) => {
+        ($command:expr) => {{
+            let command = $command;
+            if expected_result_revision.is_some() && !matches!(&command, Command::Apply { .. }) {
+                return Err(Error::Refused(
+                    "--expected-result-revision is only valid with an explicit apply command"
+                        .to_owned(),
+                ));
+            }
             return Ok(Parsed {
-                command: $command,
+                command,
                 format,
                 detail,
-            })
-        };
+            });
+        }};
     }
 
     while let Some(arg) = rest.next() {
@@ -268,6 +280,21 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                     Error::Refused("--todo needs a file.\nUsage: --todo <file>".to_owned())
                 })?;
                 todo = Some(PathBuf::from(file));
+            }
+            "--expected-result-revision" => {
+                let revision = rest.next().ok_or_else(|| {
+                    Error::Refused("--expected-result-revision needs a revision".to_owned())
+                })?;
+                if revision.starts_with('-') {
+                    return Err(Error::Refused(
+                        "--expected-result-revision needs a revision".to_owned(),
+                    ));
+                }
+                if expected_result_revision.replace(revision.clone()).is_some() {
+                    return Err(Error::Refused(
+                        "--expected-result-revision may be supplied once".to_owned(),
+                    ));
+                }
             }
             // Everything after `--` is git's, whatever it looks like.
             "--" => {
@@ -297,14 +324,27 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 });
             }
             "list" => parsed!(Command::List),
-            "show" => parsed!(Command::Show { id: id_from(rest) }),
+            "show" => parsed!(Command::Show { id: id_from(rest)? }),
             "continue" => {
                 parsed!(Command::Continue {
-                    id: id_from(rest),
+                    id: id_from(rest)?,
                     decision,
                 });
             }
-            "apply" => parsed!(Command::Apply { id: id_from(rest) }),
+            "apply" => {
+                let (id, command_revision) = parse_apply(rest)?;
+                if command_revision.is_some() && expected_result_revision.is_some() {
+                    return Err(Error::Refused(
+                        "--expected-result-revision may be supplied once".to_owned(),
+                    ));
+                }
+                let expected_result_revision =
+                    command_revision.or_else(|| expected_result_revision.clone());
+                parsed!(Command::Apply {
+                    id,
+                    expected_result_revision,
+                });
+            }
             "undo" => parsed!(parse_undo(rest)?),
             "recover" => parsed!(parse_recover(rest)?),
             "discard" => {
@@ -363,7 +403,7 @@ pub fn wants_json(args: &[String]) -> bool {
             "--apply" | "--keep" | "--stat-only" => {}
             // Its value too: a path does not start with `-`, and letting it end
             // the scan would hide a `--json` that came after it.
-            "--todo" => {
+            "--todo" | "--expected-result-revision" => {
                 rest.next();
             }
             // Anything else is the command, or an error inside it. Either way
@@ -397,9 +437,57 @@ fn parse_undo<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Command> {
     })
 }
 
-/// The first non-flag argument left, if any.
-fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Option<String> {
-    rest.into_iter().find(|arg| !arg.starts_with('-')).cloned()
+/// Parses the optional ID accepted by `show` and `continue`.
+fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Option<String>> {
+    let mut id = None;
+    for arg in rest {
+        if arg.starts_with('-') {
+            return Err(Error::Refused(
+                "show and continue accept zero or one rehearsal ID".to_owned(),
+            ));
+        }
+        if id.replace(arg.clone()).is_some() {
+            return Err(Error::Refused(
+                "show and continue accept zero or one rehearsal ID".to_owned(),
+            ));
+        }
+    }
+    Ok(id)
+}
+
+/// Parses the management-command arguments after `apply`.
+fn parse_apply<'a>(
+    rest: impl Iterator<Item = &'a String>,
+) -> Result<(Option<String>, Option<String>)> {
+    let mut id = None;
+    let mut expected = None;
+    let mut args = rest.peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--expected-result-revision" {
+            let revision = args.next().ok_or_else(|| {
+                Error::Refused("--expected-result-revision needs a revision".to_owned())
+            })?;
+            if revision.starts_with('-') {
+                return Err(Error::Refused(
+                    "--expected-result-revision needs a revision".to_owned(),
+                ));
+            }
+            if expected.replace(revision.clone()).is_some() {
+                return Err(Error::Refused(
+                    "--expected-result-revision may be supplied once".to_owned(),
+                ));
+            }
+        } else if arg.starts_with('-') {
+            return Err(Error::Refused(
+                "apply accepts a rehearsal ID and optional --expected-result-revision".to_owned(),
+            ));
+        } else if id.replace(arg.clone()).is_some() {
+            return Err(Error::Refused(
+                "apply accepts at most one rehearsal ID".to_owned(),
+            ));
+        }
+    }
+    Ok((id, expected))
 }
 
 fn parse_recover<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Command> {
@@ -474,7 +562,16 @@ pub fn run<W: Write>(parsed: Parsed, cwd: &Path, output: &mut W) -> Result<u8> {
         Command::Continue { id, decision } => {
             resume(id.as_deref(), decision, format, detail, cwd, output)
         }
-        Command::Apply { id } => apply_kept(id.as_deref(), format, cwd, output),
+        Command::Apply {
+            id,
+            expected_result_revision,
+        } => apply_kept(
+            id.as_deref(),
+            expected_result_revision.as_deref(),
+            format,
+            cwd,
+            output,
+        ),
         Command::Undo { id } => undo_apply(id.as_deref(), format, cwd, output),
         Command::UndoStatus { id } => undo_status(id.as_deref(), format, cwd, output),
         Command::Recover { id, action } => recover(id.as_deref(), action, format, cwd, output),
@@ -1082,13 +1179,25 @@ fn write_show_metadata<W: Write>(sandbox: &Sandbox, output: &mut W) -> Result<()
 /// Applies a rehearsal that was kept.
 fn apply_kept<W: Write>(
     id: Option<&str>,
+    expected_result_revision: Option<&str>,
     format: Format,
     cwd: &Path,
     output: &mut W,
 ) -> Result<u8> {
+    if let Some(expected) = expected_result_revision {
+        crate::result::validate_revision(expected)?;
+    }
+    // Coordination seam for real two-process conditional-Apply tests: the
+    // reviewed revision has been syntactically validated, but no rehearsal
+    // lookup or ownership claim has happened yet.
+    crate::test_hooks::pause("GIT_REHEARSE_PAUSE_APPLY_AT", "before-claim");
     let mut sandbox = find(id, cwd)?;
     sandbox.claim_execution()?;
-    let applied = apply::run(&sandbox, now_unix())?;
+    let applied = if let Some(expected) = expected_result_revision {
+        apply::run_conditional(&sandbox, now_unix(), expected)?
+    } else {
+        apply::run(&sandbox, now_unix())?
+    };
     if format == Format::Json {
         let document = json::ApplyResult {
             schema: json::SCHEMA,
@@ -1098,6 +1207,8 @@ fn apply_kept<W: Write>(
             repository: sandbox.meta().repo_path.display().to_string(),
             exit_code: exit::CLEAN,
             applied: json::applied_report(&applied),
+            result_revision: applied.result_revision.clone(),
+            result_endpoints: applied.result_endpoints.clone(),
         };
         write_json(&document, output)?;
     } else {
@@ -1437,9 +1548,38 @@ mod tests {
             Command::Show { id: None }
         );
         assert_eq!(
+            parse(&args(&["show", "1786248000-00"])).expect("parses"),
+            Command::Show {
+                id: Some("1786248000-00".to_owned())
+            }
+        );
+        assert_eq!(
+            parse(&args(&["continue", "1786248000-00"])).expect("parses"),
+            Command::Continue {
+                id: Some("1786248000-00".to_owned()),
+                decision: Decision::Ask,
+            }
+        );
+        assert_eq!(
             parse(&args(&["apply", "1786248000-00"])).expect("parses"),
             Command::Apply {
-                id: Some("1786248000-00".to_owned())
+                id: Some("1786248000-00".to_owned()),
+                expected_result_revision: None,
+            }
+        );
+        assert_eq!(
+            parse(&args(&[
+                "apply",
+                "1786248000-00",
+                "--expected-result-revision",
+                "rr1:0123456789abcdef0123456789abcdef01234567",
+            ]))
+            .expect("parses"),
+            Command::Apply {
+                id: Some("1786248000-00".to_owned()),
+                expected_result_revision: Some(
+                    "rr1:0123456789abcdef0123456789abcdef01234567".to_owned(),
+                ),
             }
         );
         assert_eq!(
@@ -1456,6 +1596,74 @@ mod tests {
                 all: false
             }
         );
+    }
+
+    #[test]
+    fn show_and_continue_reject_unknown_flags_and_extra_arguments() {
+        for arguments in [
+            &["show", "--unknown"][..],
+            &["show", "1786", "--unknown"][..],
+            &["continue", "--expected-result-revision=bad", "1786"][..],
+            &["continue", "1786", "--expected-result-revision=bad"][..],
+            &["continue", "extra", "1786"][..],
+            &["continue", "1786", "extra"][..],
+        ] {
+            let error = parse(&args(arguments)).expect_err("extra management arguments refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("accept zero or one rehearsal ID"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_revision_cannot_downgrade_rehearsal_or_continue() {
+        for arguments in [
+            &[
+                "--expected-result-revision",
+                "bad",
+                "--apply",
+                "merge",
+                "feature",
+            ][..],
+            &[
+                "--expected-result-revision",
+                "bad",
+                "--apply",
+                "continue",
+                "1786",
+            ][..],
+            &[
+                "--apply",
+                "continue",
+                "1786",
+                "--expected-result-revision",
+                "bad",
+            ][..],
+        ] {
+            let error =
+                parse(&args(arguments)).expect_err("conditional mode is explicit apply only");
+            let message = error.to_string();
+            assert!(
+                message.contains("only valid with an explicit apply command")
+                    || message.contains("accept zero or one rehearsal ID"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_revision_global_option_requires_a_value() {
+        let error = parse(&args(&[
+            "--expected-result-revision",
+            "--apply",
+            "merge",
+            "feature",
+        ]))
+        .expect_err("a following option is not a revision");
+        assert!(error.to_string().contains("needs a revision"), "{error}");
     }
 
     #[test]

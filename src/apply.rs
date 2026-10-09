@@ -55,6 +55,10 @@ pub struct Applied {
     /// The namespace the rehearsed commits were fetched into, kept as an
     /// anchor so nothing that was just applied can be garbage-collected.
     pub anchor: String,
+    /// The exact reviewed result transplanted by this apply.
+    pub result_revision: String,
+    /// The public endpoints corresponding to `result_revision`.
+    pub result_endpoints: crate::result::EndpointDescriptors,
 }
 
 /// Applies a rehearsal to the repository it was rehearsed against.
@@ -66,6 +70,16 @@ pub struct Applied {
 /// checkout changed. [`Error::Git`] or [`Error::Io`] if the transplant itself
 /// fails.
 pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
+    run_inner(sandbox, now_unix, None)
+}
+
+/// Applies only when `expected` identifies the exact retained result.
+pub fn run_conditional(sandbox: &Sandbox, now_unix: u64, expected: &str) -> Result<Applied> {
+    crate::result::validate_revision(expected)?;
+    run_inner(sandbox, now_unix, Some(expected))
+}
+
+fn run_inner(sandbox: &Sandbox, now_unix: u64, expected: Option<&str>) -> Result<Applied> {
     let mut owned = sandbox.clone();
     owned.claim_execution()?;
     let sandbox = &owned;
@@ -76,10 +90,24 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
     // An interrupted apply owns this repository until its real state has been
     // classified and explicitly completed or rolled back.
     let lock = recovery::acquire(repo)?;
-    recovery::ensure_clear_locked(repo, &lock)?;
+    // A non-clean rehearsal has no finished endpoint set. Check this before
+    // calculating a candidate so callers get the established stopped/failed
+    // refusal, while still remaining before any journal or ref effect.
     check_outcome(meta)?;
+    // Calculate the candidate once while both ownership rails are held. A
+    // conditional refusal happens before recovery/journal lifecycle effects.
+    let candidate = crate::result::calculate(sandbox)?;
+    if let Some(expected) = expected
+        && candidate.revision != expected
+    {
+        return Err(Error::Refused(format!(
+            "the reviewed rehearsal result changed (expected {expected}, found {}); refresh the review before applying",
+            candidate.revision
+        )));
+    }
+    recovery::ensure_clear_locked(repo, &lock)?;
     meta.origin.as_ref().ok_or_else(|| Error::Refused("the rehearsal has no durable origin; keep it for reference and rehearse again before applying".to_owned()))?.verify(repo)?;
-    let rehearsed = state_of(&worktree)?;
+    let rehearsed = candidate.results().clone();
     let moved = ref_moves(&meta.pre_state, &rehearsed);
     if moved.is_empty() {
         return Err(Error::Refused(format!(
@@ -91,7 +119,7 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
 
     crate::worktree::check_occupancy(repo, moved.iter().map(|moved| moved.name.as_str()))?;
     let basis = relevant_basis(meta, &moved);
-    let now = state_of(repo)?;
+    let now = crate::result::state(repo)?;
     // Checkout first: switching branches also moves HEAD, and "you rehearsed
     // on main and are now on feature" is a better answer than "HEAD is now a
     // different commit".
@@ -136,7 +164,7 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
     pause_for_test("before-ref-transaction");
     crate::worktree::check_occupancy(repo, moved.iter().map(|moved| moved.name.as_str()))?;
     check_checkout(repo, &meta.checkout)?;
-    check_unchanged(&basis, &state_of(repo)?, &meta.id)?;
+    check_unchanged(&basis, &crate::result::state(repo)?, &meta.id)?;
     if let Some(branch) = reset.as_ref() {
         check_worktree(repo, &worktree, branch, meta.carry.as_ref(), &meta.id)?;
     }
@@ -175,6 +203,8 @@ pub fn run(sandbox: &Sandbox, now_unix: u64) -> Result<Applied> {
         undo,
         anchor,
         carried: carried.map(|carried| carried.paths.to_vec()),
+        result_revision: candidate.revision,
+        result_endpoints: candidate.endpoints,
     })
 }
 
@@ -270,16 +300,6 @@ fn check_worktree<'a>(
         result,
         paths: &carry.paths,
     }))
-}
-
-/// A repository's branches and `HEAD`, in the same shape as the pre-state, so
-/// the sandbox and the real repository can be compared directly.
-fn state_of(repo: &Path) -> Result<BTreeMap<String, String>> {
-    let mut refs = git::refs(repo, "refs/heads/", 0)?;
-    if let Ok(head) = git::run(repo, ["rev-parse", "--verify", "--quiet", "HEAD"]) {
-        refs.insert(HEAD_KEY.to_owned(), head);
-    }
-    Ok(refs)
 }
 
 /// A simple operation with one explicit local branch depends on that branch,

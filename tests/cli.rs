@@ -714,6 +714,11 @@ fn normalised(text: &str) -> serde_json::Value {
     let object = value.as_object_mut().expect("the document is an object");
     object.remove("id");
     object.remove("sandbox");
+    // A result revision is intentionally tied to the rehearsal identity and
+    // exact produced objects. Two separate runs therefore have different
+    // revisions even when --stat-only did not change the report shape.
+    object.remove("result_revision");
+    object.remove("result_endpoints");
     if let Some(refs) = object
         .get_mut("refs")
         .and_then(serde_json::Value::as_array_mut)
