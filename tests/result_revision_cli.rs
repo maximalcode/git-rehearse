@@ -183,6 +183,33 @@ fn another_process_moving_a_result_ref_invalidates_pending_conditional_apply() {
 }
 
 #[test]
+fn trailing_conditional_option_refuses_pending_continue_without_effects() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "followup", "feature"]);
+    fixture.commit_file("later.txt", "later content\n", "later result");
+    fixture.git(&["checkout", "-q", "main"]);
+    let report = clean_merge(&fixture, "feature");
+    let sandbox = Path::new(field(&report, "sandbox"));
+    fixture.git_in(sandbox, &["merge", "--no-ff", "--no-commit", "followup"]);
+
+    let before = protected_state(&fixture, &report);
+    let refusal = json_run(
+        &fixture,
+        &[
+            "--json",
+            "--apply",
+            "continue",
+            field(&report, "id"),
+            "--expected-result-revision=bad",
+        ],
+        4,
+    );
+    assert_eq!(refusal["kind"], "refused");
+    assert_eq!(protected_state(&fixture, &report), before);
+    assert!(sandbox.is_dir(), "retained pending result remains");
+}
+
+#[test]
 fn another_process_moving_only_a_carried_object_invalidates_pending_apply() {
     let fixture = Fixture::new();
     fixture.git(&["checkout", "-q", "-b", "carried-feature", "main"]);

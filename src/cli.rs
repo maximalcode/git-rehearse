@@ -248,13 +248,20 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     // Every `return` below goes through this, so the format and the detail
     // reach the caller whichever branch the command falls into.
     macro_rules! parsed {
-        ($command:expr) => {
+        ($command:expr) => {{
+            let command = $command;
+            if expected_result_revision.is_some() && !matches!(&command, Command::Apply { .. }) {
+                return Err(Error::Refused(
+                    "--expected-result-revision is only valid with an explicit apply command"
+                        .to_owned(),
+                ));
+            }
             return Ok(Parsed {
-                command: $command,
+                command,
                 format,
                 detail,
-            })
-        };
+            });
+        }};
     }
 
     while let Some(arg) = rest.next() {
@@ -278,6 +285,11 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 let revision = rest.next().ok_or_else(|| {
                     Error::Refused("--expected-result-revision needs a revision".to_owned())
                 })?;
+                if revision.starts_with('-') {
+                    return Err(Error::Refused(
+                        "--expected-result-revision needs a revision".to_owned(),
+                    ));
+                }
                 if expected_result_revision.replace(revision.clone()).is_some() {
                     return Err(Error::Refused(
                         "--expected-result-revision may be supplied once".to_owned(),
@@ -312,10 +324,10 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 });
             }
             "list" => parsed!(Command::List),
-            "show" => parsed!(Command::Show { id: id_from(rest) }),
+            "show" => parsed!(Command::Show { id: id_from(rest)? }),
             "continue" => {
                 parsed!(Command::Continue {
-                    id: id_from(rest),
+                    id: id_from(rest)?,
                     decision,
                 });
             }
@@ -326,7 +338,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                         "--expected-result-revision may be supplied once".to_owned(),
                     ));
                 }
-                let expected_result_revision = command_revision.or(expected_result_revision);
+                let expected_result_revision =
+                    command_revision.or_else(|| expected_result_revision.clone());
                 parsed!(Command::Apply {
                     id,
                     expected_result_revision,
@@ -424,9 +437,22 @@ fn parse_undo<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Command> {
     })
 }
 
-/// The first non-flag argument left, if any.
-fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Option<String> {
-    rest.into_iter().find(|arg| !arg.starts_with('-')).cloned()
+/// Parses the optional ID accepted by `show` and `continue`.
+fn id_from<'a>(rest: impl Iterator<Item = &'a String>) -> Result<Option<String>> {
+    let mut id = None;
+    for arg in rest {
+        if arg.starts_with('-') {
+            return Err(Error::Refused(
+                "show and continue accept zero or one rehearsal ID".to_owned(),
+            ));
+        }
+        if id.replace(arg.clone()).is_some() {
+            return Err(Error::Refused(
+                "show and continue accept zero or one rehearsal ID".to_owned(),
+            ));
+        }
+    }
+    Ok(id)
 }
 
 /// Parses the management-command arguments after `apply`.
@@ -441,6 +467,11 @@ fn parse_apply<'a>(
             let revision = args.next().ok_or_else(|| {
                 Error::Refused("--expected-result-revision needs a revision".to_owned())
             })?;
+            if revision.starts_with('-') {
+                return Err(Error::Refused(
+                    "--expected-result-revision needs a revision".to_owned(),
+                ));
+            }
             if expected.replace(revision.clone()).is_some() {
                 return Err(Error::Refused(
                     "--expected-result-revision may be supplied once".to_owned(),
@@ -1517,6 +1548,19 @@ mod tests {
             Command::Show { id: None }
         );
         assert_eq!(
+            parse(&args(&["show", "1786248000-00"])).expect("parses"),
+            Command::Show {
+                id: Some("1786248000-00".to_owned())
+            }
+        );
+        assert_eq!(
+            parse(&args(&["continue", "1786248000-00"])).expect("parses"),
+            Command::Continue {
+                id: Some("1786248000-00".to_owned()),
+                decision: Decision::Ask,
+            }
+        );
+        assert_eq!(
             parse(&args(&["apply", "1786248000-00"])).expect("parses"),
             Command::Apply {
                 id: Some("1786248000-00".to_owned()),
@@ -1552,6 +1596,74 @@ mod tests {
                 all: false
             }
         );
+    }
+
+    #[test]
+    fn show_and_continue_reject_unknown_flags_and_extra_arguments() {
+        for arguments in [
+            &["show", "--unknown"][..],
+            &["show", "1786", "--unknown"][..],
+            &["continue", "--expected-result-revision=bad", "1786"][..],
+            &["continue", "1786", "--expected-result-revision=bad"][..],
+            &["continue", "extra", "1786"][..],
+            &["continue", "1786", "extra"][..],
+        ] {
+            let error = parse(&args(arguments)).expect_err("extra management arguments refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("accept zero or one rehearsal ID"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_revision_cannot_downgrade_rehearsal_or_continue() {
+        for arguments in [
+            &[
+                "--expected-result-revision",
+                "bad",
+                "--apply",
+                "merge",
+                "feature",
+            ][..],
+            &[
+                "--expected-result-revision",
+                "bad",
+                "--apply",
+                "continue",
+                "1786",
+            ][..],
+            &[
+                "--apply",
+                "continue",
+                "1786",
+                "--expected-result-revision",
+                "bad",
+            ][..],
+        ] {
+            let error =
+                parse(&args(arguments)).expect_err("conditional mode is explicit apply only");
+            let message = error.to_string();
+            assert!(
+                message.contains("only valid with an explicit apply command")
+                    || message.contains("accept zero or one rehearsal ID"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_revision_global_option_requires_a_value() {
+        let error = parse(&args(&[
+            "--expected-result-revision",
+            "--apply",
+            "merge",
+            "feature",
+        ]))
+        .expect_err("a following option is not a revision");
+        assert!(error.to_string().contains("needs a revision"), "{error}");
     }
 
     #[test]

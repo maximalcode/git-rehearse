@@ -119,7 +119,7 @@ fn run_inner(sandbox: &Sandbox, now_unix: u64, expected: Option<&str>) -> Result
 
     crate::worktree::check_occupancy(repo, moved.iter().map(|moved| moved.name.as_str()))?;
     let basis = relevant_basis(meta, &moved);
-    let now = state_of(repo)?;
+    let now = crate::result::state(repo)?;
     // Checkout first: switching branches also moves HEAD, and "you rehearsed
     // on main and are now on feature" is a better answer than "HEAD is now a
     // different commit".
@@ -164,7 +164,7 @@ fn run_inner(sandbox: &Sandbox, now_unix: u64, expected: Option<&str>) -> Result
     pause_for_test("before-ref-transaction");
     crate::worktree::check_occupancy(repo, moved.iter().map(|moved| moved.name.as_str()))?;
     check_checkout(repo, &meta.checkout)?;
-    check_unchanged(&basis, &state_of(repo)?, &meta.id)?;
+    check_unchanged(&basis, &crate::result::state(repo)?, &meta.id)?;
     if let Some(branch) = reset.as_ref() {
         check_worktree(repo, &worktree, branch, meta.carry.as_ref(), &meta.id)?;
     }
@@ -300,16 +300,6 @@ fn check_worktree<'a>(
         result,
         paths: &carry.paths,
     }))
-}
-
-/// A repository's branches and `HEAD`, in the same shape as the pre-state, so
-/// the sandbox and the real repository can be compared directly.
-fn state_of(repo: &Path) -> Result<BTreeMap<String, String>> {
-    let mut refs = git::refs(repo, "refs/heads/", 0)?;
-    if let Ok(head) = git::run(repo, ["rev-parse", "--verify", "--quiet", "HEAD"]) {
-        refs.insert(HEAD_KEY.to_owned(), head);
-    }
-    Ok(refs)
 }
 
 /// A simple operation with one explicit local branch depends on that branch,
