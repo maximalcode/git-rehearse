@@ -185,7 +185,8 @@ pub fn validate_revision(revision: &str) -> Result<()> {
     Ok(())
 }
 
-fn state(worktree: &std::path::Path) -> Result<BTreeMap<String, String>> {
+/// Captures the branch refs and `HEAD` used to compare a repository state.
+pub(crate) fn state(worktree: &std::path::Path) -> Result<BTreeMap<String, String>> {
     let mut refs = git::refs(worktree, "refs/heads/", 0)?;
     if let Ok(head) = git::run(worktree, ["rev-parse", "--verify", "--quiet", "HEAD"]) {
         refs.insert("HEAD".to_owned(), head);

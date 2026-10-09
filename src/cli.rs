@@ -248,13 +248,20 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     // Every `return` below goes through this, so the format and the detail
     // reach the caller whichever branch the command falls into.
     macro_rules! parsed {
-        ($command:expr) => {
+        ($command:expr) => {{
+            let command = $command;
+            if expected_result_revision.is_some() && !matches!(&command, Command::Apply { .. }) {
+                return Err(Error::Refused(
+                    "--expected-result-revision is only valid with an explicit apply command"
+                        .to_owned(),
+                ));
+            }
             return Ok(Parsed {
-                command: $command,
+                command,
                 format,
                 detail,
-            })
-        };
+            });
+        }};
     }
 
     while let Some(arg) = rest.next() {
@@ -278,6 +285,11 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 let revision = rest.next().ok_or_else(|| {
                     Error::Refused("--expected-result-revision needs a revision".to_owned())
                 })?;
+                if revision.starts_with('-') {
+                    return Err(Error::Refused(
+                        "--expected-result-revision needs a revision".to_owned(),
+                    ));
+                }
                 if expected_result_revision.replace(revision.clone()).is_some() {
                     return Err(Error::Refused(
                         "--expected-result-revision may be supplied once".to_owned(),
@@ -326,7 +338,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                         "--expected-result-revision may be supplied once".to_owned(),
                     ));
                 }
-                let expected_result_revision = command_revision.or(expected_result_revision);
+                let expected_result_revision =
+                    command_revision.or_else(|| expected_result_revision.clone());
                 parsed!(Command::Apply {
                     id,
                     expected_result_revision,
@@ -441,6 +454,11 @@ fn parse_apply<'a>(
             let revision = args.next().ok_or_else(|| {
                 Error::Refused("--expected-result-revision needs a revision".to_owned())
             })?;
+            if revision.starts_with('-') {
+                return Err(Error::Refused(
+                    "--expected-result-revision needs a revision".to_owned(),
+                ));
+            }
             if expected.replace(revision.clone()).is_some() {
                 return Err(Error::Refused(
                     "--expected-result-revision may be supplied once".to_owned(),
@@ -1552,6 +1570,47 @@ mod tests {
                 all: false
             }
         );
+    }
+
+    #[test]
+    fn expected_revision_cannot_downgrade_rehearsal_or_continue() {
+        for arguments in [
+            &[
+                "--expected-result-revision",
+                "bad",
+                "--apply",
+                "merge",
+                "feature",
+            ][..],
+            &[
+                "--expected-result-revision",
+                "bad",
+                "--apply",
+                "continue",
+                "1786",
+            ][..],
+        ] {
+            let error =
+                parse(&args(arguments)).expect_err("conditional mode is explicit apply only");
+            assert!(
+                error
+                    .to_string()
+                    .contains("only valid with an explicit apply command"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_revision_global_option_requires_a_value() {
+        let error = parse(&args(&[
+            "--expected-result-revision",
+            "--apply",
+            "merge",
+            "feature",
+        ]))
+        .expect_err("a following option is not a revision");
+        assert!(error.to_string().contains("needs a revision"), "{error}");
     }
 
     #[test]

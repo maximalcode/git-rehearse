@@ -222,6 +222,52 @@ fn malformed_conditional_revision_is_refused_before_finding_or_mutating_result()
 }
 
 #[test]
+fn global_expected_revision_refuses_non_apply_before_effects() {
+    let fixture = Fixture::new();
+    let id = kept_merge(&fixture);
+    let before = fixture.refs();
+
+    for arguments in [
+        vec![
+            "--json",
+            "--expected-result-revision",
+            "bad",
+            "--apply",
+            "merge",
+            "--no-edit",
+            "feature",
+        ],
+        vec![
+            "--json",
+            "--expected-result-revision",
+            "--apply",
+            "merge",
+            "--no-edit",
+            "feature",
+        ],
+        vec![
+            "--json",
+            "--expected-result-revision",
+            "bad",
+            "--apply",
+            "continue",
+            &id,
+        ],
+    ] {
+        let output = fixture.rehearse(&arguments);
+        assert_eq!(output.0, 4, "stdout={} stderr={}", output.1, output.2);
+        let error: serde_json::Value = serde_json::from_str(&output.1).expect("failure JSON");
+        assert_eq!(error["kind"], "refused");
+    }
+
+    assert_eq!(fixture.refs(), before, "parser refusal cannot move refs");
+    assert!(
+        !fixture.repo().join(".git/rehearse-apply").exists(),
+        "parser refusal cannot publish an apply journal"
+    );
+}
+
+#[test]
 fn conditional_revision_binds_carried_object_endpoints_not_just_carry_status() {
     let fixture = Fixture::new();
     fixture.git(&["checkout", "-q", "-b", "carried-feature", "main"]);
