@@ -11,3 +11,4 @@
 .claude/agent-guard-ledger.jsonl
 
 /dist/
+/scripts/__pycache__/

@@ -16,18 +16,38 @@ before/after graph, the conflicts, and a warning if replaying your commits
 quietly changed what they do. Then you choose: apply it, keep it, or throw it
 away. Your repository is not touched until you say so.
 
-> **Status: v1.3.0.** Everything on this page is in the release; every terminal
-> transcript here is real captured output. The command surface and the exit
-> codes are settled and will not shift under you.
+> **Status: preparing v1.4.0; latest published release v1.3.0.** The reviewed-result
+> revision and conditional Apply contract below require the new build. The
+> v1.4.0 archives and install tag below become available after publication. Every terminal
+> transcript here is real captured output; the exit codes remain compatible.
 > [SCOPE.md](SCOPE.md) is the full plan.
 
 ## Install
 
-### Upgrading from v1.2.0 (and older releases)
+### Upgrading to v1.4.0
+
+Retained results created by v1.3.0 already contain durable origin information.
+When read by v1.4.0, supported completed results gain a public `result_revision`
+and frozen `result_endpoints` without recreating the rehearsal. Inspect those
+endpoints, then use `apply <id> --expected-result-revision <revision>` to adopt
+that exact result. An unchanged read returns the same revision. The old
+unconditional `apply` syntax remains supported with its existing guarantees.
+
+Retained conflicts keep their sandbox edits and remain unavailable for Apply
+until resolved and completed with `continue`; review the newly completed result
+before conditional Apply. Carried tracked content is preserved; Apply adopts the
+reviewed replay's index and files, which may leave originally staged changes
+unstaged under the existing replay policy. Recovery rollback restores the original
+staging and file content. Supported interrupted Apply journals remain recoverable with
+`recover --complete` or `recover --rollback`; inspect recovery first instead of
+starting a replacement Apply. See [release verification](docs/releases.md) for
+the native upgrade checks and publication boundary.
+
+### Upgrading from v1.2.0 and older releases
 
 Kept rehearsals from v1.2.0 use metadata schema 2. They remain readable as
 reference material and their original `meta.json` is preserved unchanged, but
-they have no durable worktree origin, so v1.3.0 refuses automatic Apply.
+they have no durable worktree origin, so v1.3.0 and v1.4.0 refuse automatic Apply.
 Create a new rehearsal before using automatic Apply.
 
 Older schema 1 metadata is migrated when first read. The migration saves the
@@ -39,20 +59,22 @@ left in place so they can be recovered or diagnosed.
 
 Version 1 Undo records remain readable for manual recovery only because they
 lack durable origin information. Version 2 records include that origin and can
-be used by v1.3.0 when their worktree and repository still match.
+be used by v1.3.0 and v1.4.0 when their worktree and repository still match.
 
 ### A prebuilt binary
 
 The [releases page](https://github.com/maximalcode/git-rehearse/releases)
 carries an archive per platform with a SHA-256 sum beside it. Download it,
 check the sum, and put the `git-rehearse` inside on your `PATH`.
+These are the prepared v1.4.0 names; until publication, use the existing v1.3.0
+assets from that page.
 
 | platform | archive |
 |---|---|
-| Linux, x86-64 | `git-rehearse-v1.3.0-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS, Intel | `git-rehearse-v1.3.0-x86_64-apple-darwin.tar.gz` |
-| macOS, Apple silicon | `git-rehearse-v1.3.0-aarch64-apple-darwin.tar.gz` |
-| Windows, x86-64 | `git-rehearse-v1.3.0-x86_64-pc-windows-msvc.zip` |
+| Linux, x86-64 | `git-rehearse-v1.4.0-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS, Intel | `git-rehearse-v1.4.0-x86_64-apple-darwin.tar.gz` |
+| macOS, Apple silicon | `git-rehearse-v1.4.0-aarch64-apple-darwin.tar.gz` |
+| Windows, x86-64 | `git-rehearse-v1.4.0-x86_64-pc-windows-msvc.zip` |
 
 ARM Linux is not built yet — [build from source](#from-source) there, which
 works fine.
@@ -60,9 +82,10 @@ works fine.
 ### From source
 
 Needs [Rust 1.97 or newer](https://rustup.rs) and `git` on your `PATH`.
+After v1.4.0 is published:
 
 ```bash
-cargo install --git https://github.com/maximalcode/git-rehearse --tag v1.3.0
+cargo install --git https://github.com/maximalcode/git-rehearse --tag v1.4.0
 ```
 
 Or from a clone, to track `develop`:
@@ -390,6 +413,7 @@ checks which rehearsal that journal belongs to.
 | `--json` | one JSON document on stdout instead of the report |
 | `--stat-only` | the report without the before/after graphs |
 | `--todo <file>` | drive an interactive rebase from a prepared todo |
+| `--expected-result-revision <revision>` | require Apply to use the exact reviewed result |
 | `-h`, `--help` | usage |
 | `-V`, `--version` | version |
 
@@ -477,6 +501,39 @@ English anyway:
 So the loop a program runs is `rehearse` → read `conflicts` → resolve them under
 `sandbox` → `continue` → read `drift_unexpected` → `apply`, with the real
 repository untouched until that last step.
+
+For a reviewed result, JSON also provides `result_revision`, an opaque
+versioned `rr1:<git-object-id>` value, and `result_endpoints`. The endpoints
+freeze the originating repository/worktree identity, action and checkout,
+pre-state refs, resulting refs, and any carried snapshot/replay objects.
+Clean retained results are the only results with these authoritative frozen
+endpoints; stopped, failed, or incomplete results omit them. Carried endpoint
+objects include explicit `*_ref_status` values (`present`, `missing`,
+`not_produced`, `not_needed`, or `unexpected`) so a missing or extra parked
+object is never presented as a valid replay. A client that must apply exactly
+what it inspected passes the revision back:
+
+```console
+$ git rehearse --json apply <id> --expected-result-revision rr1:<git-object-id>
+```
+
+The tool acquires the rehearsal and repository ownership, reloads the retained
+result, calculates that candidate once, compares the supplied revision, and
+transplants that same candidate. A missing or malformed revision in this
+conditional form, or a revision that no longer matches, exits 4 before refs,
+worktree files, recovery journal, or retained lifecycle change; the result
+stays available for refresh and review. The older unconditional `apply` form
+remains supported with its existing original-worktree race checks and is not
+revision-bound.
+
+When a result is active, incomplete, stopped, failed, or has an unreadable
+carried endpoint, JSON omits `result_revision` and `result_endpoints` and sets
+`result_unavailable` to the reason. A listing publishes a revision only after
+it acquires the rehearsal's ownership lock and reloads its metadata.
+
+Cooperating git-rehearse processes respect these ownership locks. The contract
+does not control arbitrary filesystem writes that bypass git-rehearse's
+ownership, and it does not emulate another tool's private lock files.
 
 `list` and `show` include the exact rehearsal id, originating worktree,
 repository identity, checkout and pre-state refs, lifecycle, storage paths,
