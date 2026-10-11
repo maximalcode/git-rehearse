@@ -13,7 +13,14 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: candidate
+    env:
+      # The actual v1.3.0 release commit, never a mutable tag or develop.
+      PREVIOUS_RELEASE_REVISION: 81a0621b4089749dfa899233a2a3ee06eacad44e
+      PYTHONDONTWRITEBYTECODE: 1
     strategy:
       fail-fast: false
       matrix:
@@ -30,11 +37,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          path: candidate
+      - name: Check out the supported upgrade baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: maximalcode/git-rehearse
+          ref: ${{ env.PREVIOUS_RELEASE_REVISION }}
+          path: previous
+          persist-credentials: false
       - name: Pinned Rust toolchain
         run: |
           rustup toolchain install 1.97.1 --profile minimal --target ${{ matrix.target }}
           rustup default 1.97.1
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Build the previous release for real retained-data upgrades
+        run: cargo build --manifest-path ../previous/Cargo.toml --release --locked --target ${{ matrix.target }}
 
       # PR/manual builds are test artifacts, even when dispatched against a tag.
       - name: Package, verify checksum, and test the unpacked binary
@@ -47,12 +64,18 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/tags/v* ]]; then
             label="$GITHUB_REF_NAME"
           fi
-          python3 scripts/release-artifact.py "$TARGET" "$label"
+          previous_binary="../previous/target/${TARGET}/release/git-rehearse"
+          if [[ "$TARGET" == *windows-msvc ]]; then
+            previous_binary="${previous_binary}.exe"
+          fi
+          python3 scripts/release-artifact.py "$TARGET" "$label" \
+            --previous-binary "$previous_binary" \
+            --previous-source-revision "$PREVIOUS_RELEASE_REVISION"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}
-          path: dist/*
+          path: candidate/dist/*
           if-no-files-found: error
 
   publish:
