@@ -25,6 +25,7 @@ pub mod json;
 pub mod preflight;
 pub mod recovery;
 pub mod report;
+pub mod result;
 pub mod sandbox;
 mod signatures;
 mod test_hooks;

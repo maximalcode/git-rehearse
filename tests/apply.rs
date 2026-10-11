@@ -60,6 +60,306 @@ fn kept(fixture: &Fixture, command: &[&str]) -> String {
         .to_owned()
 }
 
+#[test]
+fn retained_json_publishes_a_stable_result_revision_and_frozen_endpoints() {
+    let fixture = Fixture::new();
+    let output = fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "feature"]);
+    assert_eq!(output.0, 0, "stdout={} stderr={}", output.1, output.2);
+    let report: serde_json::Value = serde_json::from_str(&output.1).expect("report JSON");
+    let revision = report["result_revision"].as_str().expect("result revision");
+    assert!(revision.starts_with("rr1:"), "{revision}");
+    assert_eq!(report["result_endpoints"]["version"], 1);
+    assert_eq!(
+        report["result_endpoints"]["origin"]["rehearsal"],
+        report["id"]
+    );
+    assert_eq!(
+        report["result_endpoints"]["pre_state"]["refs/heads/main"],
+        report["pre_state"]["refs/heads/main"]
+    );
+
+    let id = report["id"].as_str().expect("id");
+    let shown = fixture.rehearse(&["--json", "show", id]);
+    assert_eq!(shown.0, 0, "stdout={} stderr={}", shown.1, shown.2);
+    let shown: serde_json::Value = serde_json::from_str(&shown.1).expect("show JSON");
+    assert_eq!(shown["result_revision"], revision);
+    assert_eq!(shown["result_endpoints"], report["result_endpoints"]);
+}
+
+#[test]
+fn conditional_apply_refuses_a_stale_result_before_journal_or_discard() {
+    let fixture = Fixture::new();
+    let output = fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "feature"]);
+    let report: serde_json::Value = serde_json::from_str(&output.1).expect("report JSON");
+    let id = report["id"].as_str().expect("id");
+    let expected = report["result_revision"].as_str().expect("revision");
+    let before = fixture.refs();
+
+    let sandbox = report["sandbox"].as_str().expect("sandbox");
+    let original_main = report["pre_state"]["refs/heads/main"]
+        .as_str()
+        .expect("original main");
+    fixture.git_in(
+        std::path::Path::new(sandbox),
+        &["update-ref", "refs/heads/main", original_main],
+    );
+    let refused = fixture.rehearse(&[
+        "--json",
+        "apply",
+        id,
+        "--expected-result-revision",
+        expected,
+    ]);
+    assert_eq!(refused.0, 4, "stdout={} stderr={}", refused.1, refused.2);
+    let error: serde_json::Value = serde_json::from_str(&refused.1).expect("failure JSON");
+    assert_eq!(error["kind"], "refused");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refresh")
+    );
+    assert_eq!(fixture.refs(), before, "a stale result cannot move refs");
+    assert!(std::path::Path::new(sandbox).exists(), "result is retained");
+    assert!(
+        !fixture.repo().join(".git/rehearse-apply").exists(),
+        "a stale result does not publish a recovery journal"
+    );
+}
+
+#[test]
+fn conditional_apply_accepts_the_unchanged_reviewed_result() {
+    let fixture = Fixture::new();
+    let output = fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "feature"]);
+    let report: serde_json::Value = serde_json::from_str(&output.1).expect("report JSON");
+    let id = report["id"].as_str().expect("id");
+    let expected = report["result_revision"].as_str().expect("revision");
+    let applied = fixture.rehearse(&[
+        "--json",
+        "apply",
+        id,
+        "--expected-result-revision",
+        expected,
+    ]);
+    assert_eq!(applied.0, 0, "stdout={} stderr={}", applied.1, applied.2);
+    let applied: serde_json::Value = serde_json::from_str(&applied.1).expect("apply JSON");
+    assert_eq!(applied["result_revision"], expected);
+    assert_eq!(applied["result_endpoints"], report["result_endpoints"]);
+}
+
+#[test]
+fn conditional_apply_accepts_the_result_after_a_reviewed_continue() {
+    let fixture = Fixture::new();
+    fixture.commit("four", "four\n");
+    fixture.git(&["checkout", "feature"]);
+    let stopped = fixture.rehearse(&["--json", "--keep", "rebase", "main"]);
+    assert_eq!(stopped.0, 2, "stdout={} stderr={}", stopped.1, stopped.2);
+    let stopped: serde_json::Value = serde_json::from_str(&stopped.1).expect("stopped JSON");
+    assert!(stopped["result_revision"].is_null(), "{stopped}");
+    assert!(stopped["result_endpoints"].is_null(), "{stopped}");
+    let id = stopped["id"].as_str().expect("id");
+    let sandbox = std::path::Path::new(stopped["sandbox"].as_str().expect("sandbox"));
+    std::fs::write(sandbox.join("file.txt"), "resolved\n").expect("resolve conflict");
+    fixture.git_in(sandbox, &["add", "file.txt"]);
+
+    let continued = fixture.rehearse(&["--json", "--keep", "continue", id]);
+    assert_eq!(
+        continued.0, 0,
+        "stdout={} stderr={}",
+        continued.1, continued.2
+    );
+    let continued: serde_json::Value = serde_json::from_str(&continued.1).expect("continued JSON");
+    let expected = continued["result_revision"].as_str().expect("revision");
+    assert!(continued["result_endpoints"].is_object(), "{continued}");
+
+    let applied = fixture.rehearse(&[
+        "--json",
+        "apply",
+        id,
+        "--expected-result-revision",
+        expected,
+    ]);
+    assert_eq!(applied.0, 0, "stdout={} stderr={}", applied.1, applied.2);
+    let applied: serde_json::Value = serde_json::from_str(&applied.1).expect("apply JSON");
+    assert_eq!(applied["result_revision"], expected);
+    assert_eq!(applied["result_endpoints"], continued["result_endpoints"]);
+}
+
+#[test]
+fn malformed_conditional_revision_is_refused_before_finding_or_mutating_result() {
+    let fixture = Fixture::new();
+    let id = kept_merge(&fixture);
+    let before = fixture.refs();
+    let missing = fixture.rehearse(&["--json", "apply", &id, "--expected-result-revision"]);
+    assert_eq!(missing.0, 4, "stdout={} stderr={}", missing.1, missing.2);
+    let missing_error: serde_json::Value =
+        serde_json::from_str(&missing.1).expect("missing-value failure JSON");
+    assert_eq!(missing_error["kind"], "refused");
+    assert!(
+        missing_error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("needs a revision")
+    );
+
+    let refused = fixture.rehearse(&["--json", "apply", &id, "--expected-result-revision", "bad"]);
+    assert_eq!(refused.0, 4, "stdout={} stderr={}", refused.1, refused.2);
+    let error: serde_json::Value = serde_json::from_str(&refused.1).expect("failure JSON");
+    assert_eq!(error["kind"], "refused");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("malformed")
+    );
+    assert_eq!(fixture.refs(), before);
+    let list = fixture.rehearse(&["--json", "list"]);
+    assert_eq!(list.0, 0, "stdout={} stderr={}", list.1, list.2);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&list.1).expect("list JSON")["rehearsals"][0]["id"],
+        id
+    );
+}
+
+#[test]
+fn global_expected_revision_refuses_non_apply_before_effects() {
+    let fixture = Fixture::new();
+    let id = kept_merge(&fixture);
+    let before = fixture.refs();
+
+    for arguments in [
+        vec![
+            "--json",
+            "--expected-result-revision",
+            "bad",
+            "--apply",
+            "merge",
+            "--no-edit",
+            "feature",
+        ],
+        vec![
+            "--json",
+            "--expected-result-revision",
+            "--apply",
+            "merge",
+            "--no-edit",
+            "feature",
+        ],
+        vec![
+            "--json",
+            "--expected-result-revision",
+            "bad",
+            "--apply",
+            "continue",
+            &id,
+        ],
+        vec![
+            "--json",
+            "--apply",
+            "continue",
+            &id,
+            "--expected-result-revision",
+            "bad",
+        ],
+    ] {
+        let output = fixture.rehearse(&arguments);
+        assert_eq!(output.0, 4, "stdout={} stderr={}", output.1, output.2);
+        let error: serde_json::Value = serde_json::from_str(&output.1).expect("failure JSON");
+        assert_eq!(error["kind"], "refused");
+    }
+
+    assert_eq!(fixture.refs(), before, "parser refusal cannot move refs");
+    assert!(
+        !fixture.repo().join(".git/rehearse-apply").exists(),
+        "parser refusal cannot publish an apply journal"
+    );
+}
+
+#[test]
+fn conditional_revision_binds_carried_object_endpoints_not_just_carry_status() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "carried-feature", "main"]);
+    fixture.commit_file("new.txt", "feature\n", "add feature file");
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("file.txt", "uncommitted\n");
+
+    let output = fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "carried-feature"]);
+    assert_eq!(output.0, 0, "stdout={} stderr={}", output.1, output.2);
+    let report: serde_json::Value = serde_json::from_str(&output.1).expect("report JSON");
+    let id = report["id"].as_str().expect("id");
+    let expected = report["result_revision"].as_str().expect("revision");
+    let sandbox = report["sandbox"].as_str().expect("sandbox");
+    let carried = &report["result_endpoints"]["carried"];
+    assert!(carried["replay_ref"].is_string(), "{carried}");
+    let snapshot = fixture.git_in(
+        std::path::Path::new(sandbox),
+        &["rev-parse", "refs/rehearse/carried"],
+    );
+    fixture.git_in(
+        std::path::Path::new(sandbox),
+        &["update-ref", "refs/rehearse/replayed", snapshot.trim()],
+    );
+
+    let refused = fixture.rehearse(&[
+        "--json",
+        "apply",
+        id,
+        "--expected-result-revision",
+        expected,
+    ]);
+    assert_eq!(refused.0, 4, "stdout={} stderr={}", refused.1, refused.2);
+    let error: serde_json::Value = serde_json::from_str(&refused.1).expect("failure JSON");
+    assert_eq!(error["kind"], "refused");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("changed")
+    );
+    assert!(!fixture.repo().join(".git/rehearse-apply").exists());
+}
+
+#[test]
+fn missing_carried_endpoint_is_reported_unavailable_before_apply_effects() {
+    let fixture = Fixture::new();
+    fixture.git(&["checkout", "-q", "-b", "carried-feature", "main"]);
+    fixture.commit_file("new.txt", "feature\n", "add feature file");
+    fixture.git(&["checkout", "-q", "main"]);
+    fixture.write("file.txt", "uncommitted\n");
+
+    let output = fixture.rehearse(&["--json", "--keep", "merge", "--no-edit", "carried-feature"]);
+    let report: serde_json::Value = serde_json::from_str(&output.1).expect("report JSON");
+    let id = report["id"].as_str().expect("id");
+    let expected = report["result_revision"].as_str().expect("revision");
+    let sandbox = std::path::Path::new(report["sandbox"].as_str().expect("sandbox"));
+    fixture.git_in(sandbox, &["update-ref", "-d", "refs/rehearse/replayed"]);
+
+    let shown = fixture.rehearse(&["--json", "show", id]);
+    assert_eq!(shown.0, 0, "stdout={} stderr={}", shown.1, shown.2);
+    let shown: serde_json::Value = serde_json::from_str(&shown.1).expect("show JSON");
+    assert!(shown["result_revision"].is_null(), "{shown}");
+    assert!(shown["result_endpoints"].is_null(), "{shown}");
+    assert!(
+        shown["result_unavailable"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replay endpoint is missing"),
+        "{shown}"
+    );
+
+    let before = fixture.refs();
+    let refused = fixture.rehearse(&[
+        "--json",
+        "apply",
+        id,
+        "--expected-result-revision",
+        expected,
+    ]);
+    assert_eq!(refused.0, 4, "stdout={} stderr={}", refused.1, refused.2);
+    assert_eq!(fixture.refs(), before);
+    assert!(!fixture.repo().join(".git/rehearse-apply").exists());
+}
+
 fn abort_apply(fixture: &Fixture, id: &str, stage: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_git-rehearse"))
         .current_dir(fixture.repo())

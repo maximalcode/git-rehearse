@@ -390,6 +390,7 @@ checks which rehearsal that journal belongs to.
 | `--json` | one JSON document on stdout instead of the report |
 | `--stat-only` | the report without the before/after graphs |
 | `--todo <file>` | drive an interactive rebase from a prepared todo |
+| `--expected-result-revision <revision>` | require Apply to use the exact reviewed result |
 | `-h`, `--help` | usage |
 | `-V`, `--version` | version |
 
@@ -477,6 +478,39 @@ English anyway:
 So the loop a program runs is `rehearse` → read `conflicts` → resolve them under
 `sandbox` → `continue` → read `drift_unexpected` → `apply`, with the real
 repository untouched until that last step.
+
+For a reviewed result, JSON also provides `result_revision`, an opaque
+versioned `rr1:<git-object-id>` value, and `result_endpoints`. The endpoints
+freeze the originating repository/worktree identity, action and checkout,
+pre-state refs, resulting refs, and any carried snapshot/replay objects.
+Clean retained results are the only results with these authoritative frozen
+endpoints; stopped, failed, or incomplete results omit them. Carried endpoint
+objects include explicit `*_ref_status` values (`present`, `missing`,
+`not_produced`, `not_needed`, or `unexpected`) so a missing or extra parked
+object is never presented as a valid replay. A client that must apply exactly
+what it inspected passes the revision back:
+
+```console
+$ git rehearse --json apply <id> --expected-result-revision rr1:<git-object-id>
+```
+
+The tool acquires the rehearsal and repository ownership, reloads the retained
+result, calculates that candidate once, compares the supplied revision, and
+transplants that same candidate. A missing or malformed revision in this
+conditional form, or a revision that no longer matches, exits 4 before refs,
+worktree files, recovery journal, or retained lifecycle change; the result
+stays available for refresh and review. The older unconditional `apply` form
+remains supported with its existing original-worktree race checks and is not
+revision-bound.
+
+When a result is active, incomplete, stopped, failed, or has an unreadable
+carried endpoint, JSON omits `result_revision` and `result_endpoints` and sets
+`result_unavailable` to the reason. A listing publishes a revision only after
+it acquires the rehearsal's ownership lock and reloads its metadata.
+
+Cooperating git-rehearse processes respect these ownership locks. The contract
+does not control arbitrary filesystem writes that bypass git-rehearse's
+ownership, and it does not emulate another tool's private lock files.
 
 `list` and `show` include the exact rehearsal id, originating worktree,
 repository identity, checkout and pre-state refs, lifecycle, storage paths,
