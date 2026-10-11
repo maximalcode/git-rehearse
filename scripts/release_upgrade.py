@@ -53,6 +53,18 @@ def _git(repo: Path, env: dict[str, str], *args: str, expected: int | tuple[int,
     return _run(["git", *args], repo, env, expected).stdout.strip()
 
 
+def _git_bytes(repo: Path, env: dict[str, str], *args: str) -> bytes:
+    result = subprocess.run(
+        ["git", *args], cwd=repo, env=env, capture_output=True, timeout=_TIMEOUT
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} exited {result.returncode}: "
+            f"{result.stderr.decode('utf-8', errors='replace')}"
+        )
+    return result.stdout
+
+
 def _json_cli(
     binary: Path,
     repo: Path,
@@ -154,27 +166,75 @@ def _result(report: dict, label: str) -> tuple[str, Path]:
     return revision, Path(sandbox)
 
 
-def _assert_carried_endpoints(
+def _tree_bytes(repo: Path, env: dict[str, str], tree: str) -> dict[str, bytes]:
+    paths = _git(repo, env, "ls-tree", "-r", "--name-only", tree).splitlines()
+    return {path: _git_bytes(repo, env, "show", f"{tree}:{path}") for path in paths}
+
+
+def _endpoint_contract(
     report: dict,
     label: str,
     env: dict[str, str],
-    expected_snapshot_tree: str,
-) -> str:
+    expected_snapshot_tree: str | None = None,
+) -> dict:
     endpoints = report.get("result_endpoints")
-    carried = endpoints.get("carried") if isinstance(endpoints, dict) else None
-    if not isinstance(carried, dict) or set(carried.get("paths", ())) != {"staged.txt", "unstaged.txt"}:
-        raise RuntimeError(f"{label} did not publish carried object endpoints: {report}")
-    for field in ("snapshot", "snapshot_ref", "replay", "replay_ref"):
-        if not isinstance(carried.get(field), str) or not carried[field]:
-            raise RuntimeError(f"{label} carried endpoint {field} is unavailable: {report}")
-    sandbox = Path(report["sandbox"])
-    snapshot_tree = _git(sandbox, env, "rev-parse", f"{carried['snapshot']}^2^{{tree}}")
-    if snapshot_tree != expected_snapshot_tree:
-        raise RuntimeError(
-            f"{label} snapshot^2 tree does not match the predecessor index: "
-            f"{snapshot_tree} != {expected_snapshot_tree}"
-        )
-    return _git(sandbox, env, "rev-parse", f"{carried['replay']}^2^{{tree}}")
+    results = endpoints.get("results") if isinstance(endpoints, dict) else None
+    sandbox = Path(report["sandbox"]) if isinstance(report.get("sandbox"), str) else None
+    if not isinstance(results, dict) or not results or sandbox is None:
+        raise RuntimeError(f"{label} did not publish result endpoints: {report}")
+    actual_refs = {
+        "HEAD",
+        *_git(sandbox, env, "for-each-ref", "--format=%(refname)", "refs/heads").splitlines(),
+    }
+    if set(results) != actual_refs:
+        raise RuntimeError(f"{label} endpoint ref set differs: {set(results)} != {actual_refs}")
+    for ref, expected in results.items():
+        actual = _git(sandbox, env, "rev-parse", ref)
+        if actual != expected:
+            raise RuntimeError(f"{label} sandbox endpoint {ref} differs: {actual} != {expected}")
+    carried = endpoints.get("carried")
+    if carried is not None:
+        if not isinstance(carried, dict) or set(carried.get("paths", ())) != {"staged.txt", "unstaged.txt"}:
+            raise RuntimeError(f"{label} did not publish carried object endpoints: {report}")
+        for field in ("snapshot", "snapshot_ref", "replay", "replay_ref"):
+            if not isinstance(carried.get(field), str) or not carried[field]:
+                raise RuntimeError(f"{label} carried endpoint {field} is unavailable: {report}")
+        snapshot_tree = _git(sandbox, env, "rev-parse", f"{carried['snapshot']}^2^{{tree}}")
+        if expected_snapshot_tree is not None and snapshot_tree != expected_snapshot_tree:
+            raise RuntimeError(
+                f"{label} snapshot^2 tree does not match the predecessor index: "
+                f"{snapshot_tree} != {expected_snapshot_tree}"
+            )
+        index = _git(sandbox, env, "rev-parse", f"{carried['replay']}^2^{{tree}}")
+        tree = f"{carried['replay']}^{{tree}}"
+    elif expected_snapshot_tree is not None:
+        raise RuntimeError(f"{label} omitted carried endpoints for a carried predecessor index")
+    else:
+        index = _git(sandbox, env, "rev-parse", f"{results['HEAD']}^{{tree}}")
+        tree = f"{results['HEAD']}^{{tree}}"
+    return {"head": results["HEAD"], "refs": results, "index": index, "files": _tree_bytes(sandbox, env, tree)}
+
+
+def _assert_repo_contract(contract: dict, repo: Path, env: dict[str, str], label: str) -> None:
+    if _git(repo, env, "rev-parse", "HEAD") != contract["head"]:
+        raise RuntimeError(f"{label} HEAD differs from the reviewed endpoint")
+    actual_refs = {
+        "HEAD",
+        *_git(repo, env, "for-each-ref", "--format=%(refname)", "refs/heads").splitlines(),
+    }
+    if set(contract["refs"]) != actual_refs:
+        raise RuntimeError(f"{label} endpoint ref set differs: {set(contract['refs'])} != {actual_refs}")
+    for ref, expected in contract["refs"].items():
+        if _git(repo, env, "rev-parse", ref) != expected:
+            raise RuntimeError(f"{label} endpoint {ref} differs from the reviewed result")
+    if _git(repo, env, "write-tree") != contract["index"]:
+        raise RuntimeError(f"{label} index differs from the reviewed endpoint tree")
+    actual_paths = set(_git(repo, env, "ls-files").splitlines())
+    if actual_paths != set(contract["files"]):
+        raise RuntimeError(f"{label} tracked path set differs from the reviewed tree")
+    for path, expected in contract["files"].items():
+        if (repo / path).read_bytes() != expected:
+            raise RuntimeError(f"{label} tracked file bytes differ for {path}")
 
 
 def _old_completed(old: Path, root: Path, name: str) -> tuple[Path, dict[str, str], dict, Path, dict]:
@@ -272,12 +332,12 @@ def _scenario_completed(old: Path, current: Path, root: Path) -> dict:
         or metadata.read_bytes() != metadata_after_first_show
     ):
         raise RuntimeError("repeated current reads changed the upgraded result or schema-3 metadata")
+    contract = _endpoint_contract(shown, "current reload of old completed rehearsal", env)
     _assert_untouched(before, repo, env, ("base.txt",))
     applied = _json_cli(current, repo, env, "apply", report["id"], "--expected-result-revision", revision)
     if applied.get("result_revision") != revision:
         raise RuntimeError(f"current CLI applied a different result: {applied}")
-    if _git(repo, env, "show", "HEAD:feature.txt") != "feature":
-        raise RuntimeError("completed old rehearsal did not apply its exact reviewed tree")
+    _assert_repo_contract(contract, repo, env, "completed old rehearsal apply")
     return {"status": "passed", "id": report["id"], "result_revision": revision}
 
 
@@ -297,8 +357,10 @@ def _scenario_conflict(old: Path, current: Path, root: Path) -> dict:
     _git(sandbox, env, "add", "base.txt")
     continued = _json_cli(current, repo, env, "--keep", "continue", stopped["id"])
     revision, _sandbox = _result(continued, "continued conflict rehearsal")
+    contract = _endpoint_contract(continued, "continued conflict rehearsal", env)
     _assert_untouched(before, repo, env, ("base.txt",))
     _json_cli(current, repo, env, "apply", stopped["id"], "--expected-result-revision", revision)
+    _assert_repo_contract(contract, repo, env, "continued conflict rehearsal apply")
     if (repo / "base.txt").read_bytes() != b"reviewed conflict resolution\n":
         raise RuntimeError("continued conflict resolution was not transplanted")
     return {"status": "passed", "id": stopped["id"], "result_revision": revision}
@@ -310,13 +372,12 @@ def _scenario_carried(old: Path, current: Path, root: Path) -> dict:
     report = _json_cli(old, repo, env, "--keep", "merge", "--no-edit", "feature")
     shown = _json_cli(current, repo, env, "show", report["id"])
     revision, _sandbox = _result(shown, "current reload of old carried rehearsal")
-    replay_tree = _assert_carried_endpoints(
+    contract = _endpoint_contract(
         shown, "current reload of old carried rehearsal", env, before["index"]
     )
     _assert_untouched(before, repo, env, ("staged.txt", "unstaged.txt"))
     _json_cli(current, repo, env, "apply", report["id"], "--expected-result-revision", revision)
-    if _git(repo, env, "write-tree") != replay_tree:
-        raise RuntimeError("apply did not adopt the reviewed replay^2 index tree")
+    _assert_repo_contract(contract, repo, env, "carried rehearsal apply")
     if (repo / "staged.txt").read_bytes() != b"reviewed staged bytes\n" or (repo / "unstaged.txt").read_bytes() != b"reviewed unstaged bytes\n":
         raise RuntimeError("carried tracked file bytes did not survive upgrade apply")
     status = _git(repo, env, "status", "--porcelain=v1")
@@ -345,6 +406,7 @@ def _scenario_recovery(old: Path, current: Path, root: Path) -> dict:
     clean_repo, clean_env, clean_report, _sandbox, clean_before = _old_completed(old, root, "recovery-clean")
     clean_shown = _json_cli(current, clean_repo, clean_env, "show", clean_report["id"])
     _result(clean_shown, "current reload of old clean recovery rehearsal")
+    clean_contract = _endpoint_contract(clean_shown, "current reload of old clean recovery rehearsal", clean_env)
     with _git_transaction_failure(root, clean_env) as interrupted_env:
         # The predecessor owns the apply too: this is an on-disk recovery
         # journal migration, not merely a current-version crash test.
@@ -357,6 +419,7 @@ def _scenario_recovery(old: Path, current: Path, root: Path) -> dict:
     _json_cli(current, clean_repo, clean_env, "recover", "--complete", clean_report["id"])
     if (clean_repo / ".git" / "rehearse-apply").exists() or not (clean_repo / ".git" / "rehearse-undo").exists():
         raise RuntimeError("clean recovery did not finish its journal/retain Undo snapshot")
+    _assert_repo_contract(clean_contract, clean_repo, clean_env, "clean recovery completion")
     undo_status = _json_cli(current, clean_repo, clean_env, "undo", clean_report["id"], "--check")
     if not undo_status.get("available"):
         raise RuntimeError(f"completed clean recovery lost its Undo snapshot: {undo_status}")
@@ -386,7 +449,7 @@ def _scenario_recovery(old: Path, current: Path, root: Path) -> dict:
     carried_report = _json_cli(old, carried_repo, carried_env, "--keep", "merge", "--no-edit", "feature")
     carried_shown = _json_cli(current, carried_repo, carried_env, "show", carried_report["id"])
     _result(carried_shown, "current reload of old carried recovery rehearsal")
-    _assert_carried_endpoints(
+    _endpoint_contract(
         carried_shown,
         "current reload of old carried recovery rehearsal",
         carried_env,
